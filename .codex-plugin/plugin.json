@@ -1,0 +1,22 @@
+{
+  "name": "code-review-suite",
+  "version": "0.2.0",
+  "description": "Code Analyzer for C/C++ using Cppcheck, Flawfinder, Splint, and clang-tidy.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Code Analyzer",
+    "shortDescription": "Deep C/C++ static analysis and reports.",
+    "longDescription": "Run Cppcheck, Flawfinder, Splint, and clang-tidy; normalize findings; preserve run history; and generate combined Markdown, JSON, and HTML dashboard reports.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["Write", "Interactive"],
+    "defaultPrompt": [
+      "Run Code Analyzer on this C/C++ project.",
+      "Aggregate Cppcheck, Flawfinder, Splint, and clang-tidy findings.",
+      "Create a static-analysis dashboard."
+    ]
+  }
+}

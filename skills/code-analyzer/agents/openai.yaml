@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Analyzer"
+  short_description: "Deep C/C++ static analysis with four analyzers"
+  default_prompt: "Use $code-analyzer to analyze this C/C++ project and summarize the combined report."
