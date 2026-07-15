@@ -44,7 +44,7 @@ class ConsolidatedParserRegressionTests(unittest.TestCase):
 
     def test_parses_splint_continuations_unknown_and_wrapped_locations(self):
         core = load_core()
-        findings = core._parse_splint(
+        findings, diagnostics = core._parse_splint(
             """
 < Location unknown >: Preprocessing error for file src/main.c
 src/main.c:12:
@@ -54,16 +54,18 @@ src/include/config.h:3: Cannot find include file <missing.h>
 src/parser.c:44: Parse Error: Suspect missing semicolon
 """
         )
-        self.assertEqual(len(findings), 4)
-        self.assertEqual(findings[0].file, "< Location unknown >")
-        self.assertEqual(findings[1].column, "8")
-        self.assertIn("Additional wrapped detail", findings[1].message)
-        self.assertEqual(findings[2].severity, "info")
-        self.assertEqual(findings[3].severity, "high")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].column, "8")
+        self.assertIn("Additional wrapped detail", findings[0].message)
+        self.assertEqual(len(diagnostics), 3)
+        self.assertEqual(diagnostics[0].file, "< Location unknown >")
+        self.assertEqual([item.category for item in diagnostics], ["configuration", "include", "parsing"])
+        self.assertFalse(diagnostics[0].fatal)
+        self.assertTrue(diagnostics[2].fatal)
 
     def test_parses_consecutive_wrapped_long_splint_paths_separately(self):
         core = load_core()
-        findings = core._parse_splint(
+        findings, diagnostics = core._parse_splint(
             """
 testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
     low__CWE805_char_alloca_loop_03.c:26:36: Unrecognized identifier: alloca
@@ -73,9 +75,13 @@ testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
     Function memset expects arg 2 to be int gets char: 'C'
 """
         )
-        self.assertEqual(len(findings), 2)
+        self.assertEqual(len(findings), 1)
         self.assertTrue(findings[0].file.endswith("Overflow__CWE805_char_alloca_loop_03.c"))
-        self.assertEqual([item.line for item in findings], ["26", "38"])
+        self.assertEqual(findings[0].line, "38")
+        self.assertEqual(len(diagnostics), 1)
+        self.assertTrue(diagnostics[0].file.endswith("Overflow__CWE805_char_alloca_loop_03.c"))
+        self.assertEqual(diagnostics[0].line, "26")
+        self.assertFalse(diagnostics[0].fatal)
 
     def test_include_discovery_prioritizes_explicit_and_skips_reports(self):
         core = load_core()
@@ -87,7 +93,8 @@ testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
             report = project / "code-analyzer-report-old"
             report.mkdir()
             (report / "ignored.h").write_text("", encoding="utf-8")
-            includes = core._include_dirs(project, [str(include)])
+            manifest = core.build_source_manifest(project, [], [], True, report)
+            includes = core._include_dirs(manifest, [str(include)])
 
         self.assertEqual(includes, [str(include)])
 
@@ -95,6 +102,7 @@ testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
         core = load_core()
         self.assertEqual(core.TOOL_ORDER, ("cppcheck", "flawfinder", "splint"))
         self.assertEqual(list(core.ADAPTERS), ["cppcheck", "flawfinder", "splint"])
+        self.assertEqual([spec.required for spec in core.ANALYZERS.values()], [True, True, False])
 
 
 if __name__ == "__main__":
