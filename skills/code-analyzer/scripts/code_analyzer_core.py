@@ -26,11 +26,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 
 SCHEMA_VERSION = "2.0"
-TOOL_ORDER = ("cppcheck", "flawfinder", "splint", "clang-tidy")
+TOOL_ORDER = ("cppcheck", "flawfinder", "splint")
 REQUIRED_TOOLS = frozenset(("cppcheck", "flawfinder"))
-DEFAULT_CLANG_TIDY_CHECKS = "clang-analyzer-*,bugprone-*,performance-*,portability-*"
+REMOVED_COMPATIBILITY_LINKS = ("clang-tidy",)
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0, "unknown": 0}
-SOURCE_SUFFIXES = frozenset((".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx"))
 
 
 @dataclass
@@ -423,24 +422,6 @@ def _parse_splint(text: str) -> List[Finding]:
     return unique
 
 
-_CLANG_TIDY = re.compile(r"^(.*?):(\d+):(\d+):\s*(warning|error|note):\s*(.*?)\s*(?:\[([^]]+)\])?$")
-
-
-def _parse_clang_tidy(text: str) -> List[Finding]:
-    findings = []
-    for line in text.splitlines():
-        match = _CLANG_TIDY.match(line.strip())
-        if not match:
-            continue
-        level = match.group(4)
-        severity = "high" if level == "error" else "medium" if level == "warning" else "info"
-        findings.append(Finding(
-            "clang-tidy", severity, match.group(6) or "clang-tidy", match.group(5), match.group(1),
-            match.group(2), "", match.group(3), "clang-tidy/summary.json",
-        ))
-    return findings
-
-
 def _discover_sources(project: Path, suffixes: Iterable[str]) -> List[Path]:
     suffix_set = set(suffixes)
     if project.is_file():
@@ -560,38 +541,6 @@ def _run_splint(args: argparse.Namespace, project: Path, out_dir: Path) -> ToolR
     return result
 
 
-def _run_clang_tidy(args: argparse.Namespace, project: Path, out_dir: Path) -> ToolResult:
-    compile_commands = find_compile_commands(project, args.compile_commands)
-    if not compile_commands:
-        return ToolResult("clang-tidy", "skipped", "compile_commands.json not found", required=False)
-    try:
-        entries = json.loads(compile_commands.read_text(encoding="utf-8"))
-        sources = []
-        for entry in entries:
-            source = Path(entry.get("file", ""))
-            if not source.is_absolute():
-                source = Path(entry.get("directory", compile_commands.parent)) / source
-            if source.suffix.lower() in SOURCE_SUFFIXES:
-                sources.append(str(source.resolve()))
-    except (OSError, ValueError, TypeError) as exc:
-        return ToolResult("clang-tidy", "skipped", "invalid compile_commands.json: %s" % exc, required=False)
-    if not sources:
-        return ToolResult("clang-tidy", "skipped", "compile_commands.json contains no C/C++ sources", required=False)
-    command = [args.clang_tidy_bin] + sorted(set(sources)) + ["-p=%s" % compile_commands.parent]
-    root = project if project.is_dir() else project.parent
-    if args.clang_tidy_checks:
-        command.append("-checks=%s" % args.clang_tidy_checks)
-    elif not (root / ".clang-tidy").is_file():
-        command.append("-checks=%s" % DEFAULT_CLANG_TIDY_CHECKS)
-    request = ToolRequest("clang-tidy", command, root, out_dir, False, args.timeout_seconds, (0, 1),
-                          "clang-tidy.txt", "clang-tidy.stderr.txt")
-    result = execute_request(request)
-    if result.status == "ok":
-        result.findings = _parse_clang_tidy("\n".join((result.stdout, result.stderr)))
-    result.metadata.update({"compile_commands": str(compile_commands), "source_count": len(set(sources))})
-    return result
-
-
 AnalyzerAdapter = Callable[[argparse.Namespace, Path, Path], ToolResult]
 
 
@@ -599,7 +548,6 @@ ADAPTERS: Dict[str, AnalyzerAdapter] = {
     "cppcheck": _run_cppcheck,
     "flawfinder": _run_flawfinder,
     "splint": _run_splint,
-    "clang-tidy": _run_clang_tidy,
 }
 
 
@@ -812,6 +760,10 @@ def publish_run(staging: Path, out_root: Path, run_id: str, overwrite: bool) -> 
             _atomic_symlink("latest/%s" % name, out_root / name)
         elif (out_root / name).is_symlink():
             (out_root / name).unlink()
+    for name in REMOVED_COMPATIBILITY_LINKS:
+        link = out_root / name
+        if link.is_symlink():
+            link.unlink()
     return final
 
 
@@ -825,8 +777,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cppcheck-bin", default="cppcheck")
     parser.add_argument("--flawfinder-bin", default="flawfinder")
     parser.add_argument("--splint-bin", default="splint")
-    parser.add_argument("--clang-tidy-bin", default="clang-tidy")
-    parser.add_argument("--clang-tidy-checks")
     parser.add_argument("--tool-jobs", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--run-id")
@@ -855,7 +805,6 @@ def doctor(args: argparse.Namespace) -> Dict[str, Any]:
         "cppcheck": (args.cppcheck_bin, True, ("xml", "compile_commands"), ("--version",)),
         "flawfinder": (args.flawfinder_bin, True, ("csv", "cwe"), ("--version",)),
         "splint": (args.splint_bin, False, ("c-analysis",), ("-help", "version")),
-        "clang-tidy": (args.clang_tidy_bin, False, ("compile_commands", "clang-tidy-config"), ("--version",)),
     }
     return {"schema_version": SCHEMA_VERSION, "tools": {
         tool: probe_tool(binary, required, capabilities, version_args)
@@ -865,16 +814,16 @@ def doctor(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    tools = [item.strip() for item in args.tools.split(",") if item.strip()]
+    invalid = [tool for tool in tools if tool not in TOOL_ORDER]
+    if invalid or len(tools) != len(set(tools)):
+        print("error: unsupported or duplicate tool(s): %s" % ", ".join(invalid or tools), file=os.sys.stderr)
+        return 2
     if args.doctor:
         print(json.dumps(doctor(args), indent=2))
         return 0
     if args.tool_jobs < 1 or args.timeout_seconds < 1:
         print("error: --tool-jobs and --timeout-seconds must be positive", file=os.sys.stderr)
-        return 2
-    tools = [item.strip() for item in args.tools.split(",") if item.strip()]
-    invalid = [tool for tool in tools if tool not in TOOL_ORDER]
-    if invalid or len(tools) != len(set(tools)):
-        print("error: unsupported or duplicate tool(s): %s" % ", ".join(invalid or tools), file=os.sys.stderr)
         return 2
     project = Path(args.project).expanduser().resolve()
     if not project.exists():

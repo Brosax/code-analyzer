@@ -91,15 +91,10 @@ testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
 
         self.assertEqual(includes, [str(include)])
 
-    def test_clang_tidy_parser_preserves_rule_and_location(self):
+    def test_default_tool_registry_contains_only_supported_analyzers(self):
         core = load_core()
-        findings = core._parse_clang_tidy(
-            "/repo/main.cpp:9:4: warning: use nullptr [modernize-use-nullptr]\n"
-        )
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].rule_id, "modernize-use-nullptr")
-        self.assertEqual(findings[0].severity, "medium")
-        self.assertEqual(findings[0].column, "4")
+        self.assertEqual(core.TOOL_ORDER, ("cppcheck", "flawfinder", "splint"))
+        self.assertEqual(list(core.ADAPTERS), ["cppcheck", "flawfinder", "splint"])
 
 
 if __name__ == "__main__":

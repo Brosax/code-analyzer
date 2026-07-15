@@ -122,6 +122,25 @@ class CodeAnalyzerCoreTests(unittest.TestCase):
             core.publish_run(second, out, "second", False)
             self.assertFalse((out / "cppcheck").is_symlink())
 
+    def test_publishing_removes_retired_clang_tidy_link_but_preserves_history(self):
+        core = load_core()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "reports"
+            historical = out / "runs" / "historical" / "clang-tidy"
+            historical.mkdir(parents=True)
+            marker = historical / "summary.json"
+            marker.write_text("{}\n", encoding="utf-8")
+            (out / "clang-tidy").symlink_to(
+                "runs/historical/clang-tidy", target_is_directory=True
+            )
+
+            staging = out / ".current"
+            (staging / "combined").mkdir(parents=True)
+            core.publish_run(staging, out, "current", False)
+
+            self.assertFalse((out / "clang-tidy").is_symlink())
+            self.assertTrue(marker.exists())
+
 
 class CodeAnalyzerCliTests(unittest.TestCase):
     def _fake_tools(self, root: Path):
@@ -169,7 +188,7 @@ class CodeAnalyzerCliTests(unittest.TestCase):
         )
         return log, cppcheck, flawfinder, splint
 
-    def test_cli_publishes_history_latest_links_and_partial_optional_skip(self):
+    def test_cli_publishes_history_latest_links_with_three_default_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "project"
@@ -187,7 +206,6 @@ class CodeAnalyzerCliTests(unittest.TestCase):
                 "--cppcheck-bin", str(cppcheck),
                 "--flawfinder-bin", str(flawfinder),
                 "--splint-bin", str(splint),
-                "--clang-tidy-bin", str(root / "missing-clang-tidy"),
             ]
             result = subprocess.run(cmd, text=True, capture_output=True)
 
@@ -195,13 +213,15 @@ class CodeAnalyzerCliTests(unittest.TestCase):
             run = out / "runs" / "run-one"
             summary = json.loads((run / "combined" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["schema_version"], "2.0")
-            self.assertEqual(list(summary["tools"]), ["cppcheck", "flawfinder", "splint", "clang-tidy"])
-            self.assertEqual(summary["tools"]["clang-tidy"]["status"], "skipped")
+            self.assertEqual(list(summary["tools"]), ["cppcheck", "flawfinder", "splint"])
+            self.assertEqual(summary["run"]["tool_order"], ["cppcheck", "flawfinder", "splint"])
             self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["cppcheck", "flawfinder", "splint"])
             self.assertTrue((out / "latest").is_symlink())
             self.assertTrue((out / "combined" / "summary.json").exists())
             self.assertTrue((run / "combined" / "index.html").exists())
             self.assertFalse((run / "flawfinder" / "html").exists())
+            self.assertFalse((run / "clang-tidy").exists())
+            self.assertFalse((out / "clang-tidy").is_symlink())
 
             duplicate = subprocess.run(cmd, text=True, capture_output=True)
             self.assertNotEqual(duplicate.returncode, 0)
@@ -255,7 +275,7 @@ class CodeAnalyzerCliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("tools", payload)
+        self.assertEqual(list(payload["tools"]), ["cppcheck", "flawfinder", "splint"])
         self.assertIn("capabilities", payload["tools"]["cppcheck"])
         self.assertFalse(marker.exists())
 
@@ -291,44 +311,67 @@ class CodeAnalyzerCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--neverignore", recorded_arguments)
 
-    def test_clang_tidy_uses_compile_database_and_default_checks(self):
+    def test_compile_commands_remains_supported_for_cppcheck(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "project"
             project.mkdir()
-            source = project / "main.cpp"
-            source.write_text("int main(){return 0;}\n", encoding="utf-8")
+            source = project / "main.c"
+            source.write_text("int main(void){return 0;}\n", encoding="utf-8")
             database = project / "compile_commands.json"
             database.write_text(json.dumps([
-                {"directory": str(project), "file": "main.cpp", "command": "c++ -c main.cpp"}
+                {"directory": str(project), "file": "main.c", "command": "cc -c main.c"}
             ]), encoding="utf-8")
-            arguments = root / "clang-arguments.json"
-            clang_tidy = make_binary(
+            arguments = root / "cppcheck-arguments.json"
+            cppcheck = make_binary(
                 root,
-                "clang-tidy",
+                "cppcheck",
                 f"""
                 import json, sys
                 from pathlib import Path
                 if '--version' in sys.argv:
-                    print('LLVM clang-tidy 19')
+                    print('Cppcheck 2.14')
                 else:
                     Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))
-                    print({str(source)!r} + ':1:1: warning: issue [bugprone-test]')
+                    print('<?xml version="1.0"?><results><errors/></results>', file=sys.stderr)
                 """,
             )
             out = root / "out"
             result = subprocess.run([
                 sys.executable, str(SCRIPT), "--project", str(project), "--out", str(out),
-                "--run-id", "clang", "--tools", "clang-tidy", "--clang-tidy-bin", str(clang_tidy),
+                "--run-id", "cppcheck-db", "--tools", "cppcheck",
+                "--cppcheck-bin", str(cppcheck), "--compile-commands", str(database),
             ], text=True, capture_output=True)
-            summary = json.loads((out / "runs/clang/combined/summary.json").read_text(encoding="utf-8"))
             recorded = json.loads(arguments.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(summary["tools"]["clang-tidy"]["status"], "ok")
-        self.assertEqual(summary["findings"][0]["rule_id"], "bugprone-test")
-        self.assertIn("-p=%s" % project, recorded)
-        self.assertIn("-checks=clang-analyzer-*,bugprone-*,performance-*,portability-*", recorded)
+        self.assertIn("--project=%s" % database.resolve(), recorded)
+
+    def test_removed_clang_tidy_tool_and_options_are_cli_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            cases = (
+                ["--tools", "clang-tidy"],
+                ["--doctor", "--tools", "clang-tidy"],
+                ["--clang-tidy-bin", "clang-tidy"],
+                ["--clang-tidy-checks", "bugprone-*"],
+            )
+            for index, removed_arguments in enumerate(cases):
+                with self.subTest(arguments=removed_arguments):
+                    out = root / ("out-%s" % index)
+                    result = subprocess.run(
+                        [
+                            sys.executable, str(SCRIPT), "--project", str(project),
+                            "--out", str(out), "--run-id", "removed-%s" % index,
+                        ] + removed_arguments,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("clang-tidy", result.stderr)
+                    self.assertFalse((out / "runs").exists())
 
     def test_bad_output_fails_one_tool_and_other_tool_still_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,6 +491,8 @@ class DistributionLayoutTests(unittest.TestCase):
     def test_only_code_analyzer_skill_is_discoverable_and_legacy_scripts_forward(self):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["interface"]["displayName"], "Code Analyzer")
+        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertNotIn("clang-tidy", json.dumps(manifest))
         self.assertTrue((SKILL / "SKILL.md").exists())
         skill_text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         description = skill_text.split("description:", 1)[1].splitlines()[0].strip()
@@ -455,6 +500,10 @@ class DistributionLayoutTests(unittest.TestCase):
         self.assertIn("## Overview", skill_text)
         self.assertIn("## Quick reference", skill_text)
         self.assertIn("## Common mistakes", skill_text)
+        self.assertNotIn("clang-tidy", skill_text)
+        openai_metadata = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("three analyzers", openai_metadata)
+        self.assertNotIn("clang-tidy", openai_metadata)
         self.assertEqual(list((PLUGIN / "skills").rglob("SKILL.md")), [SKILL / "SKILL.md"])
         for name in ("c-cpp-review-suite", "cppcheck-analysis", "flawfinder-analysis", "splint-analysis"):
             self.assertFalse((PLUGIN / "skills" / name).exists())
@@ -465,7 +514,8 @@ class DistributionLayoutTests(unittest.TestCase):
         legacy = PLUGIN / "legacy" / "c-cpp-review-suite" / "scripts" / "run_review_suite.py"
         result = subprocess.run([sys.executable, str(legacy), "--help"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--clang-tidy-bin", result.stdout)
+        self.assertIn("--compile-commands", result.stdout)
+        self.assertNotIn("--clang-tidy", result.stdout)
 
 
 class InstallerTests(unittest.TestCase):
