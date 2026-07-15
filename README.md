@@ -1,6 +1,6 @@
 # Code Analyzer
 
-Code Analyzer is a Codex plugin and standalone Python runner for C and C++ static analysis. It runs Cppcheck, Flawfinder, and Splint, normalizes their results, separates analyzer diagnostics from code findings, and publishes versioned Markdown, JSON, and HTML reports.
+Code Analyzer is a Codex plugin and standalone Python runner for C and C++ static analysis. It runs Cppcheck, Flawfinder, and Splint, normalizes their results, separates analyzer diagnostics from code findings, and publishes versioned Markdown, JSON, and a full offline HTML dashboard.
 
 ## Requirements
 
@@ -59,7 +59,10 @@ The combined report contains:
 - Original findings with stable fingerprints and severity counts.
 - Tool diagnostics, including Splint parse, include, and configuration failures.
 - Cross-tool overlap groups based on semantic category and nearby source lines.
-- An interactive HTML table with severity, tool, and text filters.
+- A self-contained HTML dashboard with summary cards, severity/analyzer/CWE/file charts, scan scope, tool status, diagnostics, and overlap groups.
+- Every normalized finding, with severity, analyzer, CWE, and text filters plus sorting and pagination. Analyzer summaries and raw logs remain available through relative links.
+
+The dashboard is generated only after all selected analyzers finish and can be opened directly with `file://`; it has no CDN or runtime network dependency. It remains available when a tool fails, times out, or is skipped, and shows that incomplete status explicitly. `--max-findings` limits only the Markdown findings list; the HTML dashboard always contains the complete normalized result set.
 
 `--fail-on tool-error` is the default. Other gates are `none`, `medium`, `high`, and `critical`. CLI validation errors return 2, a failed gate returns 1, and cancellation returns 130.
 

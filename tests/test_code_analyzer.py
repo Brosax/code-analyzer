@@ -45,6 +45,13 @@ def make_binary(directory: Path, name: str, body: str) -> Path:
     return path
 
 
+def dashboard_data(rendered: str):
+    marker = '<script id="report-data" type="application/json">'
+    start = rendered.index(marker) + len(marker)
+    end = rendered.index("</script>", start)
+    return json.loads(rendered[start:end])
+
+
 class CodeAnalyzerCoreTests(unittest.TestCase):
     def test_normalizes_paths_fingerprints_and_groups_cross_tool_overlap(self):
         core = load_core()
@@ -285,20 +292,64 @@ class CodeAnalyzerCoreTests(unittest.TestCase):
             self.assertFalse((out / "runs" / "current").exists())
             self.assertEqual(list((out / "runs").glob("legacy-*")), [])
 
-    def test_html_report_has_filters_status_reasons_and_external_json_link(self):
+    def test_html_dashboard_embeds_all_findings_and_escapes_script_data(self):
         core = load_core()
-        finding = core.Finding("cppcheck", "high", "nullPointer", "bad <value>", "main.c", "2")
-        result = core.ToolResult("cppcheck", "failed", "bad configuration", findings=[finding])
-        summary = core.aggregate_results(Path("/tmp/project"), [result], "html")
-        rendered = core.html_report(summary, 100)
+        malicious = "bad </script><script>alert(1)</script> & value\u2028next"
+        findings = [
+            core.Finding("cppcheck", "high", "nullPointer", malicious, "main.c", "2", "CWE-476"),
+            core.Finding("cppcheck", "low", "style", "second finding", "other.c", "4"),
+        ]
+        result = core.ToolResult(
+            "cppcheck", "failed", "bad configuration", findings=findings,
+            diagnostics=[core.ToolDiagnostic(
+                "cppcheck", "error", "configuration", "invalid include path", fatal=True,
+            )],
+            metadata={
+                "stdout_log": "cppcheck.stdout.txt", "stderr_log": "cppcheck.xml", "source_count": 2,
+            },
+        )
+        flawfinder = core.ToolResult("flawfinder", "ok", findings=[
+            core.Finding("flawfinder", "high", "pointer:null", "related finding", "main.c", "3", "CWE-476"),
+        ])
+        summary = core.aggregate_results(Path("/tmp/project"), [result, flawfinder], "html")
+        rendered = core.html_report(summary, 1)
+        embedded = dashboard_data(rendered)
+
         self.assertIn('id="severity"', rendered)
         self.assertIn('id="tool"', rendered)
+        self.assertIn('id="cwe"', rendered)
         self.assertIn('id="search"', rendered)
+        self.assertIn('id="severity-chart"', rendered)
+        self.assertIn('id="overlap-body"', rendered)
         self.assertIn("bad configuration", rendered)
         self.assertIn('href="summary.json"', rendered)
-        self.assertIn("showing 1 of 1", rendered)
-        self.assertIn("bad &lt;value&gt;", rendered)
-        self.assertNotIn('"findings":', rendered)
+        self.assertNotIn("https://", rendered)
+        self.assertNotIn("http://", rendered)
+        self.assertNotIn("</script><script>alert(1)</script>", rendered)
+        self.assertIn("\\u003c/script\\u003e", rendered)
+        self.assertEqual(len(embedded["findings"]), 3)
+        self.assertEqual(embedded["findings"][0]["message"], malicious)
+        self.assertEqual(len(embedded["diagnostics"]), 1)
+        self.assertEqual(len(embedded["overlap_groups"]), 1)
+        self.assertEqual(embedded["tools"]["cppcheck"]["stdout_log"], "cppcheck.stdout.txt")
+
+    def test_max_findings_limits_markdown_but_not_html_dashboard(self):
+        core = load_core()
+        findings = [
+            core.Finding("cppcheck", "high", "rule-%s" % index, "message-%s" % index, "main.c", str(index))
+            for index in range(1, 276)
+        ]
+        result = core.ToolResult("cppcheck", "ok", findings=findings)
+        summary = core.aggregate_results(Path("/tmp/project"), [result], "all-findings")
+
+        markdown = core.markdown_report(summary, 1)
+        embedded = dashboard_data(core.html_report(summary, 1))
+
+        self.assertIn("message-1", markdown)
+        self.assertNotIn("message-2", markdown)
+        self.assertEqual(len(embedded["findings"]), 275)
+        self.assertEqual(embedded["findings"][0]["message"], "message-1")
+        self.assertEqual(embedded["findings"][-1]["message"], "message-275")
 
 
 class CodeAnalyzerCliTests(unittest.TestCase):
@@ -362,6 +413,7 @@ class CodeAnalyzerCliTests(unittest.TestCase):
                 "--project", str(project),
                 "--out", str(out),
                 "--run-id", "run-one",
+                "--max-findings", "1",
                 "--cppcheck-bin", str(cppcheck),
                 "--flawfinder-bin", str(flawfinder),
                 "--splint-bin", str(splint),
@@ -371,12 +423,16 @@ class CodeAnalyzerCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             run = out / "runs" / "run-one"
             summary = json.loads((run / "combined" / "summary.json").read_text(encoding="utf-8"))
+            dashboard = (run / "combined" / "index.html").read_text(encoding="utf-8")
             self.assertEqual(summary["schema_version"], "2.1")
             self.assertEqual(list(summary["tools"]), ["cppcheck", "flawfinder", "splint"])
             self.assertEqual(summary["run"]["tool_order"], ["cppcheck", "flawfinder", "splint"])
             self.assertEqual(summary["source_manifest"]["files"], ["src/main.c"])
             self.assertEqual(summary["total_diagnostics"], 0)
             self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["cppcheck", "flawfinder", "splint"])
+            self.assertEqual(len(dashboard_data(dashboard)["findings"]), 3)
+            self.assertIn("dashboard: %s" % (run / "combined" / "index.html"), result.stdout)
+            self.assertIn("Findings (first 1)", (run / "combined" / "summary.md").read_text(encoding="utf-8"))
             self.assertTrue((out / "latest").is_symlink())
             self.assertTrue((out / "combined" / "summary.json").exists())
             self.assertTrue((run / "combined" / "index.html").exists())
@@ -410,9 +466,14 @@ class CodeAnalyzerCliTests(unittest.TestCase):
                 capture_output=True,
             )
             summary = json.loads((out / "runs" / "missing" / "combined" / "summary.json").read_text())
+            dashboard = dashboard_data(
+                (out / "runs" / "missing" / "combined" / "index.html").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(summary["tools"]["cppcheck"]["status"], "failed")
+        self.assertEqual(dashboard["tools"]["cppcheck"]["status"], "failed")
+        self.assertEqual(dashboard["findings"], [])
 
     def test_doctor_is_json_and_does_not_run_analyzers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -835,7 +896,7 @@ class DistributionLayoutTests(unittest.TestCase):
     def test_only_code_analyzer_skill_is_discoverable_and_legacy_scripts_forward(self):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["interface"]["displayName"], "Code Analyzer")
-        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(manifest["version"], "0.5.0")
         self.assertNotIn("clang-tidy", json.dumps(manifest))
         self.assertTrue((SKILL / "SKILL.md").exists())
         skill_text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
@@ -850,7 +911,7 @@ class DistributionLayoutTests(unittest.TestCase):
         self.assertNotIn("clang-tidy", openai_metadata)
         self.assertEqual(list((PLUGIN / "skills").rglob("SKILL.md")), [SKILL / "SKILL.md"])
         self.assertLess(len(CORE.read_text(encoding="utf-8").splitlines()), 50)
-        for module in ("runtime", "adapters", "reporting", "cli"):
+        for module in ("runtime", "adapters", "dashboard", "reporting", "cli"):
             self.assertTrue((SKILL / "scripts" / ("code_analyzer_%s.py" % module)).is_file())
         for name in ("c-cpp-review-suite", "cppcheck-analysis", "flawfinder-analysis", "splint-analysis"):
             self.assertFalse((PLUGIN / "skills" / name).exists())

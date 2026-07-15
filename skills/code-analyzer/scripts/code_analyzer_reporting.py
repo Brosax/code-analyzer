@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import os
 import re
@@ -16,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from code_analyzer_dashboard import html_report
 from code_analyzer_runtime import (
     OVERLAP_LINE_DISTANCE,
     REMOVED_COMPATIBILITY_LINKS,
@@ -221,37 +221,6 @@ def markdown_report(summary: Dict[str, Any], max_findings: int) -> str:
     lines.extend(("", "## Notes", "", "- Findings require confirmation against source before code changes.",
                   "- Cross-tool overlap groups preserve every original finding; they do not deduplicate results."))
     return "\n".join(lines) + "\n"
-
-
-def html_report(summary: Dict[str, Any], max_findings: int) -> str:
-    rows = "".join(
-        '<tr data-severity="%s" data-tool="%s"><td>%s</td><td>%s</td><td>%s</td><td>%s:%s</td><td>%s</td></tr>' % tuple(
-            html.escape(str(value)) for value in (
-                item["severity"], item["tool"], item["severity"], item["tool"], item["rule_id"],
-                item["canonical_path"], item["line"], item["message"]
-            )
-        ) for item in summary["findings"][:max_findings]
-    )
-    statuses = "".join("<li><b>%s</b>: %s (%s findings, %s diagnostics)%s</li>" % (
-        html.escape(tool), html.escape(data["status"]), data["total_findings"], data["total_diagnostics"],
-        " — %s" % html.escape(str(data["reason"])) if data.get("reason") else "",
-    ) for tool, data in summary["tools"].items())
-    diagnostic_rows = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s:%s</td><td>%s</td></tr>" % tuple(
-        html.escape(str(value)) for value in (
-            item["severity"], item["tool"], item["category"], item["canonical_path"], item["line"], item["message"]
-        )
-    ) for item in summary["diagnostics"])
-    severity_options = "".join('<option value="%s">%s</option>' % (html.escape(value), html.escape(value))
-                               for value in summary["severity_counts"])
-    tool_options = "".join('<option value="%s">%s</option>' % (html.escape(value), html.escape(value))
-                           for value in summary["tools"])
-    return """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Code Analyzer</title><style>body{font:14px system-ui;margin:2rem;color:#172033}header{background:#172033;color:white;padding:1rem}.filters{display:flex;gap:.75rem;flex-wrap:wrap;margin:1rem 0}.filters input,.filters select{padding:.45rem}table{border-collapse:collapse;width:100%%}th,td{border:1px solid #ccd3df;padding:.5rem;text-align:left}tr[hidden]{display:none}.meta{color:#526071}</style></head><body><header><h1>Code Analyzer</h1><p>%s</p></header><p class="meta">%s source files · %s findings · %s diagnostics · <a href="summary.json">summary.json</a></p><h2>Tool status</h2><ul>%s</ul><h2>Tool diagnostics</h2><table><thead><tr><th>Severity</th><th>Tool</th><th>Category</th><th>Location</th><th>Message</th></tr></thead><tbody>%s</tbody></table><h2>Findings (showing %s of %s)</h2><div class="filters"><label>Severity <select id="severity"><option value="">All</option>%s</select></label><label>Tool <select id="tool"><option value="">All</option>%s</select></label><label>Search <input id="search" type="search" placeholder="Rule, file, or message"></label></div><table id="findings"><thead><tr><th>Severity</th><th>Tool</th><th>Rule</th><th>Location</th><th>Message</th></tr></thead><tbody>%s</tbody></table><script>const severity=document.getElementById('severity'),tool=document.getElementById('tool'),search=document.getElementById('search'),rows=[...document.querySelectorAll('#findings tbody tr')];function filter(){const q=search.value.toLowerCase();for(const row of rows){row.hidden=!!((severity.value&&row.dataset.severity!==severity.value)||(tool.value&&row.dataset.tool!==tool.value)||(q&&!row.textContent.toLowerCase().includes(q)));}}for(const input of [severity,tool,search])input.addEventListener('input',filter);</script></body></html>""" % (
-        html.escape(summary["project"]), (summary.get("source_manifest") or {}).get("total_files", 0),
-        summary["total_findings"], summary["total_diagnostics"], statuses,
-        diagnostic_rows or '<tr><td colspan="5">No tool diagnostics</td></tr>',
-        min(max_findings, summary["total_findings"]), summary["total_findings"],
-        severity_options, tool_options, rows or '<tr><td colspan="5">No findings</td></tr>',
-    )
 
 
 def write_outputs(summary: Dict[str, Any], results: Sequence[ToolResult], run_dir: Path, max_findings: int) -> None:

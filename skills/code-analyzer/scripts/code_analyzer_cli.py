@@ -35,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=".")
     parser.add_argument("--out", default="code-analyzer-report")
     parser.add_argument("--tools", default=",".join(TOOL_ORDER))
-    parser.add_argument("--max-findings", type=int, default=100)
+    parser.add_argument("--max-findings", type=int, default=100,
+                        help="Maximum findings listed in Markdown; HTML always contains all findings.")
     parser.add_argument("--fail-on", choices=("none", "tool-error", "medium", "high", "critical"), default="tool-error")
     for spec in ANALYZERS.values():
         parser.add_argument("--%s-bin" % spec.name, default=spec.binary_default)
@@ -158,6 +159,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     print("report: %s" % published)
     print("combined: %s" % (published / "combined" / "summary.md"))
+    print("dashboard: %s" % (published / "combined" / "index.html"))
     print("findings: %s" % summary["total_findings"])
     print("diagnostics: %s" % summary["total_diagnostics"])
     return 1 if should_fail(summary, args.fail_on) else 0

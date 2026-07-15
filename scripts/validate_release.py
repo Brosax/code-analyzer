@@ -65,6 +65,7 @@ def validate(root: Path) -> List[str]:
         "skills/code-analyzer/scripts/code_analyzer_core.py",
         "skills/code-analyzer/scripts/code_analyzer_runtime.py",
         "skills/code-analyzer/scripts/code_analyzer_adapters.py",
+        "skills/code-analyzer/scripts/code_analyzer_dashboard.py",
         "skills/code-analyzer/scripts/code_analyzer_reporting.py",
         "skills/code-analyzer/scripts/code_analyzer_cli.py",
         "skills/code-analyzer/scripts/install_code_analyzer.py",

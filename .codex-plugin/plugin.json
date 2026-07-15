@@ -1,6 +1,6 @@
 {
   "name": "code-review-suite",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Reliable C/C++ static analysis with Cppcheck, Flawfinder, and Splint.",
   "author": {
     "name": "Local developer"
@@ -9,14 +9,14 @@
   "interface": {
     "displayName": "Code Analyzer",
     "shortDescription": "Deep C/C++ static analysis and reports.",
-    "longDescription": "Run Cppcheck, Flawfinder, and Splint over a shared filtered source manifest; separate tool diagnostics from findings; preserve run history; and generate combined Markdown, JSON, and HTML reports.",
+    "longDescription": "Run Cppcheck, Flawfinder, and Splint over a shared filtered source manifest; separate tool diagnostics from findings; preserve run history; and generate a full offline HTML dashboard with combined Markdown and JSON reports.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": ["Write", "Interactive"],
     "defaultPrompt": [
       "Run Code Analyzer on this C/C++ project.",
       "Aggregate and triage Cppcheck, Flawfinder, and Splint findings and diagnostics.",
-      "Create a static-analysis dashboard."
+      "Create a full offline static-analysis dashboard after every scan."
     ]
   }
 }

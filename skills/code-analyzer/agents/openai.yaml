@@ -1,4 +1,4 @@
 interface:
   display_name: "Code Analyzer"
   short_description: "Deep C/C++ static analysis with three analyzers"
-  default_prompt: "Use $code-analyzer with Cppcheck, Flawfinder, and Splint to analyze this C/C++ project and summarize the combined report."
+  default_prompt: "Use $code-analyzer with Cppcheck, Flawfinder, and Splint to analyze this C/C++ project, generate the full offline HTML dashboard, and summarize the combined report."

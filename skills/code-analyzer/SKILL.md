@@ -21,7 +21,7 @@ By default, source discovery excludes version-control metadata, caches, `.tools`
 
 1. Inspect C/C++ source roots, generated/vendor paths, build metadata, Cppcheck suppressions, and compile databases. Confirm `combined/source-manifest.json` matches the intended scope.
 2. Run all analyzers unless the user requests a subset. The default order is `cppcheck,flawfinder,splint`; use `--tool-jobs` only for explicit tool-level parallelism.
-3. Read `latest/combined/summary.md`, then use the JSON, tool diagnostics, and raw logs to confirm parser/configuration quality.
+3. Open `latest/combined/index.html` for the complete offline dashboard, then use the JSON, tool diagnostics, and linked raw logs to confirm parser/configuration quality.
 4. Prioritize critical/high findings and `overlap_groups`, but confirm every result against source. Overlap groups do not remove findings.
 5. Report failed/timed-out/skipped tools and configuration gaps alongside the findings. Splint parse, include, and configuration diagnostics are not security findings; fatal diagnostics fail the Splint run.
 
@@ -52,6 +52,7 @@ code-analyzer-report/
 | Include normally excluded trees | `--no-default-excludes` |
 | Bound Splint command size | `--splint-command-bytes N` |
 | Apply CI gate | `--fail-on none|tool-error|medium|high|critical` |
+| Limit Markdown detail | `--max-findings N` (HTML remains complete) |
 | Find current report | `latest/combined/summary.md` and `latest/combined/index.html` |
 
 ## Configuration example
@@ -70,6 +71,7 @@ python3 scripts/run_code_analyzer.py \
 - `--patch` and `--suppressions-list` resolve relative paths from the project root.
 - Splint automatically chunks large source lists under one overall timeout.
 - Existing Cppcheck, Flawfinder, and Splint configuration flags remain supported.
+- `combined/index.html` is a self-contained offline dashboard generated after all selected tools finish. It includes every normalized finding, diagnostics, overlap groups, scope, charts, filters, sorting, and pagination; raw analyzer logs are linked rather than embedded.
 
 Install the same skill source for local hosts with:
 
