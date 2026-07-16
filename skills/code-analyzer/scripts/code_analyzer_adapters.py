@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from code_analyzer_ai import AI_TOOL, run_ai_review
 from code_analyzer_runtime import (
     ALL_SOURCE_SUFFIXES,
     ANALYZERS,
@@ -575,6 +576,7 @@ def _run_splint(args: argparse.Namespace, project: Path, out_dir: Path) -> ToolR
 
 
 ADAPTERS = {name: spec.adapter for name, spec in ANALYZERS.items()}
+ADAPTERS[AI_TOOL] = run_ai_review
 
 
 def run_tools(args: argparse.Namespace, project: Path, run_dir: Path, tools: Sequence[str]) -> List[ToolResult]:
@@ -582,7 +584,7 @@ def run_tools(args: argparse.Namespace, project: Path, run_dir: Path, tools: Seq
         out_dir = run_dir / tool
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
-            adapter = ANALYZERS[tool].adapter
+            adapter = ADAPTERS.get(tool)
             if adapter is None:
                 raise RuntimeError("analyzer adapter is not registered: %s" % tool)
             return adapter(args, project, out_dir)

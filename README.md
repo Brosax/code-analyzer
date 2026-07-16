@@ -1,18 +1,19 @@
 # Code Analyzer
 
-Code Analyzer is a Codex plugin and standalone Python runner for C and C++ static analysis. It runs Cppcheck, Flawfinder, and Splint, normalizes their results, separates analyzer diagnostics from code findings, and publishes versioned Markdown, JSON, and a full offline HTML dashboard.
+Code Analyzer is a Codex plugin and standalone Python runner for C and C++ analysis. Its default path runs Cppcheck, Flawfinder, and Splint over one filtered source manifest. Version 0.6 adds an explicitly enabled, independent multi-round AI reviewer for OpenAI, local OpenAI-compatible servers, or a ledger produced by the skill host.
 
 ## Requirements
 
 - Python 3.8 or newer; the runner uses only the standard library.
 - Cppcheck and Flawfinder for the default required checks.
 - Splint for the optional C analysis pass.
+- An environment-only API key for OpenAI provider mode, or an explicitly configured compatible endpoint. Local compatible endpoints may run without a key.
 
-The plugin never installs or upgrades external analyzers.
+The plugin never installs analyzers, modifies source, auto-discovers local AI services, or enables AI by default.
 
 ## Quick start
 
-Run directly from the skill directory:
+Run the unchanged default static suite:
 
 ```bash
 python3 skills/code-analyzer/scripts/run_code_analyzer.py \
@@ -20,55 +21,69 @@ python3 skills/code-analyzer/scripts/run_code_analyzer.py \
   --out /path/to/project/code-analyzer-report
 ```
 
-Check availability without running analyzers:
+Check static tool availability with `--doctor`. Install the shared skill with `python3 skills/code-analyzer/scripts/install_code_analyzer.py --hosts auto`; copy installs include a content hash that covers scripts, references, and metadata.
+
+## Optional AI review
+
+AI must be explicitly included as the fourth tool:
 
 ```bash
-python3 skills/code-analyzer/scripts/run_code_analyzer.py --doctor
+export OPENAI_API_KEY='...'
+python3 skills/code-analyzer/scripts/run_code_analyzer.py \
+  --project /path/to/project \
+  --tools cppcheck,flawfinder,splint,ai-review \
+  --ai-provider openai \
+  --ai-model gpt-5.6
 ```
 
-Install the shared skill for detected local agent hosts:
-
-```bash
-python3 skills/code-analyzer/scripts/install_code_analyzer.py --hosts auto
-```
-
-Use `--copy` where symbolic links are unsuitable. Copy installations include a content hash; `--check` reports damaged or stale copies, and rerunning the installer refreshes them. Multi-host installs and `--migrate-legacy` migrations are transactional.
-
-## Analysis scope
-
-All analyzers use one source manifest. Default discovery excludes `.tools`, version-control and cache directories, `node_modules`, vendor and third-party trees, generated code, build outputs, and report directories.
-
-Use repeated filters when the defaults do not match a repository:
+For vLLM, llama.cpp server, LM Studio, or an Ollama OpenAI-compatible endpoint:
 
 ```bash
 python3 skills/code-analyzer/scripts/run_code_analyzer.py \
-  --project . \
-  --source-include 'src/**' \
-  --source-include 'include/**' \
-  --source-exclude 'src/generated/**'
+  --project /path/to/project \
+  --tools ai-review \
+  --ai-provider openai-compatible \
+  --ai-model local-model \
+  --ai-base-url http://127.0.0.1:8000/v1
 ```
 
-The exact scope is saved as `combined/source-manifest.json`. A discovered or explicit compilation database is filtered to the same scope before Cppcheck runs. Splint source lists are chunked to avoid operating-system command-length limits.
+The default protocol uses four rounds and accepts 3–8. Round one presents every source-manifest range; intermediate rounds deepen defect-specific analysis; the penultimate round rereads relevant source and tries to disprove every candidate; the final round deduplicates and calibrates only verified candidates. Requests inherit the structured ledger, not an ever-growing conversation transcript. Source code and repository text are always marked as untrusted data.
 
-## Reports and exit status
+OpenAI mode follows the official [Responses API structured-output format](https://developers.openai.com/api/docs/guides/structured-outputs) with a strict JSON schema.
 
-Each completed run is published under `runs/<run-id>`. The `latest` and root-level analyzer links update atomically, while prior runs remain available. Existing flat report directories are preserved as a `runs/legacy-*` snapshot during the first new publication.
+Provider output is structured JSON. One JSON-only format repair is allowed; another parse failure makes the batch a tool error and leaves its first-round ranges uncovered. The runner independently validates every final file, inclusive line range, and exact evidence excerpt. It retains dismissed and inconclusive candidates but never promotes them to combined findings.
 
-The combined report contains:
+The skill host can follow `skills/code-analyzer/references/ai-review-protocol.md`, write the same schema `2.2` ledger, and import it with `--ai-ledger PATH`. Ledger mode is mutually exclusive with provider options.
 
-- Original findings with stable fingerprints and severity counts.
-- Tool diagnostics, including Splint parse, include, and configuration failures.
-- Cross-tool overlap groups based on semantic category and nearby source lines.
-- A self-contained HTML dashboard with summary cards, severity/analyzer/CWE/file charts, scan scope, tool status, diagnostics, and overlap groups.
-- Every normalized finding, with severity, analyzer, CWE, and text filters plus sorting and pagination. Analyzer summaries and raw logs remain available through relative links.
+Configuration precedence is CLI, `AI_REVIEW_*` environment variables, then provider defaults. OpenAI mode reads `AI_REVIEW_API_KEY` or `OPENAI_API_KEY`; a compatible endpoint receives only an explicitly set `AI_REVIEW_API_KEY`, preventing an ambient OpenAI key from leaking to a local server. Credentials are never serialized. Relevant options are:
 
-The dashboard is generated only after all selected analyzers finish and can be opened directly with `file://`; it has no CDN or runtime network dependency. It remains available when a tool fails, times out, or is skipped, and shows that incomplete status explicitly. `--max-findings` limits only the Markdown findings list; the HTML dashboard always contains the complete normalized result set.
+- `--ai-provider openai|openai-compatible`
+- `--ai-model MODEL`
+- `--ai-base-url URL`
+- `--ai-rounds N` (3–8; default 4)
+- `--ai-context-tokens N`
+- `--ai-timeout-seconds N`
+- `--ai-ledger PATH`
+- `--ai-fail-on none|medium|high|critical` (default `none`)
 
-`--fail-on tool-error` is the default. Other gates are `none`, `medium`, `high`, and `critical`. CLI validation errors return 2, a failed gate returns 1, and cancellation returns 130.
+AI findings do not affect severity-based `--fail-on`; `--ai-fail-on` is independent. Provider failures, timeouts, malformed output, and partial coverage are still tool errors and can fail `--fail-on tool-error`.
+
+## Scope and reports
+
+All analyzers use one source manifest. Default discovery excludes version-control metadata, caches, `.tools`, `node_modules`, vendor/third-party trees, generated code, build outputs, and report directories. Use repeated `--source-include` and `--source-exclude` filters when needed. A discovered or explicit compilation database is filtered to the same scope before Cppcheck runs.
+
+Each completed run is published under `runs/<run-id>`. `latest` and root-level analyzer links update atomically while prior runs remain available. The combined output includes:
+
+- Original normalized static and verified AI findings with stable fingerprints.
+- Schema `2.2` AI fields: candidate ID, category, confidence, exact evidence, impact, trigger, recommendation, and verification state.
+- Tool diagnostics and explicit AI source coverage/uncovered ranges.
+- Cross-tool overlap groups, including independently produced AI/static evidence.
+- A self-contained offline HTML dashboard with full AI candidate detail.
+- `ai-review/rounds/`, `ai-review/ledger.json`, `summary.json`, and `summary.md` when AI is selected.
+
+`--max-findings` limits only Markdown; the dashboard keeps every normalized finding. CLI validation errors return 2, a failed gate returns 1, and cancellation returns 130.
 
 ## Development
-
-Run the release checks and tests with:
 
 ```bash
 python3 scripts/validate_release.py
@@ -76,7 +91,9 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-The canonical release repository is mirrored into the workspace plugin directory after validation. `scripts/validate_release.py --compare PATH` verifies that two distribution trees have identical content.
+Tests use fake providers for deterministic round, coverage, timeout, repair, injection, evidence, and CI-gate assertions. Forward model evaluation can use the included Juliet workspace samples, but probabilistic model outputs are not fixed CI assertions.
+
+The canonical release repository is mirrored into the workspace plugin and local marketplace trees after validation. `scripts/validate_release.py --compare PATH` verifies byte-identical distribution content.
 
 ## License
 

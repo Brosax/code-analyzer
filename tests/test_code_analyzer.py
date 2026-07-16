@@ -424,7 +424,7 @@ class CodeAnalyzerCliTests(unittest.TestCase):
             run = out / "runs" / "run-one"
             summary = json.loads((run / "combined" / "summary.json").read_text(encoding="utf-8"))
             dashboard = (run / "combined" / "index.html").read_text(encoding="utf-8")
-            self.assertEqual(summary["schema_version"], "2.1")
+            self.assertEqual(summary["schema_version"], "2.2")
             self.assertEqual(list(summary["tools"]), ["cppcheck", "flawfinder", "splint"])
             self.assertEqual(summary["run"]["tool_order"], ["cppcheck", "flawfinder", "splint"])
             self.assertEqual(summary["source_manifest"]["files"], ["src/main.c"])
@@ -896,7 +896,7 @@ class DistributionLayoutTests(unittest.TestCase):
     def test_only_code_analyzer_skill_is_discoverable_and_legacy_scripts_forward(self):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["interface"]["displayName"], "Code Analyzer")
-        self.assertEqual(manifest["version"], "0.5.0")
+        self.assertEqual(manifest["version"], "0.6.0")
         self.assertNotIn("clang-tidy", json.dumps(manifest))
         self.assertTrue((SKILL / "SKILL.md").exists())
         skill_text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
@@ -907,12 +907,13 @@ class DistributionLayoutTests(unittest.TestCase):
         self.assertIn("## Common mistakes", skill_text)
         self.assertNotIn("clang-tidy", skill_text)
         openai_metadata = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
-        self.assertIn("three analyzers", openai_metadata)
+        self.assertIn("optional multi-round AI review", openai_metadata)
         self.assertNotIn("clang-tidy", openai_metadata)
         self.assertEqual(list((PLUGIN / "skills").rglob("SKILL.md")), [SKILL / "SKILL.md"])
         self.assertLess(len(CORE.read_text(encoding="utf-8").splitlines()), 50)
-        for module in ("runtime", "adapters", "dashboard", "reporting", "cli"):
+        for module in ("runtime", "adapters", "dashboard", "reporting", "cli", "ai"):
             self.assertTrue((SKILL / "scripts" / ("code_analyzer_%s.py" % module)).is_file())
+        self.assertTrue((SKILL / "references" / "ai-review-protocol.md").is_file())
         for name in ("c-cpp-review-suite", "cppcheck-analysis", "flawfinder-analysis", "splint-analysis"):
             self.assertFalse((PLUGIN / "skills" / name).exists())
             wrapper = next((PLUGIN / "legacy" / name / "scripts").glob("run_*.py"))
@@ -1028,6 +1029,10 @@ class InstallerTests(unittest.TestCase):
             stale = subprocess.run(command + ["--check"], env=env, text=True, capture_output=True)
             repaired = subprocess.run(command, env=env, text=True, capture_output=True)
             current = subprocess.run(command + ["--check"], env=env, text=True, capture_output=True)
+            reference = destination / "references/ai-review-protocol.md"
+            reference.write_text("corrupt reference\n", encoding="utf-8")
+            stale_reference = subprocess.run(command + ["--check"], env=env, text=True, capture_output=True)
+            repaired_reference = subprocess.run(command, env=env, text=True, capture_output=True)
             marker = json.loads((destination / ".code-analyzer-source.json").read_text(encoding="utf-8"))
 
             self.assertEqual(installed.returncode, 0, installed.stderr)
@@ -1035,7 +1040,11 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("stale", stale.stdout)
             self.assertEqual(repaired.returncode, 0, repaired.stderr)
             self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertEqual(stale_reference.returncode, 1, stale_reference.stderr)
+            self.assertEqual(repaired_reference.returncode, 0, repaired_reference.stderr)
             self.assertEqual((destination / "SKILL.md").read_text(), (SKILL / "SKILL.md").read_text())
+            self.assertEqual(reference.read_text(), (SKILL / "references/ai-review-protocol.md").read_text())
+            self.assertEqual(marker["format"], 2)
             self.assertEqual(len(marker["content_sha256"]), 64)
 
     def test_multi_host_legacy_preflight_prevents_partial_install(self):

@@ -1,21 +1,22 @@
 {
   "name": "code-review-suite",
-  "version": "0.5.0",
-  "description": "Reliable C/C++ static analysis with Cppcheck, Flawfinder, and Splint.",
+  "version": "0.6.0",
+  "description": "Reliable C/C++ static analysis with optional independent multi-round AI review.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Code Analyzer",
-    "shortDescription": "Deep C/C++ static analysis and reports.",
-    "longDescription": "Run Cppcheck, Flawfinder, and Splint over a shared filtered source manifest; separate tool diagnostics from findings; preserve run history; and generate a full offline HTML dashboard with combined Markdown and JSON reports.",
+    "shortDescription": "C/C++ static and optional AI review.",
+    "longDescription": "Run Cppcheck, Flawfinder, and Splint over a shared filtered source manifest, optionally add an independent multi-round AI reviewer, validate exact AI evidence, preserve run history, and generate full offline HTML, Markdown, and JSON reports.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": ["Write", "Interactive"],
     "defaultPrompt": [
       "Run Code Analyzer on this C/C++ project.",
       "Aggregate and triage Cppcheck, Flawfinder, and Splint findings and diagnostics.",
+      "Enable multi-round AI review only when explicitly requested.",
       "Create a full offline static-analysis dashboard after every scan."
     ]
   }

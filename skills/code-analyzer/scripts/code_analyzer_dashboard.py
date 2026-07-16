@@ -175,6 +175,9 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
     tbody tr:hover { background: #f8faff; }
     td.location, td.message { min-width: 14rem; overflow-wrap: anywhere; }
     td.message { min-width: 20rem; }
+    .ai-detail { max-width: 32rem; }
+    .ai-detail p { margin: .35rem 0; }
+    .code-evidence { white-space: pre-wrap; overflow-wrap: anywhere; font: .82rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .controls {
       display: grid;
       grid-template-columns: minmax(14rem, 2fr) repeat(4, minmax(8rem, 1fr)) auto;
@@ -226,6 +229,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
     <a href="#overview">Overview</a>
     <a href="#distribution">Distribution</a>
     <a href="#tool-status">Tools</a>
+    <a href="#ai-review">AI review</a>
     <a href="#scan-scope">Scope</a>
     <a href="#overlap">Overlap</a>
     <a href="#diagnostics">Diagnostics</a>
@@ -250,6 +254,16 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
     <section id="tool-status">
       <div class="section-head"><h2>Tool status</h2><span class="muted">Reports and raw analyzer logs</span></div>
       <div class="tools" id="tool-cards"></div>
+    </section>
+
+    <section id="ai-review" hidden>
+      <div class="section-head"><h2>AI review protocol</h2><span class="muted">Independent multi-round evidence</span></div>
+      <div class="panel scope-grid">
+        <div><h3>Execution</h3><dl class="key-values" id="ai-values"></dl></div>
+        <div><h3>Candidate outcomes</h3><div class="bar-chart" id="ai-candidate-chart"></div></div>
+      </div>
+      <div class="section-head"><h3>Review candidates</h3><span class="muted" id="ai-candidate-count"></span></div>
+      <div class="table-wrap"><table><thead><tr><th>Status</th><th>ID</th><th>Category</th><th>Confidence</th><th>Location</th><th>Conclusion</th><th>Verification</th></tr></thead><tbody id="ai-candidate-body"></tbody></table></div>
     </section>
 
     <section id="scan-scope">
@@ -416,6 +430,10 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       appendPair(values, "Duration", data.duration_seconds === null || data.duration_seconds === undefined ? "—" : `${Number(data.duration_seconds).toFixed(2)} s`);
       appendPair(values, "Sources", data.source_count);
       appendPair(values, "Exit code", data.returncode);
+      if (data.ai_review) {
+        appendPair(values, "AI rounds", `${data.ai_review.rounds_completed || 0}/${data.ai_review.rounds_requested || 0}`);
+        appendPair(values, "AI coverage", data.ai_review.coverage && data.ai_review.coverage.complete ? "Complete" : "Incomplete");
+      }
       card.append(title, values);
       if (data.reason) card.append(make("p", "reason", data.reason));
       const links = make("div", "links");
@@ -423,6 +441,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         reportLink("Tool summary", data.summary),
         reportLink("Standard output", data.stdout_log ? `${tool}/${data.stdout_log}` : ""),
         reportLink("Standard error", data.stderr_log ? `${tool}/${data.stderr_log}` : ""),
+        reportLink("Review ledger", data.ai_review ? data.ai_review.ledger : ""),
       ].filter(Boolean);
       if (candidates.length) links.append(...candidates);
       else links.append(make("span", "muted", "No report files available"));
@@ -430,6 +449,38 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       toolCards.append(card);
     });
     if (!toolEntries.length) empty(toolCards, "No analyzer status was recorded.");
+
+    const aiReview = report.ai_review || null;
+    if (aiReview) {
+      byId("ai-review").hidden = false;
+      const aiValues = byId("ai-values");
+      const configuration = aiReview.configuration || {};
+      const coverage = aiReview.coverage || {};
+      appendPair(aiValues, "Mode", configuration.mode);
+      appendPair(aiValues, "Provider", configuration.provider);
+      appendPair(aiValues, "Model", configuration.model);
+      appendPair(aiValues, "Rounds", `${aiReview.rounds_completed || 0}/${aiReview.rounds_requested || 0}`);
+      appendPair(aiValues, "First-round coverage", `${number(coverage.covered_files)}/${number(coverage.total_files)} files`);
+      appendPair(aiValues, "Coverage complete", coverage.complete ? "Yes" : "No");
+      renderBars("ai-candidate-chart", Object.entries(aiReview.candidate_counts || {}));
+      const aiCandidates = aiReview.candidates || [];
+      byId("ai-candidate-count").textContent = `${number(aiCandidates.length)} candidate${aiCandidates.length === 1 ? "" : "s"}`;
+      const aiBody = byId("ai-candidate-body");
+      aiCandidates.forEach((item) => {
+        const row = make("tr");
+        row.append(
+          make("td", "", item.verification_status || "unknown"),
+          make("td", "", item.candidate_id || "—"),
+          make("td", "", item.category || "other"),
+          make("td", "", item.confidence === undefined ? "—" : Number(item.confidence).toFixed(2)),
+          make("td", "location", location({canonical_path: item.file, line: item.line_start})),
+          make("td", "message", item.conclusion || item.title || "—"),
+          make("td", "message", item.verification_notes || (item.validation_errors || []).join("; ") || "—")
+        );
+        aiBody.append(row);
+      });
+      if (!aiCandidates.length) empty(aiBody, "No AI review candidates were recorded.", 7);
+    }
 
     const scopeValues = byId("scope-values");
     appendPair(scopeValues, "Included files", number(manifest.total_files));
@@ -509,7 +560,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         if (selectedTool && item.tool !== selectedTool) return false;
         if (selectedCwe && item.cwe !== selectedCwe) return false;
         if (!query) return true;
-        return [item.tool, item.severity, item.rule_id, item.cwe, item.canonical_path, item.line, item.message].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+        return [item.tool, item.severity, item.rule_id, item.cwe, item.category, item.canonical_path, item.line, item.message, item.impact, item.trigger, item.recommendation].some((value) => String(value || "").toLocaleLowerCase().includes(query));
       });
       const mode = controls.sort.value;
       selected.sort((left, right) => {
@@ -535,7 +586,19 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         const evidence = make("td");
         const link = reportLink("Tool report", item.source_report);
         evidence.append(link || document.createTextNode("—"));
-        row.append(severity, make("td", "", item.tool), make("td", "", item.rule_id || "—"), make("td", "", item.cwe || "—"), make("td", "location", location(item)), make("td", "message", item.message), evidence);
+        const message = make("td", "message", item.message);
+        if (item.tool === "ai-review") {
+          const details = make("details", "ai-detail");
+          details.append(make("summary", "", `${item.category || "other"} · confidence ${Number(item.confidence || 0).toFixed(2)} · ${item.verification_status || "unknown"}`));
+          [["Impact", item.impact], ["Trigger", item.trigger], ["Recommendation", item.recommendation], ["Verification", item.verification_notes]].forEach(([label, value]) => {
+            const paragraph = make("p");
+            paragraph.append(make("strong", "", `${label}: `), document.createTextNode(value || "—"));
+            details.append(paragraph);
+          });
+          if (item.evidence) details.append(make("pre", "code-evidence", item.evidence));
+          message.append(details);
+        }
+        row.append(severity, make("td", "", item.tool), make("td", "", item.rule_id || "—"), make("td", "", item.cwe || "—"), make("td", "location", location(item)), message, evidence);
         body.append(row);
       });
       if (!visible.length) empty(body, "No findings match the current filters.", 7);

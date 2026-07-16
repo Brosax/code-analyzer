@@ -12,16 +12,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
+from code_analyzer_ai import AI_TOOL, resolve_ai_config
 from code_analyzer_adapters import find_compile_commands, run_tools
 from code_analyzer_reporting import (
     _safe_run_id,
     aggregate_results,
     publish_run,
     should_fail,
+    should_fail_ai,
     write_outputs,
 )
 from code_analyzer_runtime import (
     ANALYZERS,
+    DEFAULT_TOOL_ORDER,
     SCHEMA_VERSION,
     TOOL_ORDER,
     ProcessRegistry,
@@ -34,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Code Analyzer for C and C++ projects.")
     parser.add_argument("--project", default=".")
     parser.add_argument("--out", default="code-analyzer-report")
-    parser.add_argument("--tools", default=",".join(TOOL_ORDER))
+    parser.add_argument("--tools", default=",".join(DEFAULT_TOOL_ORDER))
     parser.add_argument("--max-findings", type=int, default=100,
                         help="Maximum findings listed in Markdown; HTML always contains all findings.")
     parser.add_argument("--fail-on", choices=("none", "tool-error", "medium", "high", "critical"), default="tool-error")
@@ -64,6 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--splint-include", "--include", action="append", default=[])
     parser.add_argument("--splint-define", "--define", action="append", default=[])
     parser.add_argument("--splint-command-bytes", type=int, default=100000)
+    parser.add_argument("--ai-provider", choices=("openai", "openai-compatible"))
+    parser.add_argument("--ai-model")
+    parser.add_argument("--ai-base-url")
+    parser.add_argument("--ai-rounds", type=int)
+    parser.add_argument("--ai-context-tokens", type=int)
+    parser.add_argument("--ai-timeout-seconds", type=int)
+    parser.add_argument("--ai-ledger", metavar="PATH")
+    parser.add_argument("--ai-fail-on", choices=("none", "medium", "high", "critical"))
     return parser
 
 
@@ -102,13 +113,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: project does not exist: %s" % project, file=os.sys.stderr)
         return 2
     out_root = Path(args.out).expanduser().resolve()
+    project_root = project if project.is_dir() else project.parent
     try:
+        args.ai_config = resolve_ai_config(args, AI_TOOL in tools, project_root)
         run_id = _safe_run_id(args.run_id)
         args.compile_commands_path = find_compile_commands(project, args.compile_commands)
     except ValueError as exc:
         print("error: %s" % exc, file=os.sys.stderr)
         return 2
-    project_root = project if project.is_dir() else project.parent
     for option, attribute in (("--suppressions-list", "suppressions_list"), ("--patch", "patch")):
         value = getattr(args, attribute)
         if not value:
@@ -162,4 +174,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("dashboard: %s" % (published / "combined" / "index.html"))
     print("findings: %s" % summary["total_findings"])
     print("diagnostics: %s" % summary["total_diagnostics"])
-    return 1 if should_fail(summary, args.fail_on) else 0
+    return 1 if (should_fail(summary, args.fail_on) or should_fail_ai(summary, args.ai_fail_on)) else 0

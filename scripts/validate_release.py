@@ -61,7 +61,9 @@ def validate(root: Path) -> List[str]:
     required = (
         ".codex-plugin/plugin.json", "README.md", "LICENSE",
         "skills/code-analyzer/SKILL.md", "skills/code-analyzer/agents/openai.yaml",
+        "skills/code-analyzer/references/ai-review-protocol.md",
         "skills/code-analyzer/scripts/run_code_analyzer.py",
+        "skills/code-analyzer/scripts/code_analyzer_ai.py",
         "skills/code-analyzer/scripts/code_analyzer_core.py",
         "skills/code-analyzer/scripts/code_analyzer_runtime.py",
         "skills/code-analyzer/scripts/code_analyzer_adapters.py",
@@ -85,6 +87,8 @@ def validate(root: Path) -> List[str]:
                 errors.append("plugin name must be code-review-suite")
             if not SEMVER.match(str(manifest.get("version", ""))):
                 errors.append("plugin version must be semantic x.y.z")
+            elif manifest.get("version") != "0.6.0":
+                errors.append("plugin version must be 0.6.0 for this release")
             if manifest.get("skills") != "./skills/":
                 errors.append("plugin skills path must be ./skills/")
 
@@ -101,6 +105,13 @@ def validate(root: Path) -> List[str]:
                 errors.append("skill name must be code-analyzer")
             if not metadata.get("description", "").startswith("Use when"):
                 errors.append("skill description must start with 'Use when'")
+
+    skill_root = root / "skills" / "code-analyzer"
+    installer = skill_root / "scripts" / "install_code_analyzer.py"
+    if installer.is_file():
+        installer_text = installer.read_text(encoding="utf-8")
+        if "content_hash(source)" not in installer_text or "path.rglob" not in installer_text:
+            errors.append("installer must content-hash the complete skill tree")
 
     for path in distribution_files(root):
         if path.suffix == ".py":

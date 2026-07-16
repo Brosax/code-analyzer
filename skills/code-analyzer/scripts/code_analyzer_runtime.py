@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "2.2"
+AI_REVIEW_TOOL = "ai-review"
 REMOVED_COMPATIBILITY_LINKS = ("clang-tidy",)
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0, "unknown": 0}
 ALL_SOURCE_SUFFIXES = frozenset((
@@ -48,6 +49,18 @@ class Finding:
     cwe: str = ""
     column: str = ""
     source_report: str = ""
+    candidate_id: str = ""
+    category: str = ""
+    confidence: Optional[float] = None
+    evidence_start: str = ""
+    evidence_end: str = ""
+    evidence_range: Optional[Dict[str, str]] = None
+    evidence: str = ""
+    impact: str = ""
+    trigger: str = ""
+    recommendation: str = ""
+    verification_status: str = ""
+    verification_notes: str = ""
 
 
 @dataclass
@@ -205,7 +218,9 @@ ANALYZERS: Dict[str, AnalyzerSpec] = {
         AnalyzerSpec("splint", False, "splint", ("c-analysis",), ("-help", "version")),
     )
 }
-TOOL_ORDER = tuple(ANALYZERS)
+STATIC_TOOL_ORDER = tuple(ANALYZERS)
+TOOL_ORDER = STATIC_TOOL_ORDER + (AI_REVIEW_TOOL,)
+DEFAULT_TOOL_ORDER = STATIC_TOOL_ORDER
 REQUIRED_TOOLS = frozenset(name for name, spec in ANALYZERS.items() if spec.required)
 
 

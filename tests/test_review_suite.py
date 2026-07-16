@@ -98,10 +98,11 @@ testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overf
 
         self.assertEqual(includes, [str(include)])
 
-    def test_default_tool_registry_contains_only_supported_analyzers(self):
+    def test_default_tool_registry_keeps_three_static_tools_and_optional_ai(self):
         core = load_core()
-        self.assertEqual(core.TOOL_ORDER, ("cppcheck", "flawfinder", "splint"))
-        self.assertEqual(list(core.ADAPTERS), ["cppcheck", "flawfinder", "splint"])
+        self.assertEqual(core.DEFAULT_TOOL_ORDER, ("cppcheck", "flawfinder", "splint"))
+        self.assertEqual(core.TOOL_ORDER, ("cppcheck", "flawfinder", "splint", "ai-review"))
+        self.assertEqual(list(core.ADAPTERS), ["cppcheck", "flawfinder", "splint", "ai-review"])
         self.assertEqual([spec.required for spec in core.ANALYZERS.values()], [True, True, False])
 
 

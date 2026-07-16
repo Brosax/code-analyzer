@@ -22,6 +22,7 @@ HOST_DIRS = {
 }
 LEGACY_NAMES = ("c-cpp-review-suite", "cppcheck-analysis", "flawfinder-analysis", "splint-analysis")
 MARKER = ".code-analyzer-source.json"
+MARKER_FORMAT = 2
 
 
 def parser() -> argparse.ArgumentParser:
@@ -129,7 +130,11 @@ def install_copy(source: Path, destination: Path, source_hash: Optional[str] = N
             shutil.rmtree(str(temporary))
     try:
         shutil.copytree(str(source), str(temporary), symlinks=True, ignore=_copy_ignore)
-        payload = {"source": str(source), "content_sha256": source_hash or content_hash(source)}
+        payload = {
+            "format": MARKER_FORMAT,
+            "source": str(source),
+            "content_sha256": source_hash or content_hash(source),
+        }
         (temporary / MARKER).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(str(temporary), str(destination))
     finally:
@@ -175,7 +180,7 @@ def _legacy_backup(path: Path, stamp: str) -> Path:
 
 
 def _refresh_marker(path: Path, source: Path, source_hash: str) -> None:
-    payload = {"source": str(source), "content_sha256": source_hash}
+    payload = {"format": MARKER_FORMAT, "source": str(source), "content_sha256": source_hash}
     temporary = path / (".%s.tmp-%s" % (MARKER, os.getpid()))
     try:
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -265,7 +270,7 @@ def main(argv=None) -> int:
             if states[destination] == "current":
                 if not destination.is_symlink():
                     marker = _marker_payload(destination)
-                    if marker.get("content_sha256") != source_hash:
+                    if marker.get("content_sha256") != source_hash or marker.get("format") != MARKER_FORMAT:
                         markers_to_refresh.append(destination)
                 print("already installed: %s (%s)" % (destination, ",".join(host_names)))
                 continue

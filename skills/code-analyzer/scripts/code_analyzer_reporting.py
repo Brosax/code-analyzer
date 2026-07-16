@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from code_analyzer_dashboard import html_report
 from code_analyzer_runtime import (
+    AI_REVIEW_TOOL,
     OVERLAP_LINE_DISTANCE,
     REMOVED_COMPATIBILITY_LINKS,
     SCHEMA_VERSION,
@@ -64,6 +65,11 @@ def _finding_category(finding: Dict[str, Any]) -> str:
     )
     cwe_match = re.search(r"CWE-?(\d+)", value, re.I)
     cwe = int(cwe_match.group(1)) if cwe_match else None
+    declared = str(finding.get("category", "")).strip().lower()
+    if declared in {
+        "null-dereference", "buffer", "uninitialized", "resource-leak", "format", "randomness",
+    }:
+        return declared
     if cwe == 476:
         return "null-dereference"
     if cwe in {119, 120, 121, 122, 124, 125, 126, 127, 131, 680, 787, 788, 805}:
@@ -141,6 +147,13 @@ def aggregate_results(project: Path, results: Sequence[ToolResult], run_id: str,
     for result in results:
         for finding in result.findings:
             item = asdict(finding)
+            if finding.tool != AI_REVIEW_TOOL:
+                for key in (
+                    "candidate_id", "category", "confidence", "evidence_start", "evidence_end", "evidence_range",
+                    "evidence", "impact", "trigger", "recommendation", "verification_status",
+                    "verification_notes",
+                ):
+                    item.pop(key, None)
             item["severity"] = item["severity"] if item["severity"] in SEVERITY_RANK else "unknown"
             item["rank"] = SEVERITY_RANK[item["severity"]]
             item["canonical_path"] = canonical_path(item["file"], project)
@@ -159,7 +172,7 @@ def aggregate_results(project: Path, results: Sequence[ToolResult], run_id: str,
     ))
     overlap_groups = _build_overlap_groups(findings)
     severity_counts = Counter(item["severity"] for item in findings)
-    return {
+    summary = {
         "schema_version": SCHEMA_VERSION,
         "project": str(project.resolve()),
         "run": {
@@ -180,6 +193,10 @@ def aggregate_results(project: Path, results: Sequence[ToolResult], run_id: str,
         "diagnostics": diagnostics,
         "overlap_groups": overlap_groups,
     }
+    ai_result = next((result for result in results if result.tool == AI_REVIEW_TOOL), None)
+    if ai_result is not None:
+        summary["ai_review"] = ai_result.metadata.get("ai_review", {})
+    return summary
 
 
 def markdown_report(summary: Dict[str, Any], max_findings: int) -> str:
@@ -216,6 +233,13 @@ def markdown_report(summary: Dict[str, Any], max_findings: int) -> str:
             finding["severity"], finding["tool"], finding["rule_id"],
             finding["canonical_path"] or "<unknown>", finding["line"], finding["message"],
         ))
+        if finding["tool"] == AI_REVIEW_TOOL:
+            lines.append("  - Category: `%s`; confidence: `%s`; verification: `%s`" % (
+                finding.get("category") or "other", finding.get("confidence"),
+                finding.get("verification_status") or "unknown",
+            ))
+            lines.append("  - Impact: %s" % (finding.get("impact") or "Not supplied."))
+            lines.append("  - Recommendation: %s" % (finding.get("recommendation") or "Not supplied."))
     if not summary["findings"]:
         lines.append("- No findings to list.")
     lines.extend(("", "## Notes", "", "- Findings require confirmation against source before code changes.",
@@ -239,6 +263,40 @@ def write_outputs(summary: Dict[str, Any], results: Sequence[ToolResult], run_di
                       "Diagnostics: `%s`" % len(result.diagnostics), ""]
         if result.reason:
             tool_lines.extend(("Reason: %s" % result.reason, ""))
+        if result.tool == AI_REVIEW_TOOL:
+            review = result.metadata.get("ai_review", {})
+            coverage = review.get("coverage", {})
+            counts = review.get("candidate_counts", {})
+            tool_lines.extend((
+                "## Review Protocol", "",
+                "- Rounds: `%s/%s`" % (
+                    review.get("rounds_completed", 0), review.get("rounds_requested", 0),
+                ),
+                "- First-round coverage: `%s/%s` files; complete: `%s`" % (
+                    coverage.get("covered_files", 0), coverage.get("total_files", 0),
+                    str(bool(coverage.get("complete"))).lower(),
+                ),
+                "- Verified candidates: `%s`" % counts.get("verified", 0),
+                "- Dismissed candidates: `%s`" % counts.get("dismissed", 0),
+                "- Inconclusive candidates: `%s`" % counts.get("inconclusive", 0),
+                "- Structured ledger: `ledger.json`", "- Per-round records: `rounds/`", "",
+                "## Final Findings", "",
+            ))
+            ai_findings = [item for item in summary["findings"] if item["tool"] == AI_REVIEW_TOOL]
+            if ai_findings:
+                for finding in ai_findings:
+                    tool_lines.extend((
+                        "- `%s` `%s` %s:%s — %s" % (
+                            finding["severity"], finding.get("candidate_id") or finding["rule_id"],
+                            finding["canonical_path"], finding["line"], finding["message"],
+                        ),
+                        "  - Impact: %s" % finding.get("impact", ""),
+                        "  - Trigger: %s" % finding.get("trigger", ""),
+                        "  - Recommendation: %s" % finding.get("recommendation", ""),
+                        "  - Verification: %s" % finding.get("verification_notes", ""),
+                    ))
+            else:
+                tool_lines.append("- No verified, finalized AI findings.")
         (tool_dir / "summary.md").write_text("\n".join(tool_lines), encoding="utf-8")
     combined = run_dir / "combined"
     combined.mkdir(parents=True, exist_ok=True)
@@ -256,7 +314,20 @@ def should_fail(summary: Dict[str, Any], policy: str) -> bool:
     if policy == "tool-error":
         return any(data.get("status") in ("failed", "timed_out") for data in summary["tools"].values())
     minimum = SEVERITY_RANK[policy]
-    return any(int(item["rank"]) >= minimum for item in summary["findings"])
+    return any(
+        item.get("tool") != AI_REVIEW_TOOL and int(item["rank"]) >= minimum
+        for item in summary["findings"]
+    )
+
+
+def should_fail_ai(summary: Dict[str, Any], policy: str) -> bool:
+    if policy == "none":
+        return False
+    minimum = SEVERITY_RANK[policy]
+    return any(
+        item.get("tool") == AI_REVIEW_TOOL and int(item["rank"]) >= minimum
+        for item in summary["findings"]
+    )
 
 
 def _safe_run_id(value: Optional[str]) -> str:
