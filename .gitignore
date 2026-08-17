@@ -1,4 +1,13 @@
 __pycache__/
 *.py[cod]
-.DS_Store
-code-analyzer-report/
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+code-analyzer-reports/
+uv.lock
+.freebuff/
+datas/
+plugin_version/
+trusted-firmware-m/

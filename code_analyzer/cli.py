@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from . import __version__
+from .config import load_config
+from .compile_db_wizard import run_compile_db
+from .dashboard import rebuild_dashboard
+from .doctor import probe_all
+from .errors import UserError
+from .runner import analyze
+from .recovery import recover_report
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="code-analyzer", description="Evidence-first C/C++ static analysis runner")
+    root.add_argument("--version", action="version", version=f"code-analyzer {__version__}")
+    commands = root.add_subparsers(dest="command")
+    tui = commands.add_parser("tui", help="open the basic full-screen scan interface")
+    tui.add_argument("source", type=Path, nargs="?", default=Path.cwd())
+    tui.add_argument("--config", type=Path)
+    doctor = commands.add_parser("doctor", help="probe analyzer and WSL capabilities")
+    doctor.add_argument("--config", type=Path)
+    doctor.add_argument("--json", action="store_true", dest="as_json")
+    compile_db = commands.add_parser("compile-db", help="discover or prepare a JSON compilation database")
+    compile_db.add_argument("source", type=Path)
+    compile_db.add_argument("--json", action="store_true", dest="as_json", help="report discovery without executing anything")
+    compile_db.add_argument("--method", choices=("cmake", "command"))
+    compile_db.add_argument("--build-dir", type=Path)
+    compile_db.add_argument("--generator", choices=("Ninja", "Unix Makefiles"))
+    compile_db.add_argument("--preset")
+    compile_db.add_argument("--cmake-arg", action="append", default=[])
+    compile_db.add_argument("--expected-db", type=Path)
+    compile_db.add_argument("--timeout", type=_positive_float, default=900.0)
+    compile_db.add_argument("--yes", action="store_true")
+    # ``*`` (instead of REMAINDER) keeps options after SOURCE parseable.  The
+    # conventional ``--`` separator still protects every custom command arg.
+    compile_db.add_argument("command_argv", nargs="*", metavar="COMMAND")
+    rebuild = commands.add_parser("rebuild-dashboard", help="rebuild index.html from an existing report")
+    rebuild.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    recover = commands.add_parser("recover-report", help="rebuild all derived artifacts from existing native evidence")
+    recover.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    run = commands.add_parser("analyze", help="analyze a C/C++ source tree")
+    run.add_argument("source", type=Path)
+    run.add_argument("--config", type=Path)
+    run.add_argument("--output-root", type=Path)
+    compile_group = run.add_mutually_exclusive_group()
+    compile_group.add_argument("--compile-db", type=Path)
+    compile_group.add_argument("--no-compile-db", action="store_true")
+    run.add_argument("--tool", choices=("cppcheck", "flawfinder", "splint"), action="append")
+    run.add_argument("--include", action="append", type=Path, help="project include directory")
+    run.add_argument("--system-include", action="append", type=Path)
+    run.add_argument("--define", action="append")
+    run.add_argument("--undefine", action="append")
+    run.add_argument("--exclude", action="append", help="source-relative exclusion glob")
+    run.add_argument("--c-standard")
+    run.add_argument("--cpp-standard")
+    run.add_argument("--cppcheck-platform")
+    run.add_argument("--cppcheck-timeout", type=_positive_float)
+    run.add_argument("--flawfinder-timeout", type=_positive_float)
+    run.add_argument("--splint-tu-timeout", type=_positive_float)
+    run.add_argument("--splint-total-timeout", type=_positive_float)
+    run.add_argument("--splint-scope", choices=("auto", "build", "inventory"))
+    run.add_argument("--splint-jobs", type=_positive_int)
+    run.add_argument("--splint-heartbeat", type=_positive_float)
+    run.add_argument("--termination-grace", type=_positive_float)
+    run.add_argument("--follow-symlinks", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--respect-gitignore", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--shareable-export", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--review", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--fail-on", choices=("none", "medium", "high", "critical"))
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    root_parser = parser()
+    if not raw_argv:
+        if _has_tty():
+            raw_argv = ["tui", str(Path.cwd())]
+        else:
+            root_parser.print_help(file=sys.stderr)
+            print("\ncode-analyzer: hint: run 'code-analyzer tui [SOURCE]' in an interactive terminal", file=sys.stderr)
+            return 2
+    args = root_parser.parse_args(_normalize_compile_db_args(raw_argv))
+    try:
+        if args.command == "tui":
+            if not _has_tty():
+                root_parser.print_help(file=sys.stderr)
+                print("\ncode-analyzer: error: TUI requires an interactive terminal (TTY)", file=sys.stderr)
+                return 2
+            from .tui import run_tui
+
+            outcome = run_tui(args.source, args.config)
+            if outcome.report_directory is not None:
+                print(outcome.report_directory)
+            return outcome.exit_code
+        if args.command == "doctor":
+            config = load_config(Path.cwd(), args.config, None)
+            result = probe_all(config)
+            if args.as_json:
+                print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                _print_doctor(result)
+            return 0 if result["ok"] else 20
+        if args.command == "compile-db":
+            return run_compile_db(args)
+        if args.command == "rebuild-dashboard":
+            print(rebuild_dashboard(args.report_directory))
+            return 0
+        if args.command == "recover-report":
+            print(recover_report(args.report_directory))
+            return 0
+        source = args.source.expanduser().resolve()
+        overrides = _overrides(args)
+        config = load_config(source, args.config, overrides)
+        exit_code, run_dir = analyze(source, config)
+        print(run_dir)
+        return exit_code
+    except UserError as exc:
+        print(f"code-analyzer: error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("code-analyzer: interrupted", file=sys.stderr)
+        return 130
+
+
+def _has_tty() -> bool:
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _overrides(args: argparse.Namespace) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    run: dict[str, Any] = {}
+    source: dict[str, Any] = {}
+    build: dict[str, Any] = {}
+    tools: dict[str, Any] = {}
+    review: dict[str, Any] = {}
+    if args.output_root is not None:
+        run["output_root"] = str(args.output_root.resolve())
+    if args.shareable_export is not None:
+        run["shareable_export"] = args.shareable_export
+    if args.termination_grace is not None:
+        run["termination_grace_seconds"] = args.termination_grace
+    if args.exclude is not None:
+        source["exclude"] = args.exclude
+    if args.follow_symlinks is not None:
+        source["follow_symlinks"] = args.follow_symlinks
+    if args.respect_gitignore is not None:
+        source["respect_gitignore"] = args.respect_gitignore
+    if args.compile_db is not None:
+        build.update({"compile_database_mode": "explicit", "compile_database": str(args.compile_db.resolve())})
+    elif args.no_compile_db:
+        build.update({"compile_database_mode": "disabled", "compile_database": None})
+    for argument, key in ((args.include, "include"), (args.system_include, "system_include")):
+        if argument is not None:
+            build[key] = [str(path.resolve()) for path in argument]
+    for argument, key in ((args.define, "define"), (args.undefine, "undefine")):
+        if argument is not None:
+            build[key] = argument
+    for key in ("c_standard", "cpp_standard", "cppcheck_platform"):
+        if getattr(args, key) is not None:
+            build[key] = getattr(args, key)
+    timeout_values = {
+        "cppcheck": ("timeout_seconds", args.cppcheck_timeout),
+        "flawfinder": ("timeout_seconds", args.flawfinder_timeout),
+        "splint_tu": ("tu_timeout_seconds", args.splint_tu_timeout),
+        "splint_total": ("total_timeout_seconds", args.splint_total_timeout),
+    }
+    for name, (key, timeout) in timeout_values.items():
+        if timeout is not None:
+            tool = name.split("_", 1)[0]
+            tools.setdefault(tool, {})[key] = timeout
+    if args.splint_scope is not None:
+        tools.setdefault("splint", {})["scope"] = args.splint_scope
+    if args.splint_jobs is not None:
+        tools.setdefault("splint", {})["jobs"] = args.splint_jobs
+    if args.splint_heartbeat is not None:
+        tools.setdefault("splint", {})["heartbeat_seconds"] = args.splint_heartbeat
+    if args.review is not None:
+        review["enabled"] = args.review
+    if args.fail_on is not None:
+        review["fail_on"] = args.fail_on
+    if args.tool:
+        selected = set(args.tool)
+        for name in ("cppcheck", "flawfinder", "splint"):
+            tools.setdefault(name, {})["enabled"] = name in selected
+    if run:
+        value["run"] = run
+    if source:
+        value["source"] = source
+    if build:
+        value["build"] = build
+    if tools:
+        value["tools"] = tools
+    if review:
+        value["review"] = review
+    return value
+
+
+def _normalize_compile_db_args(argv: list[str]) -> list[str]:
+    """Let ``--cmake-arg -D...`` work despite argparse option parsing.
+
+    Values are only regrouped before the custom-command ``--`` separator and
+    remain individual argv elements when CMake is eventually executed.
+    """
+    if not argv or argv[0] != "compile-db":
+        return argv
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            result.extend(argv[index:])
+            break
+        if item == "--cmake-arg" and index + 1 < len(argv):
+            result.append("--cmake-arg=" + argv[index + 1])
+            index += 2
+            continue
+        result.append(item)
+        index += 1
+    return result
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _print_doctor(result: dict[str, Any]) -> None:
+    print(f"code-analyzer {result['analyzer_version']}")
+    platform = result["platform"]
+    print(f"Python: {result['python']['version']} ({'ok' if result['python']['ok'] else 'unsupported'})")
+    print(f"WSL: {platform['wsl']}  Ubuntu: {platform['ubuntu']}  C.UTF-8: {platform['c_utf8']}")
+    for name, item in result["tools"].items():
+        version = f" — {item['version']}" if item.get("version") else ""
+        print(f"{name}: {item['status']}{version}")
+        if item.get("missing_capabilities"):
+            print("  missing capabilities: " + ", ".join(item["missing_capabilities"]))
+        if item.get("guidance"):
+            print("  " + item["guidance"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
