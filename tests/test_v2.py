@@ -171,7 +171,6 @@ def test_dashboard_embeds_all_data_safely_and_uses_text_content() -> None:
     assert "\\u003c/script\\u003e" in rendered
     assert "</script><script>alert(1)</script>" not in rendered
     assert "textContent" in rendered
-    assert "Code review grading reference" in rendered
     assert "review-level" in rendered
     assert "http://" not in rendered and "https://" not in rendered
 
@@ -217,7 +216,9 @@ def test_dashboard_is_bilingual_with_language_toggle() -> None:
     assert 'id="lang-toggle"' in rendered
     assert "data-i18n" in rendered
     assert "评分等级" in rendered
-    assert "Code review grading reference" in rendered
+    # The grading reference stays embedded in the data island but is no longer
+    # rendered as a visible section.
+    assert 'id="grading"' not in rendered
     # Persistence must stay inside executable scripts, never in static markup.
     static_html = rendered.split("<script>", 1)[0] + rendered.rsplit("</script>", 1)[1]
     assert "localStorage" not in static_html
@@ -233,6 +234,9 @@ def test_dashboard_renders_verdict_banner_from_manifest_state() -> None:
     }
     rendered = render(manifest, None)
     assert 'id="verdict"' in rendered
+    assert "hero-count" in rendered
+    for chart_id in ('id="rl-comp"', 'id="sev-comp"', 'id="heatmap"', 'id="tool-chart"'):
+        assert chart_id in rendered
     marker = '<script id="report-data" type="application/json">'
     embedded = json.loads(rendered.split(marker, 1)[1].split("</script>", 1)[0])
     execution = embedded["execution_manifest"]

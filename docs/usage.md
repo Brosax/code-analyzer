@@ -335,11 +335,13 @@ tools/splint/
 exports/<run-id>-shareable.zip
 ```
 
-- `index.html`：完整离线仪表盘（检测报告版式，中英文界面可一键切换），含总
-  体判定横幅（运行状态、报告完整性、质量门禁、源码稳定性、分析上下文与降级
-  原因、运行时长）、执行状态、覆盖率、分析单元完成/失败/超时分解、findings、
-  diagnostics、评分等级与规范化严重度按证据上下文分开统计、top rules、CWE、
-  nearby overlap、原生等级列、筛选、排序、分页和原始证据链接。
+- `index.html`：完整离线仪表盘（检测报告版式，中英文界面可一键切换），首屏
+  为判定横幅（运行状态印章、发现总数与严重度构成条、报告完整性、质量门禁、
+  源码稳定性、分析上下文与降级原因），另含执行状态、覆盖率、分析单元完成/
+  失败/超时分解、findings、diagnostics、评分等级与规范化严重度按证据上下文
+  的构成条、文件×严重度矩阵、top rules、CWE、nearby overlap、原生等级列、
+  筛选、排序、分页和原始证据链接。评分参考文档的元数据不再在页面显式展示，
+  仅保留在内嵌数据与 `review/summary.json` 中。
 - `review/summary.json`：review schema v2 的完整派生数据；schema v1 仍可由
   Dashboard 读取。
 - `review/summary.md`：适合文本审阅的摘要。
@@ -364,10 +366,11 @@ Categorization”（PDF 第 26–29 页）的四级定义：`Information`、`Sty
 
 `review_level` 只对原生等级名称完全匹配上述四级的 finding 直接映射；
 Flawfinder 数值风险等级、Splint 以及其他工具专用等级标为 `unmapped`，并保留
-`original_severity` 和既有 normalized `severity`。Dashboard 将参考分级作为主视图，
-同时保留 normalized severity 的筛选和展示；`--fail-on` 仍使用 normalized
-severity，以保持现有配置兼容。PDF 明确要求结合人工核验，因此任何工具等级都
-不自动等同于已确认漏洞或误报。
+`original_severity` 和既有 normalized `severity`。Dashboard 以参考分级作为
+findings 的主要维度（构成图、筛选与列），参考文档本身的元数据只保留在
+`review/summary.json` 与内嵌数据中，不在页面显式展示；`--fail-on` 仍使用
+normalized severity，以保持现有配置兼容。PDF 明确要求结合人工核验，因此任何
+工具等级都不自动等同于已确认漏洞或误报。
 
 ### 重建离线 Dashboard
 

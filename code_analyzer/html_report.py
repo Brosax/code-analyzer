@@ -59,6 +59,7 @@ _CSS = r"""
   --rl-error:#b23a1e; --rl-warning:#a57b00; --rl-style:#1f5f9e;
   --rl-information:#24855d; --rl-unmapped:#8a67b0;
   --ok:#2f7a50; --warn:#996c10; --bad:#b23a1e; --bar-neutral:#7a7264;
+  --bar-build:#4a463d; --bar-source:#a89e8c;
   --serif:Georgia,"Times New Roman","Songti SC","Noto Serif CJK SC",SimSun,serif;
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Cascadia Mono","Courier New",monospace;
 }
@@ -72,12 +73,14 @@ _CSS = r"""
     --rl-error:#c8481f; --rl-warning:#b78c15; --rl-style:#4285c9;
     --rl-information:#2f9e68; --rl-unmapped:#9678bf;
     --ok:#4f9d70; --warn:#c39a3a; --bad:#c8481f; --bar-neutral:#958c7b;
+    --bar-build:#cfc7b6; --bar-source:#736c60;
   }
 }
 
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
-  font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-variant-numeric:tabular-nums}
 a{color:var(--ink);text-decoration:underline;text-underline-offset:2px}
 a:hover{color:var(--muted)}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
@@ -100,6 +103,8 @@ button:hover{border-color:var(--muted)}
 .masthead h1{margin:.3rem 0 .5rem;font-family:var(--serif);font-weight:600;
   font-size:clamp(1.5rem,3.4vw,2.1rem);letter-spacing:.01em}
 #project{margin:0;font-family:var(--mono);font-size:.92rem;color:var(--muted);word-break:break-all}
+.mast-right{display:flex;flex-direction:column;align-items:flex-end;gap:.5rem}
+.run-no{margin:0;font-family:var(--mono);font-size:1.05rem;letter-spacing:.06em}
 .mast-actions{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
 .mast-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
   gap:.2rem 1.4rem;margin:1rem 0 0;border-top:1px solid var(--hairline);padding-top:.8rem}
@@ -123,9 +128,9 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 
 .notice{border-left:3px solid var(--warn);padding:.6rem .9rem;background:var(--soft);margin:.8rem 0}
 
-/* Verdict banner */
-.verdict{display:flex;gap:1.6rem;align-items:flex-start;flex-wrap:wrap;
-  border:1px solid var(--line);background:var(--soft);padding:1.1rem 1.2rem}
+/* Verdict hero */
+.verdict{display:flex;gap:1.8rem;align-items:center;flex-wrap:wrap;
+  border:1px solid var(--line);background:var(--soft);padding:1.2rem 1.4rem}
 .stamp{font-family:var(--mono);text-align:center;border:2px solid var(--muted);
   color:var(--muted);padding:.7rem 1.1rem;min-width:9rem}
 .stamp strong{display:block;font-size:1.15rem;letter-spacing:.18em;text-transform:uppercase}
@@ -133,10 +138,17 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 .stamp.ok{color:var(--ok);border-color:var(--ok)}
 .stamp.warn{color:var(--warn);border-color:var(--warn)}
 .stamp.bad{color:var(--bad);border-color:var(--bad)}
-.verdict-rows{display:grid;grid-template-columns:auto 1fr;gap:.3rem 1.2rem;margin:0;flex:1;min-width:16rem}
-.verdict-rows dt{color:var(--muted);font-size:.9rem}
-.verdict-rows dd{margin:0}
-.reasons{margin:.15rem 0 0;padding-left:1.1rem;color:var(--muted);font-size:.88rem}
+.hero{flex:1;min-width:19rem;display:flex;flex-direction:column;gap:.55rem}
+.hero-line{display:flex;align-items:baseline;gap:.55rem}
+.hero-count{font-family:var(--serif);font-size:2.1rem;font-weight:600;line-height:1}
+.hero-label{color:var(--muted)}
+.stack{display:flex;gap:2px;height:20px}
+.stack i{display:block;border-radius:2px;flex-basis:4px}
+.stack.thin{height:11px}
+.stack-labels{display:flex;flex-wrap:wrap;gap:.3rem 1rem;font-size:.85rem}
+.verdict-chips{flex-basis:100%;display:flex;flex-wrap:wrap;gap:.4rem 1.3rem;
+  border-top:1px solid var(--hairline);padding-top:.7rem;margin-top:.3rem}
+.reasons{margin:.15rem 0 0;padding-left:1.1rem;color:var(--muted);font-size:.88rem;flex-basis:100%}
 
 .chip{display:inline-flex;align-items:center;gap:.4rem;font-family:var(--mono);font-size:.9em}
 .dot{width:.55rem;height:.55rem;border-radius:50%;background:var(--muted);flex:none}
@@ -149,19 +161,45 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 .tone-rl-style{background:var(--rl-style)}.tone-rl-information{background:var(--rl-information)}
 .tone-rl-unmapped{background:var(--rl-unmapped)}
 
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));gap:.6rem;margin-top:1rem}
-.card{border:1px solid var(--hairline);padding:.8rem .9rem;background:var(--surface)}
-.card span{display:block;font-size:.8rem;color:var(--muted)}
-.card strong{display:block;font-family:var(--serif);font-size:1.7rem;font-weight:600;margin-top:.15rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:1rem 1.6rem;margin-top:1.2rem}
+.stat{border-top:2px solid var(--line);padding-top:.5rem}
+.stat .lbl{display:block;font-size:.78rem;letter-spacing:.05em;color:var(--muted)}
+.stat strong{display:block;font-family:var(--serif);font-size:1.5rem;font-weight:600;margin-top:.1rem}
+.stat .duo{display:flex;justify-content:space-between;gap:.6rem;font-family:var(--mono);
+  font-size:.95rem;margin-top:.3rem}
+.split{display:flex;gap:2px;height:5px;border-radius:2px;overflow:hidden;background:var(--track);margin-top:.35rem}
+.split i{display:block;flex-basis:2px}
 
 .panel{border:1px solid var(--hairline);background:var(--surface);padding:1rem 1.1rem}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(19rem,1fr));gap:.7rem}
+.charts{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:.7rem}
+.charts .panel{grid-column:span 2}
+.charts .panel.wide{grid-column:1/-1}
 .bar{display:grid;grid-template-columns:minmax(5.5rem,32%) 1fr auto;gap:.6rem;
   align-items:center;margin:.4rem 0}
 .bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rank{display:inline-block;min-width:1.3rem;color:var(--muted);font-size:.82em}
 .track{height:10px;background:var(--track);border-radius:2px;overflow:hidden}
 .fill{display:block;height:100%;background:var(--bar-neutral);border-radius:0 4px 4px 0}
 .bar-count{min-width:2.2rem;text-align:right}
+.tone-build{background:var(--bar-build)}
+.tone-source{background:var(--bar-source)}
+.legend{display:flex;gap:1.1rem;font-size:.8rem;color:var(--muted);margin:.1rem 0 .5rem}
+.comp-row{margin:.7rem 0}
+.comp-row .ctx{font-size:.85rem;color:var(--muted);margin-bottom:.3rem}
+.comp-row .stack{margin-bottom:.35rem}
+.grp{margin:.65rem 0}
+.grp .g-name{font-family:var(--mono);font-size:.9rem;margin-bottom:.15rem}
+.grp .bar{margin:.12rem 0;grid-template-columns:4.6rem 1fr auto}
+.grp .bar .bar-label{font-size:.78rem;color:var(--muted)}
+.hm{display:grid;gap:2px;font-size:.85rem;
+  grid-template-columns:minmax(8rem,1.6fr) repeat(6,minmax(2.4rem,1fr)) minmax(2.8rem,auto)}
+.hm-h{color:var(--muted);font-size:.75rem;text-align:center;padding:.15rem .1rem}
+.hm-h.first{text-align:left}
+.hm-f{font-family:var(--mono);font-size:.82rem;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;padding:.28rem .35rem;direction:rtl;text-align:left}
+.hm-c{text-align:center;font-family:var(--mono);padding:.28rem .15rem;border-radius:2px}
+.hm-t{text-align:right;font-family:var(--mono);color:var(--muted);padding:.28rem .3rem}
+.hm-note{margin:.5rem 0 0;font-size:.8rem;color:var(--muted)}
 
 .tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(20rem,1fr));gap:.7rem}
 .tool-card{border:1px solid var(--hairline);background:var(--surface);padding:1rem 1.1rem}
@@ -183,6 +221,7 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 table{border-collapse:collapse;width:100%}
 th,td{padding:.55rem .65rem;border-bottom:1px solid var(--hairline);text-align:left;vertical-align:top}
 th{background:var(--soft);position:sticky;top:0;font-weight:600;font-size:.85rem;white-space:nowrap}
+tbody tr:hover td{background:var(--soft)}
 .loc{white-space:nowrap;font-family:var(--mono);font-size:.88em}
 .file-list{max-height:18rem;overflow:auto;font-family:var(--mono);font-size:.88rem}
 .empty{text-align:center;color:var(--muted);padding:1rem}
@@ -192,12 +231,14 @@ th{background:var(--soft);position:sticky;top:0;font-weight:600;font-size:.85rem
 .pagination{display:flex;justify-content:space-between;align-items:center;margin-top:.7rem;gap:.7rem;flex-wrap:wrap}
 
 @media(max-width:900px){
-  .charts,.tools{grid-template-columns:1fr}
+  .tools{grid-template-columns:1fr}
+  .charts .panel{grid-column:1/-1}
   .controls{grid-template-columns:1fr 1fr}
-  .verdict{flex-direction:column}
+  .verdict{flex-direction:column;align-items:stretch}
+  .mast-right{align-items:flex-start}
 }
 @media(max-width:560px){
-  .cards,.controls{grid-template-columns:1fr}
+  .stats,.controls{grid-template-columns:1fr 1fr}
   .section-head{display:block}
   .sheet{margin:0;border:none}
 }
@@ -272,29 +313,27 @@ _JS_MAIN = r"""
       report_title: "静态分析证据报告",
       open_json: "查看原始 JSON",
       disclaimer: "派生的 findings 不具权威性。请对照其链接的原生工具报告与实际的构建配置逐条确认。",
-      sec_overview: "总体判定", sec_grading: "代码评审评分参考", sec_distribution: "发现分布",
+      sec_overview: "总体判定", sec_distribution: "发现分布",
       sec_tools: "执行与原生证据", sec_scope: "扫描范围", sec_overlap: "跨工具邻近重叠",
       sec_diagnostics: "工具诊断", sec_findings: "发现明细",
-      meta_run: "运行编号", meta_analyzer: "分析器版本", meta_finished: "完成时间", meta_duration: "运行时长",
+      meta_analyzer: "分析器版本", meta_finished: "完成时间", meta_duration: "运行时长",
       duration_value: "{m} 分 {s} 秒",
       verdict_status: "运行状态", verdict_integrity: "报告完整性", verdict_gate: "质量门禁",
       verdict_stable: "源码稳定性", verdict_context: "分析上下文",
       gate_disabled: "未启用", gate_pass: "未触发", gate_fail: "已触发",
       stable_yes: "扫描期间未变化", stable_no: "扫描期间发生变化",
-      card_source_files: "源文件", card_total_findings: "全部发现", card_build: "构建感知",
-      card_source_only: "仅源码", card_mapped: "已映射参考等级", card_unmapped: "未映射",
+      card_source_files: "源文件", card_context_split: "构建感知 / 仅源码",
+      card_mapping_split: "已映射 / 未映射参考等级",
       card_diagnostics: "诊断", card_valid_reports: "有效报告",
+      hero_label: "条发现 · 全部证据层",
       integrity_notice: "出于完整性原因省略了 {units} 个报告单元;{files} 个文件被排除或未分析。",
       omitted_notice: "有 {n} 条发现超出仪表盘内嵌上限,未在此显示;完整数据仍在 review/summary.json 中。",
-      grading_document: "文档", grading_title: "标题", grading_version: "版本 / 日期",
-      grading_sha: "SHA-256", grading_subsections: "分级小节",
-      grading_missing_section: "未声明评分参考",
-      grading_missing_levels: "此旧版 review 未声明评分参考。",
-      grading_note_fallback: "此旧版报告不含参考等级;规范化严重度仍然可见。",
-      chart_rl_build: "评分等级 · 构建感知", chart_rl_source: "评分等级 · 仅源码",
-      chart_sev_build: "规范化严重度 · 构建感知", chart_sev_source: "规范化严重度 · 仅源码",
-      chart_tool_build: "各分析器 · 构建感知", chart_tool_source: "各分析器 · 仅源码",
-      chart_top_rules: "规则 · 前列", chart_top_cwes: "CWE · 前列", chart_top_files: "文件 · 前列",
+      chart_rl_comp: "评分等级构成", chart_sev_comp: "规范化严重度构成",
+      chart_heatmap: "文件 × 严重度", chart_tools: "各分析器",
+      chart_top_rules: "规则 · 前列", chart_top_cwes: "CWE · 前列",
+      heat_total: "合计",
+      heat_partial: "矩阵基于内嵌的前 {n} 条发现;完整数据见 review/summary.json。",
+      legend_build: "构建感知", legend_source: "仅源码",
       no_data: "暂无数据",
       tool_build_findings: "构建感知发现", tool_source_findings: "仅源码发现",
       tool_diagnostics: "诊断", tool_version: "版本", tool_coverage: "有效覆盖",
@@ -331,30 +370,28 @@ _JS_MAIN = r"""
       report_title: "Static Analysis Evidence Report",
       open_json: "Open review JSON",
       disclaimer: "Derived findings are non-authoritative. Confirm every item against its linked native artifact and the analyzed build configuration.",
-      sec_overview: "Overall verdict", sec_grading: "Code review grading reference",
+      sec_overview: "Overall verdict",
       sec_distribution: "Finding distribution", sec_tools: "Execution and native evidence",
       sec_scope: "Scan scope", sec_overlap: "Cross-tool nearby overlap",
       sec_diagnostics: "Tool diagnostics", sec_findings: "Findings",
-      meta_run: "Run", meta_analyzer: "Analyzer", meta_finished: "Finished", meta_duration: "Duration",
+      meta_analyzer: "Analyzer", meta_finished: "Finished", meta_duration: "Duration",
       duration_value: "{m}m {s}s",
       verdict_status: "Run status", verdict_integrity: "Report integrity", verdict_gate: "Quality gate",
       verdict_stable: "Source stability", verdict_context: "Analysis context",
       gate_disabled: "not enabled", gate_pass: "not triggered", gate_fail: "triggered",
       stable_yes: "unchanged during scan", stable_no: "changed during scan",
-      card_source_files: "Source files", card_total_findings: "All findings", card_build: "Build-aware",
-      card_source_only: "Source-only", card_mapped: "Reference-mapped", card_unmapped: "Unmapped",
+      card_source_files: "Source files", card_context_split: "Build-aware / source-only",
+      card_mapping_split: "Mapped / unmapped reference level",
       card_diagnostics: "Diagnostics", card_valid_reports: "Valid reports",
+      hero_label: "findings · all evidence layers",
       integrity_notice: "{units} report unit(s) were omitted for integrity reasons; {files} file(s) are excluded or unanalyzed.",
       omitted_notice: "{n} finding(s) beyond the dashboard embed limit are omitted here; the complete set remains in review/summary.json.",
-      grading_document: "Document", grading_title: "Title", grading_version: "Version / date",
-      grading_sha: "SHA-256", grading_subsections: "Subsections",
-      grading_missing_section: "No grading reference declared",
-      grading_missing_levels: "This legacy review does not declare a grading reference.",
-      grading_note_fallback: "Review levels are not available for this legacy report; normalized severity remains visible.",
-      chart_rl_build: "Review level · build-aware", chart_rl_source: "Review level · source-only",
-      chart_sev_build: "Normalized severity · build-aware", chart_sev_source: "Normalized severity · source-only",
-      chart_tool_build: "By analyzer · build-aware", chart_tool_source: "By analyzer · source-only",
-      chart_top_rules: "Top rules", chart_top_cwes: "Top CWE", chart_top_files: "Top files",
+      chart_rl_comp: "Review level composition", chart_sev_comp: "Normalized severity composition",
+      chart_heatmap: "Files × severity", chart_tools: "By analyzer",
+      chart_top_rules: "Top rules", chart_top_cwes: "Top CWE",
+      heat_total: "total",
+      heat_partial: "Matrix based on the {n} embedded findings; the complete data remains in review/summary.json.",
+      legend_build: "build-aware", legend_source: "source-only",
       no_data: "No data available.",
       tool_build_findings: "Build-aware findings", tool_source_findings: "Source-only findings",
       tool_diagnostics: "Diagnostics", tool_version: "Version", tool_coverage: "Effective coverage",
@@ -493,56 +530,81 @@ _JS_MAIN = r"""
 
   const renderMasthead = () => {
     id("project").textContent = projectName || t("unknown_source");
+    id("run-no").textContent = manifest.run_id || "";
     const meta = id("run-meta");
     meta.replaceChildren();
     const pair = (label, value) => {
       meta.append(make("dt", "", label), make("dd", "", value === undefined || value === null || value === "" ? "—" : value));
     };
-    pair(t("meta_run"), manifest.run_id);
     pair(t("meta_analyzer"), manifest.analyzer_version);
     pair(t("meta_finished"), finishedAt);
     pair(t("meta_duration"), duration ? fmt("duration_value", duration) : undefined);
   };
 
-  /* ---------- verdict ---------- */
+  /* Stacked proportion bar shared by the hero and the composition panels. */
+  const stackedBar = (countsByKey, order, tone, thin) => {
+    let total = 0;
+    order.forEach(key => { total += Number(countsByKey[key] || 0); });
+    if (!total) return null;
+    const wrap = make("div");
+    const bar = make("div", "stack" + (thin ? " thin" : ""));
+    const labels = make("div", "stack-labels");
+    order.forEach(key => {
+      const value = Number(countsByKey[key] || 0);
+      if (!value) return;
+      const seg = make("i", tone(key));
+      seg.style.flexGrow = String(value);
+      bar.append(seg);
+      labels.append(chip(tone(key), key + " " + number(value)));
+    });
+    wrap.append(bar, labels);
+    return wrap;
+  };
+
+  /* ---------- verdict hero ---------- */
   const renderVerdict = () => {
     const root = id("verdict");
     root.replaceChildren();
     const status = manifest.status || "unknown";
     const stamp = make("div", "stamp " + statusTone(status));
     stamp.append(make("strong", "", status), make("span", "", "exit " + (manifest.exit_code ?? "—")));
-    const rows = make("dl", "verdict-rows");
-    const row = (label, node) => {
-      const dd = make("dd");
-      dd.append(node);
-      rows.append(make("dt", "", label), dd);
+    const hero = make("div", "hero");
+    const heroLine = make("div", "hero-line");
+    heroLine.append(make("strong", "hero-count", number(review.total_findings)),
+      make("span", "hero-label", t("hero_label")));
+    hero.append(heroLine);
+    const composition = stackedBar(sevCounts, sevOrder, sevTone, false);
+    if (composition) hero.append(composition);
+    const chips = make("div", "verdict-chips");
+    const item = (labelKey, node) => {
+      const cell = make("span");
+      cell.append(make("span", "muted", t(labelKey) + ": "), node);
+      chips.append(cell);
     };
     const integrity = (review.report_integrity || {}).status;
-    row(t("verdict_integrity"), integrity
+    item("verdict_integrity", integrity
       ? chip(integrity === "complete" ? "tone-ok" : "tone-warn", integrity)
       : make("span", "muted", "—"));
     const gate = manifest.gate;
     if (gate && gate.policy && gate.policy !== "none") {
-      row(t("verdict_gate"), chip(gate.triggered ? "tone-bad" : "tone-ok",
+      item("verdict_gate", chip(gate.triggered ? "tone-bad" : "tone-ok",
         gate.policy + " · " + (gate.triggered ? t("gate_fail") : t("gate_pass"))));
     } else {
-      row(t("verdict_gate"), chip("tone-muted", t("gate_disabled")));
+      item("verdict_gate", chip("tone-muted", t("gate_disabled")));
     }
     const stable = (manifest.source_inventory || {}).stable;
-    row(t("verdict_stable"), stable === true ? chip("tone-ok", t("stable_yes"))
+    item("verdict_stable", stable === true ? chip("tone-ok", t("stable_yes"))
       : (stable === false ? chip("tone-bad", t("stable_no")) : make("span", "muted", "—")));
-    const contextCell = make("span");
-    contextCell.append(chip(manifest.analysis_context === "full" ? "tone-ok"
+    item("verdict_context", chip(manifest.analysis_context === "full" ? "tone-ok"
       : (manifest.analysis_context === "degraded" ? "tone-warn" : "tone-muted"),
       manifest.analysis_context || "—"));
+    root.append(stamp, hero, chips);
     const reasons = manifest.analysis_context_reasons || [];
     if (reasons.length) {
       const list = make("ul", "reasons");
       reasons.forEach(reason => list.append(make("li", "", reason)));
-      contextCell.append(list);
+      root.append(list);
     }
-    row(t("verdict_context"), contextCell);
-    root.append(stamp, rows);
   };
 
   const renderNotices = () => {
@@ -561,59 +623,46 @@ _JS_MAIN = r"""
     }
   };
 
-  const renderCards = () => {
+  const renderStats = () => {
     const root = id("cards");
     root.replaceChildren();
+    const stat = (labelKey, node) => {
+      const cell = make("article", "stat");
+      cell.append(make("span", "lbl", t(labelKey)), node);
+      root.append(cell);
+    };
+    const single = value => make("strong", "", number(value));
+    const splitTile = (a, b, toneA, toneB) => {
+      const wrap = make("div");
+      const duo = make("div", "duo");
+      duo.append(chip(toneA, number(a)), chip(toneB, number(b)));
+      wrap.append(duo);
+      if (Number(a || 0) + Number(b || 0) > 0) {
+        const bar = make("div", "split");
+        [[a, toneA], [b, toneB]].forEach(([value, toneCls]) => {
+          if (Number(value || 0) > 0) {
+            const seg = make("i", toneCls);
+            seg.style.flexGrow = String(Number(value));
+            bar.append(seg);
+          }
+        });
+        wrap.append(bar);
+      }
+      return wrap;
+    };
+    stat("card_source_files", single((review.source_manifest || {}).total_files));
     const sourceOnly = counts["source-only"] !== undefined ? counts["source-only"] : review.total_findings;
-    [
-      ["card_source_files", (review.source_manifest || {}).total_files],
-      ["card_total_findings", review.total_findings],
-      ["card_build", counts["build-aware"] || 0],
-      ["card_source_only", sourceOnly],
-      ["card_mapped", Math.max(0, Number(review.total_findings || 0) - unmappedCount)],
-      ["card_unmapped", unmappedCount],
-      ["card_diagnostics", review.total_diagnostics],
-      ["card_valid_reports", Object.values(manifest.tools || {}).reduce((n, x) => n + Number(x.valid_reports || 0), 0)],
-    ].forEach(([key, value]) => {
-      const card = make("article", "card");
-      card.append(make("span", "", t(key)), make("strong", "", number(value)));
-      root.append(card);
-    });
-  };
-
-  /* ---------- grading reference ---------- */
-  const renderGrading = () => {
-    const grading = review.grading_reference || {};
-    const gradingDocument = grading.document || {};
-    const gradingSection = grading.section || {};
-    const gradingApplication = grading.application || {};
-    id("grading-section").textContent = gradingSection.number
-      ? gradingSection.number + " " + (gradingSection.title || "")
-      : t("grading_missing_section");
-    const values = id("grading-values");
-    values.replaceChildren();
-    const pair = (label, value) => values.append(make("dt", "", label), make("dd", "", value || "—"));
-    pair(t("grading_document"), gradingDocument.file_name);
-    pair(t("grading_title"), gradingDocument.title);
-    pair(t("grading_version"), [gradingDocument.version, gradingDocument.date].filter(Boolean).join(" / "));
-    pair(t("grading_sha"), gradingDocument.sha256);
-    pair(t("grading_subsections"), (gradingSection.grading_subsections || [])
-      .map(x => x.number + " " + x.title + " (PDF " + x.pdf_pages + ")").join("; "));
-    const levels = id("grading-levels");
-    levels.replaceChildren();
-    (grading.levels || []).forEach(level => {
-      const card = make("article", "tool-card");
-      const head = make("h3");
-      head.append(chip(rlTone(level.id), level.label || level.id));
-      card.append(head, make("p", "", level.description));
-      levels.append(card);
-    });
-    if (!(grading.levels || []).length) levels.append(make("p", "empty", t("grading_missing_levels")));
-    id("grading-note").textContent = gradingApplication.note || t("grading_note_fallback");
+    stat("card_context_split", splitTile(counts["build-aware"] || 0, sourceOnly || 0, "tone-build", "tone-source"));
+    stat("card_mapping_split", splitTile(
+      Math.max(0, Number(review.total_findings || 0) - unmappedCount), unmappedCount,
+      "tone-neutral", "tone-rl-unmapped"));
+    stat("card_diagnostics", single(review.total_diagnostics));
+    stat("card_valid_reports", single(
+      Object.values(manifest.tools || {}).reduce((n, x) => n + Number(x.valid_reports || 0), 0)));
   };
 
   /* ---------- distribution charts ---------- */
-  const bars = (target, entries, tone) => {
+  const bars = (target, entries, tone, ranked) => {
     const root = id(target);
     root.replaceChildren();
     const valid = entries.filter(x => Number(x[1]) > 0);
@@ -622,32 +671,118 @@ _JS_MAIN = r"""
       return;
     }
     const max = Math.max(1, ...valid.map(x => Number(x[1])));
-    valid.forEach(([label, count]) => {
+    valid.forEach(([label, count], index) => {
       const row = make("div", "bar");
+      const name = make("span", "bar-label mono");
+      if (ranked) name.append(make("span", "rank", String(index + 1)));
+      name.append(document.createTextNode(String(label || "—")));
       const track = make("span", "track");
       const fill = make("span", "fill" + (tone ? " " + tone(label) : ""));
       fill.style.width = Math.max(1, Number(count) / max * 100) + "%";
       track.append(fill);
-      row.append(make("span", "bar-label mono", label || "—"), track, make("span", "bar-count mono", number(count)));
+      row.append(name, track, make("span", "bar-count mono", number(count)));
       root.append(row);
     });
   };
-  const renderCharts = () => {
-    const levelEntries = context => rawReviewLevels.map(l => [l, (levelByContext[context] || {})[l] || 0]);
-    const sevEntries = context => sevOrder.map(s => [s, (sevByContext[context] || {})[s] || 0]);
-    bars("rl-build", levelEntries("build-aware"), rlTone);
-    bars("rl-source", levelEntries("source-only"), rlTone);
-    bars("sev-build", sevEntries("build-aware"), sevTone);
-    bars("sev-source", sevEntries("source-only"), sevTone);
-    bars("tool-build", Object.entries(review.tools || {}).map(([name, data]) =>
-      [name, (data.finding_counts || {})["build-aware"] || 0]));
-    bars("tool-source", Object.entries(review.tools || {}).map(([name, data]) => {
+  const compPanel = (target, byContext, order, tone) => {
+    const root = id(target);
+    root.replaceChildren();
+    let any = false;
+    [["build-aware", "legend_build"], ["source-only", "legend_source"]].forEach(([context, labelKey]) => {
+      const stackNode = stackedBar(byContext[context] || {}, order, tone, true);
+      if (!stackNode) return;
+      const row = make("div", "comp-row");
+      row.append(make("div", "ctx", t(labelKey)), stackNode);
+      root.append(row);
+      any = true;
+    });
+    if (!any) root.append(make("p", "empty", t("no_data")));
+  };
+  const renderHeatmap = () => {
+    const root = id("heatmap");
+    root.replaceChildren();
+    if (!findings.length) {
+      root.append(make("p", "empty", t("no_data")));
+      return;
+    }
+    const perFile = new Map();
+    findings.forEach(x => {
+      const file = x.canonical_path || x.file || "—";
+      if (!perFile.has(file)) perFile.set(file, { total: 0 });
+      const entry = perFile.get(file);
+      const sev = sevOrder.includes(x.severity) ? x.severity : "unknown";
+      entry[sev] = (entry[sev] || 0) + 1;
+      entry.total += 1;
+    });
+    const rows = [...perFile.entries()]
+      .sort((a, b) => (b[1].total - a[1].total) || (a[0] < b[0] ? -1 : 1))
+      .slice(0, 12);
+    const max = Math.max(1, ...rows.map(pair => Math.max(...sevOrder.map(s => pair[1][s] || 0))));
+    const grid = make("div", "hm");
+    grid.append(make("span", "hm-h first"));
+    sevOrder.forEach(s => grid.append(make("span", "hm-h", s)));
+    grid.append(make("span", "hm-h", t("heat_total")));
+    rows.forEach(([file, entry]) => {
+      const cellFile = make("span", "hm-f", file);
+      cellFile.title = file;
+      grid.append(cellFile);
+      sevOrder.forEach(s => {
+        const value = entry[s] || 0;
+        if (value) {
+          const cell = make("span", "hm-c", number(value));
+          const pct = Math.round(10 + 55 * value / max);
+          cell.style.background = "color-mix(in srgb, var(--sev-" + s + ") " + pct + "%, transparent)";
+          grid.append(cell);
+        } else {
+          grid.append(make("span", "hm-c muted", "·"));
+        }
+      });
+      grid.append(make("span", "hm-t", number(entry.total)));
+    });
+    root.append(grid);
+    if (review.findings_omitted) {
+      root.append(make("p", "hm-note", fmt("heat_partial", { n: number(findings.length) })));
+    }
+  };
+  const renderToolChart = () => {
+    const root = id("tool-chart");
+    root.replaceChildren();
+    const entries = Object.entries(review.tools || {}).map(([name, data]) => {
       const fc = data.finding_counts || {};
-      return [name, fc["source-only"] !== undefined ? fc["source-only"] : (data.total_findings || 0)];
-    }));
-    bars("rule-chart", (review.top_rules || []).map(x => [x.rule_id, x.count]));
-    bars("cwe-chart", (review.top_cwes || []).map(x => [x.cwe, x.count]));
-    bars("file-chart", (review.top_files || []).map(x => [x.file, x.count]));
+      const source = fc["source-only"] !== undefined ? fc["source-only"] : (data.total_findings || 0);
+      return [name, Number(fc["build-aware"] || 0), Number(source || 0)];
+    }).filter(x => x[1] > 0 || x[2] > 0);
+    if (!entries.length) {
+      root.append(make("p", "empty", t("no_data")));
+      return;
+    }
+    const legend = make("div", "legend");
+    legend.append(chip("tone-build", t("legend_build")), chip("tone-source", t("legend_source")));
+    root.append(legend);
+    const max = Math.max(1, ...entries.map(x => Math.max(x[1], x[2])));
+    entries.forEach(([name, build, source]) => {
+      const group = make("div", "grp");
+      group.append(make("div", "g-name", name));
+      [[build, "tone-build", t("legend_build")], [source, "tone-source", t("legend_source")]]
+        .forEach(([value, toneCls, label]) => {
+          const row = make("div", "bar");
+          const track = make("span", "track");
+          const fill = make("span", "fill " + toneCls);
+          fill.style.width = value ? Math.max(1, value / max * 100) + "%" : "0%";
+          track.append(fill);
+          row.append(make("span", "bar-label", label), track, make("span", "bar-count mono", number(value)));
+          group.append(row);
+        });
+      root.append(group);
+    });
+  };
+  const renderCharts = () => {
+    compPanel("rl-comp", levelByContext, rawReviewLevels, rlTone);
+    compPanel("sev-comp", sevByContext, sevOrder, sevTone);
+    renderHeatmap();
+    renderToolChart();
+    bars("rule-chart", (review.top_rules || []).map(x => [x.rule_id, x.count]), null, true);
+    bars("cwe-chart", (review.top_cwes || []).map(x => [x.cwe, x.count]), null, true);
   };
 
   /* ---------- tool cards ---------- */
@@ -880,8 +1015,7 @@ _JS_MAIN = r"""
     renderMasthead();
     renderVerdict();
     renderNotices();
-    renderCards();
-    renderGrading();
+    renderStats();
     renderCharts();
     renderTools();
     renderScope();
@@ -911,22 +1045,24 @@ _HTML_BODY = r"""<div class="sheet">
 <h1 data-i18n="report_title">静态分析证据报告</h1>
 <p id="project">正在载入报告…</p>
 </div>
+<div class="mast-right">
+<p class="run-no" id="run-no"></p>
 <div class="mast-actions">
 <button id="lang-toggle" type="button">English</button>
 <a href="review/summary.json" data-i18n="open_json">查看原始 JSON</a>
+</div>
 </div>
 </div>
 <dl class="mast-meta" id="run-meta"></dl>
 </header>
 <nav class="nav">
 <a href="#overview"><span class="sec-no">1</span><span data-i18n="sec_overview">总体判定</span></a>
-<a href="#grading"><span class="sec-no">2</span><span data-i18n="sec_grading">代码评审评分参考</span></a>
-<a href="#distribution"><span class="sec-no">3</span><span data-i18n="sec_distribution">发现分布</span></a>
-<a href="#tools"><span class="sec-no">4</span><span data-i18n="sec_tools">执行与原生证据</span></a>
-<a href="#scope"><span class="sec-no">5</span><span data-i18n="sec_scope">扫描范围</span></a>
-<a href="#overlap"><span class="sec-no">6</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></a>
-<a href="#diagnostics"><span class="sec-no">7</span><span data-i18n="sec_diagnostics">工具诊断</span></a>
-<a href="#findings"><span class="sec-no">8</span><span data-i18n="sec_findings">发现明细</span></a>
+<a href="#distribution"><span class="sec-no">2</span><span data-i18n="sec_distribution">发现分布</span></a>
+<a href="#tools"><span class="sec-no">3</span><span data-i18n="sec_tools">执行与原生证据</span></a>
+<a href="#scope"><span class="sec-no">4</span><span data-i18n="sec_scope">扫描范围</span></a>
+<a href="#overlap"><span class="sec-no">5</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></a>
+<a href="#diagnostics"><span class="sec-no">6</span><span data-i18n="sec_diagnostics">工具诊断</span></a>
+<a href="#findings"><span class="sec-no">7</span><span data-i18n="sec_findings">发现明细</span></a>
 </nav>
 <main>
 <p class="notice" data-i18n="disclaimer">派生的 findings 不具权威性。请对照其链接的原生工具报告与实际的构建配置逐条确认。</p>
@@ -934,39 +1070,25 @@ _HTML_BODY = r"""<div class="sheet">
 <h2><span class="sec-no">§ 1</span><span data-i18n="sec_overview">总体判定</span></h2>
 <div class="verdict" id="verdict"></div>
 <div id="integrity-warning"></div>
-<div class="cards" id="cards"></div>
-</section>
-<section id="grading">
-<div class="section-head">
-<h2><span class="sec-no">§ 2</span><span data-i18n="sec_grading">代码评审评分参考</span></h2>
-<span class="muted" id="grading-section"></span>
-</div>
-<article class="panel">
-<dl class="tool-values" id="grading-values"></dl>
-<div class="tools" id="grading-levels"></div>
-<p class="notice" id="grading-note"></p>
-</article>
+<div class="stats" id="cards"></div>
 </section>
 <section id="distribution">
-<h2><span class="sec-no">§ 3</span><span data-i18n="sec_distribution">发现分布</span></h2>
+<h2><span class="sec-no">§ 2</span><span data-i18n="sec_distribution">发现分布</span></h2>
 <div class="charts">
-<article class="panel"><h3 data-i18n="chart_rl_build">评分等级 · 构建感知</h3><div id="rl-build"></div></article>
-<article class="panel"><h3 data-i18n="chart_rl_source">评分等级 · 仅源码</h3><div id="rl-source"></div></article>
-<article class="panel"><h3 data-i18n="chart_sev_build">规范化严重度 · 构建感知</h3><div id="sev-build"></div></article>
-<article class="panel"><h3 data-i18n="chart_sev_source">规范化严重度 · 仅源码</h3><div id="sev-source"></div></article>
-<article class="panel"><h3 data-i18n="chart_tool_build">各分析器 · 构建感知</h3><div id="tool-build"></div></article>
-<article class="panel"><h3 data-i18n="chart_tool_source">各分析器 · 仅源码</h3><div id="tool-source"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_rl_comp">评分等级构成</h3><div id="rl-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_sev_comp">规范化严重度构成</h3><div id="sev-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_heatmap">文件 × 严重度</h3><div id="heatmap"></div></article>
+<article class="panel"><h3 data-i18n="chart_tools">各分析器</h3><div id="tool-chart"></div></article>
 <article class="panel"><h3 data-i18n="chart_top_rules">规则 · 前列</h3><div id="rule-chart"></div></article>
 <article class="panel"><h3 data-i18n="chart_top_cwes">CWE · 前列</h3><div id="cwe-chart"></div></article>
-<article class="panel"><h3 data-i18n="chart_top_files">文件 · 前列</h3><div id="file-chart"></div></article>
 </div>
 </section>
 <section id="tools">
-<h2><span class="sec-no">§ 4</span><span data-i18n="sec_tools">执行与原生证据</span></h2>
+<h2><span class="sec-no">§ 3</span><span data-i18n="sec_tools">执行与原生证据</span></h2>
 <div class="tools" id="tool-cards"></div>
 </section>
 <section id="scope">
-<h2><span class="sec-no">§ 5</span><span data-i18n="sec_scope">扫描范围</span></h2>
+<h2><span class="sec-no">§ 4</span><span data-i18n="sec_scope">扫描范围</span></h2>
 <article class="panel">
 <dl class="tool-values" id="scope-values"></dl>
 <details><summary id="source-summary">源文件</summary><ol class="file-list" id="source-files"></ol></details>
@@ -974,7 +1096,7 @@ _HTML_BODY = r"""<div class="sheet">
 </section>
 <section id="overlap">
 <div class="section-head">
-<h2><span class="sec-no">§ 6</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></h2>
+<h2><span class="sec-no">§ 5</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></h2>
 <span class="muted" id="overlap-count"></span>
 </div>
 <div class="table-wrap"><table><thead><tr>
@@ -987,7 +1109,7 @@ _HTML_BODY = r"""<div class="sheet">
 </section>
 <section id="diagnostics">
 <div class="section-head">
-<h2><span class="sec-no">§ 7</span><span data-i18n="sec_diagnostics">工具诊断</span></h2>
+<h2><span class="sec-no">§ 6</span><span data-i18n="sec_diagnostics">工具诊断</span></h2>
 <span class="muted" id="diagnostic-count"></span>
 </div>
 <div class="table-wrap"><table><thead><tr>
@@ -1002,7 +1124,7 @@ _HTML_BODY = r"""<div class="sheet">
 </section>
 <section id="findings">
 <div class="section-head">
-<h2><span class="sec-no">§ 8</span><span data-i18n="sec_findings">发现明细</span></h2>
+<h2><span class="sec-no">§ 7</span><span data-i18n="sec_findings">发现明细</span></h2>
 <span class="muted" id="finding-total"></span>
 </div>
 <p class="notice" id="context-notice" hidden></p>
