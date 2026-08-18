@@ -9,10 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import (
+    Grid,
+    Horizontal,
+    HorizontalGroup,
+    Vertical,
+    VerticalScroll,
+)
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -57,6 +63,14 @@ TUI_FIELDS = (
     "tools.splint.enabled",
     "run.shareable_export",
     "review.fail_on",
+)
+
+# 两栏布局的最小终端宽度；低于该值回落为单栏。
+WIDE_BREAKPOINT = 120
+
+GRADING_NOTE = (
+    "所有新报告固定采用 NXP i.MX RT700 AVA Test Plan 第 7 章的 "
+    "Information / Style / Warning / Error 分级；未直接匹配的工具等级显示为 Unmapped。"
 )
 
 
@@ -156,38 +170,61 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("f9", "run", "运行", priority=True),
         Binding("ctrl+c", "cancel_or_exit", "取消/退出", priority=True),
         Binding("escape", "escape", "返回", priority=True),
+        Binding("f1", "grading_info", "分级说明"),
     ]
     CSS = """
     Screen { background: $surface; }
     #workspace { height: 1fr; }
-    #forms { width: 92; max-width: 100%; height: 1fr; padding: 1 2; align-horizontal: center; }
-    .section-title { text-style: bold; color: $primary; margin: 1 0; }
+    #forms { width: 100%; max-width: 96; height: 1fr; padding: 1 2 0 2; align-horizontal: center; }
+    .wide #forms { max-width: 136; }
+    #form-columns { layout: grid; grid-size: 1; grid-columns: 1fr; grid-rows: auto; grid-gutter: 0 2; height: auto; }
+    .wide #form-columns { grid-size: 2; }
+    .column { height: auto; }
+    .section-title { text-style: bold; color: $primary; margin: 1 0 0 0; }
+    .section-title.first { margin-top: 0; }
     .field { height: auto; margin-bottom: 1; }
-    .field Label { height: auto; color: $text-muted; }
+    .field-bool { margin-bottom: 0; }
+    .field Label { height: 1; color: $text-muted; }
     .field Input, .field Select { width: 100%; }
-    #basic-actions { height: 3; layout: horizontal; align-horizontal: right; margin-top: 1; }
+    .inline-row { height: auto; }
+    .inline-row Input { width: 1fr; }
+    .inline-row Button { margin-left: 1; }
+    #grading-link { height: 1; margin-top: 1; color: $text-muted; }
+    #basic-actions { height: auto; margin: 1 2 0 2; layout: horizontal; align-horizontal: right; }
     #basic-actions Button { margin-left: 1; }
-    #grading-reference { height: auto; border-left: solid $primary; padding-left: 1; margin: 1 0; color: $text-muted; }
-    #status-line { dock: bottom; height: 3; padding: 1; background: $boost; }
+    #status-line { height: 1; padding: 0 1; background: $boost; }
     #too-small { display: none; dock: top; height: 3; background: $error; color: $text; content-align: center middle; }
     .too-small #too-small { display: block; }
     #running { display: none; height: 1fr; background: $panel; padding: 1 2; }
     .running #workspace, .running #status-line { display: none; }
     .running #running { display: block; }
     #run-heading { height: 1; text-style: bold; }
-    #run-details { height: 1; color: $text-muted; margin-bottom: 1; }
-    #run-progress { height: 2; margin-bottom: 1; }
+    #run-details { height: 1; color: $text-muted; }
+    #run-progress { height: 1; margin-bottom: 1; }
     #run-log { height: 1fr; border: round $primary; background: $surface-darken-1; }
-    #run-stop-hint { height: 2; padding-top: 1; color: $warning; }
-    #result { display: none; height: 1fr; padding: 1 2; overflow-y: auto; }
+    #run-stop-hint { height: 1; color: $warning; }
+    #result { display: none; height: 1fr; padding: 1 2; }
     .completed #workspace, .completed #status-line { display: none; }
     .completed #result { display: block; }
+    #result-status { height: auto; padding: 0 1; text-style: bold; margin-bottom: 1; }
+    #result-status.status-ok { background: $success 20%; color: $success; }
+    #result-status.status-warn { background: $warning 20%; color: $warning; }
+    #result-status.status-fail { background: $error 20%; color: $error; }
+    #result-scroll { height: 1fr; }
+    #result-kv { layout: grid; grid-size: 2; grid-columns: 12 1fr; grid-rows: auto; height: auto; margin-bottom: 1; }
+    .kv-key { color: $text-muted; }
+    #result-report-dir.has-report { text-style: bold; color: $success; }
+    #result-tools { height: auto; }
+    .tool-ok { color: $success; }
+    .tool-warn { color: $warning; }
+    .tool-fail { color: $error; }
+    .tool-skip { color: $text-muted; }
     #result-buttons, .dialog-buttons { height: 3; layout: horizontal; align-horizontal: right; }
     #result-buttons Button, .dialog-buttons Button { margin-left: 1; }
     ModalScreen { align: center middle; background: rgba(0, 0, 0, 0.65); }
-    #dialog { width: 72; max-width: 95%; height: auto; max-height: 90%; padding: 1 2; border: round $primary; background: $surface; }
+    #dialog { width: 90; max-width: 95%; height: auto; max-height: 90%; padding: 1 2; border: round $primary; background: $surface; }
     .dialog-title { text-style: bold; margin-bottom: 1; }
-    #dialog-message { height: auto; max-height: 28; overflow-y: auto; }
+    #dialog-message { height: auto; max-height: 70vh; overflow-y: auto; }
     .warning { color: $warning; margin-top: 1; }
     """
 
@@ -215,27 +252,27 @@ class AnalyzerApp(App[TuiOutcome]):
         yield Static("终端至少需要 80×24；当前尺寸不足，已阻止运行。", id="too-small")
         with Vertical(id="workspace"):
             with VerticalScroll(id="forms"):
-                yield Label("扫描目标", classes="section-title")
-                yield from self._special_basic_fields()
-                yield self._field_widget(FIELD_BY_PATH["run.output_root"])
-                yield Label("构建上下文", classes="section-title")
-                yield self._field_widget(FIELD_BY_PATH["build.compile_database_mode"])
-                yield self._field_widget(FIELD_BY_PATH["build.compile_database"])
-                yield Label("分析工具", classes="section-title")
-                for path in ("tools.cppcheck.enabled", "tools.flawfinder.enabled", "tools.splint.enabled"):
-                    yield self._field_widget(FIELD_BY_PATH[path])
-                yield Label("报告", classes="section-title")
-                yield self._field_widget(FIELD_BY_PATH["run.shareable_export"])
-                yield self._field_widget(FIELD_BY_PATH["review.fail_on"])
-                yield Static(
-                    "所有新报告固定采用 NXP i.MX RT700 AVA Test Plan 第 7 章的 Information / Style / Warning / Error 分级；未直接匹配的工具等级显示为 Unmapped。",
-                    id="grading-reference",
-                )
-                with Horizontal(id="basic-actions"):
-                    yield Button("保存配置", id="save-config")
-                    yield Button("预检", id="preflight")
-                    yield Button("退出", id="exit")
-                    yield Button("开始扫描", id="run", variant="primary")
+                with Grid(id="form-columns"):
+                    with Vertical(id="column-left", classes="column"):
+                        yield Label("扫描目标", classes="section-title first")
+                        yield from self._special_basic_fields()
+                        yield self._field_widget(FIELD_BY_PATH["run.output_root"])
+                        yield Label("分析工具", classes="section-title")
+                        for path in ("tools.cppcheck.enabled", "tools.flawfinder.enabled", "tools.splint.enabled"):
+                            yield self._field_widget(FIELD_BY_PATH[path])
+                    with Vertical(id="column-right", classes="column"):
+                        yield Label("构建上下文", classes="section-title first")
+                        yield self._field_widget(FIELD_BY_PATH["build.compile_database_mode"])
+                        yield self._field_widget(FIELD_BY_PATH["build.compile_database"])
+                        yield Label("报告", classes="section-title")
+                        yield self._field_widget(FIELD_BY_PATH["run.shareable_export"])
+                        yield self._field_widget(FIELD_BY_PATH["review.fail_on"])
+                        yield Static("[@click=app.grading_info]评分分级说明（F1）[/]", id="grading-link")
+            with Horizontal(id="basic-actions"):
+                yield Button("保存配置", id="save-config")
+                yield Button("预检", id="preflight")
+                yield Button("退出", id="exit")
+                yield Button("开始扫描", id="run", variant="primary")
         yield Static("就绪 · 可直接开始扫描；高级选项沿用 TOML/CLI 配置", id="status-line")
         with Vertical(id="running"):
             yield Static("正在运行…", id="run-heading")
@@ -243,9 +280,17 @@ class AnalyzerApp(App[TuiOutcome]):
             yield ProgressBar(total=100, id="run-progress")
             yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
             yield Static("Ctrl+C 请求安全停止；将停止调度并回收当前进程组。", id="run-stop-hint")
-        with VerticalScroll(id="result"):
-            yield Label("扫描完成", classes="dialog-title")
-            yield Static("", id="result-body")
+        with Vertical(id="result"):
+            yield Static("", id="result-status")
+            with VerticalScroll(id="result-scroll"):
+                with Grid(id="result-kv"):
+                    yield Label("分析上下文", classes="kv-key")
+                    yield Static("—", id="result-context")
+                    yield Label("源码稳定", classes="kv-key")
+                    yield Static("—", id="result-stable")
+                    yield Label("报告目录", classes="kv-key")
+                    yield Static("—", id="result-report-dir")
+                yield Vertical(id="result-tools")
             with Horizontal(id="result-buttons"):
                 yield Button("返回配置", id="result-back")
                 yield Button("同配置重跑", id="result-rerun", variant="primary")
@@ -253,23 +298,28 @@ class AnalyzerApp(App[TuiOutcome]):
         yield Footer()
 
     def _special_basic_fields(self) -> list[Vertical]:
+        source_input = Input(str(self.source), id="special-source")
+        source_input.tooltip = "源码根目录（绝对或相对路径）。"
+        config_input = Input(
+            str(self.explicit_config) if self.explicit_config else "", id="special-config", placeholder="可留空"
+        )
+        config_input.tooltip = "显式配置文件；留空则仅使用 SOURCE/.code-analyzer.toml。"
         return [
-            Vertical(Label("SOURCE · 源码根目录"), Input(str(self.source), id="special-source"), classes="field"),
+            Vertical(Label("SOURCE 源码根目录"), source_input, classes="field"),
             Vertical(
-                Label("--config · 显式配置文件（可空）"),
-                Input(str(self.explicit_config) if self.explicit_config else "", id="special-config"),
-                Button("加载 SOURCE / 配置", id="reload-config"),
+                Label("--config 显式配置文件"),
+                HorizontalGroup(config_input, Button("加载", id="reload-config"), classes="inline-row"),
                 classes="field",
             ),
         ]
 
     def _field_widget(self, field: FieldSpec) -> Vertical:
         value = config_value(self.config, field.path)
-        title = field.label
         widget_id = _widget_id(field.path)
         if field.kind == "bool":
-            control: Any = Checkbox(field.help, bool(value), id=widget_id, disabled=field.readonly)
-            return Vertical(Label(title), control, classes="field")
+            control: Any = Checkbox(field.label, bool(value), id=widget_id, disabled=field.readonly)
+            control.tooltip = field.help
+            return Vertical(control, classes="field field-bool")
         if field.kind == "choice":
             control = Select([(choice, choice) for choice in field.choices], value=value, allow_blank=False, id=widget_id, disabled=field.readonly)
         else:
@@ -277,9 +327,11 @@ class AnalyzerApp(App[TuiOutcome]):
                 "" if value is None else str(value), id=widget_id, disabled=field.readonly,
                 placeholder="可留空" if field.kind.startswith("optional") else None,
             )
-        return Vertical(Label(title + " · " + field.help), control, classes="field")
+        control.tooltip = field.help
+        return Vertical(Label(field.label), control, classes="field")
 
     def on_mount(self) -> None:
+        self.query_one("#run-log", RichLog).border_title = "实时日志"
         self.set_timer(0.2, self._mark_clean)
         self.set_interval(0.1, self._flush_log_queue)
         self.set_interval(1.0, self._update_elapsed)
@@ -292,6 +344,16 @@ class AnalyzerApp(App[TuiOutcome]):
         width, height = event.size.width, event.size.height
         self.small = width < 80 or height < 24
         self.set_class(self.small, "too-small")
+        self.set_class(width >= WIDE_BREAKPOINT, "wide")
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        tip = getattr(event.widget, "tooltip", None)
+        if tip and not self.running:
+            prefix = "● 未保存修改 · " if self.dirty else ""
+            self.query_one("#status-line", Static).update(f"{prefix}{tip}")
+
+    def action_grading_info(self) -> None:
+        self.push_screen(InfoScreen("评分分级说明", GRADING_NOTE))
 
     @on(Button.Pressed)
     def button_pressed(self, event: Button.Pressed) -> None:
@@ -633,17 +695,29 @@ class AnalyzerApp(App[TuiOutcome]):
         self._set_controls_disabled(False)
         self.last_result = result
         manifest = result.manifest or {}
-        tools = manifest.get("tools", {})
-        tool_lines = "\n".join(f"  • {name}: {value.get('status', '—')}" for name, value in tools.items()) or "  —"
-        body = (
-            f"总状态：{manifest.get('status', 'interrupted' if result.exit_code == 130 else 'unknown')}\n"
-            f"退出码：{result.exit_code}\n"
-            f"分析上下文：{manifest.get('analysis_context', '—')}\n"
-            f"源码稳定：{manifest.get('source_inventory', {}).get('stable', '—')}\n"
-            f"工具：\n{tool_lines}\n"
-            f"报告目录：{result.report_directory or '未创建'}"
-        )
-        self.query_one("#result-body", Static).update(body)
+        status = manifest.get("status", "interrupted" if result.exit_code == 130 else "unknown")
+        severity = "ok" if result.exit_code == 0 else ("warn" if result.exit_code in (1, 10) else "fail")
+        banner = self.query_one("#result-status", Static)
+        banner.set_classes(f"status-{severity}")
+        banner.update(f"总状态：{status} · 退出码 {result.exit_code}")
+        self.query_one("#result-context", Static).update(str(manifest.get("analysis_context", "—")))
+        self.query_one("#result-stable", Static).update(str(manifest.get("source_inventory", {}).get("stable", "—")))
+        report_widget = self.query_one("#result-report-dir", Static)
+        report_widget.set_class(bool(result.report_directory), "has-report")
+        report_widget.update(str(result.report_directory or "未创建"))
+        tools_box = self.query_one("#result-tools", Vertical)
+        tools_box.remove_children()
+        rows = []
+        for name, value in manifest.get("tools", {}).items():
+            tool_status = value.get("status", "—")
+            marker = {
+                "completed": "tool-ok",
+                "not_applicable": "tool-skip",
+                "partial": "tool-warn",
+                "timed_out": "tool-warn",
+            }.get(tool_status, "tool-fail")
+            rows.append(Static(f"{name:<12} {tool_status}", classes=f"tool-row {marker}"))
+        tools_box.mount_all(rows or [Static("—", classes="tool-skip")])
         self.add_class("completed")
 
     def _set_controls_disabled(self, disabled: bool) -> None:

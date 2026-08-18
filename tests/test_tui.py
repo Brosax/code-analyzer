@@ -78,6 +78,7 @@ def test_headless_tui_has_single_basic_form_and_preserves_hidden_config(tmp_path
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             assert not app.small
+            assert not app.has_class("wide")
             assert len(app.query("#nav")) == 0
             assert len(app.query(".page")) == 0
             assert len(app.query("#field-source-include")) == 0
@@ -85,6 +86,9 @@ def test_headless_tui_has_single_basic_form_and_preserves_hidden_config(tmp_path
             assert app.query_one("#field-build-compile-database-mode")
             assert app.query_one("#field-tools-cppcheck-enabled")
             assert app.query_one("#basic-actions")
+            left = app.query_one("#column-left").virtual_region
+            right = app.query_one("#column-right").virtual_region
+            assert right.y >= left.y + left.height  # 窄终端：两栏纵向堆叠
             source, config = app._collect()
             assert source == tmp_path.resolve()
             assert config["build"]["compile_database_mode"] == "auto"
@@ -94,10 +98,17 @@ def test_headless_tui_has_single_basic_form_and_preserves_hidden_config(tmp_path
         async with minimum.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             assert not minimum.small
+            assert not minimum.has_class("wide")
+            run_button = minimum.query_one("#run").region
+            assert run_button.height > 0 and run_button.y < 24  # 操作按钮免滚动可见
         wide = AnalyzerApp(tmp_path)
         async with wide.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             assert not wide.small
+            assert wide.has_class("wide")
+            left = wide.query_one("#column-left").region
+            right = wide.query_one("#column-right").region
+            assert right.x >= left.x + left.width  # 宽终端：两栏并排
         small = AnalyzerApp(tmp_path)
         async with small.run_test(size=(79, 23)) as pilot:
             await pilot.pause()

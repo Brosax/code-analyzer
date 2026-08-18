@@ -34,6 +34,9 @@ code-analyzer tui /path/to/project --config ./review-config.toml
 
 The UTF-8 Chinese TUI is a single-page basic scan interface for the source,
 output, compile database, analyzer selection, shareable export, and fail gate.
+The page adapts to terminal width — two balanced columns at 120 columns or
+wider, a single column below that — and the action buttons stay pinned below
+the form instead of scrolling away. `F1` shows the grading reference.
 Advanced schema-v2 values remain available through TOML and the CLI; loaded
 hidden values are preserved when the TUI runs or saves a full snapshot. `F5`
 performs a read-only preflight, `F9` shows the run impact, and `Ctrl+S` saves the
