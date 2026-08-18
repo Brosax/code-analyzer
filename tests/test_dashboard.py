@@ -80,6 +80,9 @@ def test_all_dashboard_javascript_is_syntax_checked_by_node(tmp_path: Path) -> N
     assert html.index("window.__codeAnalyzerDashboard") < html.index('id="report-data"')
     assert "Dashboard initialization failed" in scripts[0]
     assert 'href="http://' not in html and 'href="https://' not in html
+    # A stray "</script>" inside script source would terminate the block early
+    # and leave more closing tags than opening ones.
+    assert html.count("</script>") == html.count("<script")
 
 
 @pytest.mark.parametrize("with_review", [True, False])

@@ -211,6 +211,52 @@ def test_dashboard_without_review_still_declares_default_grading_reference() -> 
     assert embedded["grading_reference"]["section"]["number"] == "7"
 
 
+def test_dashboard_is_bilingual_with_language_toggle() -> None:
+    rendered = render({"run_id": "x", "tools": {}}, None)
+    assert 'lang="zh-CN"' in rendered
+    assert 'id="lang-toggle"' in rendered
+    assert "data-i18n" in rendered
+    assert "评分等级" in rendered
+    assert "Code review grading reference" in rendered
+    # Persistence must stay inside executable scripts, never in static markup.
+    static_html = rendered.split("<script>", 1)[0] + rendered.rsplit("</script>", 1)[1]
+    assert "localStorage" not in static_html
+
+
+def test_dashboard_renders_verdict_banner_from_manifest_state() -> None:
+    manifest = {
+        "run_id": "verdict-run", "tools": {}, "status": "partial", "exit_code": 10,
+        "started_at": "2026-08-18T10:00:00Z", "finished_at": "2026-08-18T10:12:34Z",
+        "gate": {"policy": "high", "triggered": True},
+        "analysis_context": "degraded", "analysis_context_reasons": ["no compile database"],
+        "source_inventory": {"total": 1, "stable": False},
+    }
+    rendered = render(manifest, None)
+    assert 'id="verdict"' in rendered
+    marker = '<script id="report-data" type="application/json">'
+    embedded = json.loads(rendered.split(marker, 1)[1].split("</script>", 1)[0])
+    execution = embedded["execution_manifest"]
+    assert execution["gate"] == {"policy": "high", "triggered": True}
+    assert execution["analysis_context_reasons"] == ["no compile database"]
+    assert execution["source_inventory"]["stable"] is False
+    assert execution["started_at"] == "2026-08-18T10:00:00Z"
+
+
+def test_dashboard_severity_charts_read_context_split_counts() -> None:
+    rendered = render({"run_id": "x", "tools": {}}, None)
+    main_script = rendered.rsplit("<script>", 1)[1].rsplit("</script>", 1)[0]
+    # Guards against re-conflating normalized severity with review levels and
+    # against dropping the newly surfaced datasets from the page.
+    for literal in (
+        "severity_counts_by_context",
+        "review_level_counts_by_context",
+        "top_rules",
+        "unit_counts",
+        "original_severity",
+    ):
+        assert literal in main_script
+
+
 def test_explicit_gate_only_changes_complete_exit_and_latest_is_atomic_record(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

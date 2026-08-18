@@ -332,8 +332,11 @@ tools/splint/
 exports/<run-id>-shareable.zip
 ```
 
-- `index.html`：完整离线仪表盘，含执行状态、覆盖率、findings、diagnostics、
-  CWE、nearby overlap、筛选、排序、分页和原始证据链接。
+- `index.html`：完整离线仪表盘（检测报告版式，中英文界面可一键切换），含总
+  体判定横幅（运行状态、报告完整性、质量门禁、源码稳定性、分析上下文与降级
+  原因、运行时长）、执行状态、覆盖率、分析单元完成/失败/超时分解、findings、
+  diagnostics、评分等级与规范化严重度按证据上下文分开统计、top rules、CWE、
+  nearby overlap、原生等级列、筛选、排序、分页和原始证据链接。
 - `review/summary.json`：review schema v2 的完整派生数据；schema v1 仍可由
   Dashboard 读取。
 - `review/summary.md`：适合文本审阅的摘要。
