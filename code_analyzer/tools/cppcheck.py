@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import time
 import xml.etree.ElementTree as ET
@@ -9,7 +8,7 @@ from typing import Any, Callable
 
 from ..process import run_process
 from ..status import aggregate_units, counts
-from .common import attach_artifacts
+from .common import attach_artifacts, unit_outcome
 
 
 def run(
@@ -96,15 +95,10 @@ def run(
             ),
         )
         valid, reason = _validate(report)
-        if process.interrupted:
-            state = "interrupted"
-        elif process.timed_out:
-            state = "partial" if valid else "timed_out"
-        elif process.exit_code == 0 and valid:
-            state = "completed"
-        else:
-            state = "partial" if valid else "failed"
-            reason = reason or f"unexpected exit status {process.exit_code}"
+        state, reason = unit_outcome(
+            process, valid, process.exit_code == 0 and valid, reason,
+            f"unexpected exit status {process.exit_code}",
+        )
         unit = {"id": name, "status": state, "input_files": files, "valid_report": valid, "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context}
         attach_artifacts(unit, directory, run_dir)
         units.append(unit)

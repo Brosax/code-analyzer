@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import load_config
 from .compile_db_wizard import run_compile_db
+from .config import load_config
 from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
-from .runner import analyze
 from .recovery import recover_report
+from .runner import analyze
+from .tools import TOOL_NAMES
 
 
 def parser() -> argparse.ArgumentParser:
@@ -51,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
     compile_group = run.add_mutually_exclusive_group()
     compile_group.add_argument("--compile-db", type=Path)
     compile_group.add_argument("--no-compile-db", action="store_true")
-    run.add_argument("--tool", choices=("cppcheck", "flawfinder", "splint"), action="append")
+    run.add_argument("--tool", choices=TOOL_NAMES, action="append")
     run.add_argument("--include", action="append", type=Path, help="project include directory")
     run.add_argument("--system-include", action="append", type=Path)
     run.add_argument("--define", action="append")
@@ -86,7 +87,16 @@ def main(argv: list[str] | None = None) -> int:
             root_parser.print_help(file=sys.stderr)
             print("\ncode-analyzer: hint: run 'code-analyzer tui [SOURCE]' in an interactive terminal", file=sys.stderr)
             return 2
-    args = root_parser.parse_args(_normalize_compile_db_args(raw_argv))
+    raw_argv = _normalize_compile_db_args(raw_argv)
+    # Split the custom command off before argparse sees it: ``--`` handling for
+    # subparser positionals is version-dependent (fixed in Python 3.12.5).
+    command_tail: list[str] | None = None
+    if raw_argv and raw_argv[0] == "compile-db" and "--" in raw_argv:
+        separator = raw_argv.index("--")
+        raw_argv, command_tail = raw_argv[:separator], raw_argv[separator + 1:]
+    args = root_parser.parse_args(raw_argv)
+    if command_tail is not None:
+        args.command_argv = list(args.command_argv) + command_tail
     try:
         if args.command == "tui":
             if not _has_tty():
@@ -187,7 +197,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         review["fail_on"] = args.fail_on
     if args.tool:
         selected = set(args.tool)
-        for name in ("cppcheck", "flawfinder", "splint"):
+        for name in TOOL_NAMES:
             tools.setdefault(name, {})["enabled"] = name in selected
     if run:
         value["run"] = run

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
 from typing import TextIO
-
 
 _BRAILLE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _ASCII_FRAMES = ("|", "/", "-", "\\")
@@ -41,7 +41,7 @@ class ProgressDisplay:
     def start(self, message: str = "preparing analysis") -> None:
         if not self._enabled or self._thread is not None:
             return
-        self._message = _single_line(message)
+        self._message = single_line(message)
         self._started = time.monotonic()
         self._stop.clear()
         self._thread = threading.Thread(
@@ -52,7 +52,7 @@ class ProgressDisplay:
         self._thread.start()
 
     def emit(self, message: str) -> None:
-        message = _single_line(message)
+        message = single_line(message)
         with self._lock:
             if self._enabled:
                 self._clear_locked()
@@ -132,5 +132,14 @@ def _terminal_width(stream: TextIO) -> int:
         return 120
 
 
-def _single_line(message: str) -> str:
-    return " ".join(str(message).replace("\r", " ").replace("\n", " ").split())
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def single_line(message: str) -> str:
+    """Collapse a message to one line with no C0/DEL control characters.
+
+    Progress and log lines embed analyzer output and scanned file names, which
+    are untrusted; a name containing an escape sequence must not be able to
+    rewrite the operator's terminal.
+    """
+    return " ".join(_CONTROL_CHARS.sub(" ", str(message)).split())

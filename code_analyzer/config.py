@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import UserError
-
+from .tools import TOOL_NAMES
 
 DEFAULTS: dict[str, Any] = {
     "config_schema_version": 2,
@@ -128,7 +128,7 @@ _ALLOWED = {
     "source": set(DEFAULTS["source"]),
     "build": set(DEFAULTS["build"]),
     "review": set(DEFAULTS["review"]),
-    "tools": {"cppcheck", "flawfinder", "splint"},
+    "tools": set(TOOL_NAMES),
     "tools.cppcheck": set(DEFAULTS["tools"]["cppcheck"]),
     "tools.flawfinder": set(DEFAULTS["tools"]["flawfinder"]),
     "tools.splint": set(DEFAULTS["tools"]["splint"]),
@@ -289,7 +289,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 # Kept private alias for downstream code which imported it during v2 previews.
-_normalize_and_validate = validate_config
 
 
 def _expect(value: Any, expected: type, name: str) -> None:
@@ -323,7 +322,7 @@ def effective_toml(config: dict[str, Any]) -> str:
                 continue
             lines.append(f"{key} = {_toml_value(value)}")
         lines.append("")
-    for tool in ("cppcheck", "flawfinder", "splint"):
+    for tool in TOOL_NAMES:
         lines.append(f"[tools.{tool}]")
         for key in DEFAULTS["tools"][tool]:
             value = config["tools"][tool][key]

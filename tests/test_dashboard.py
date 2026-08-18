@@ -2,31 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
+import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
+from helpers import run_cli
 
 from code_analyzer.dashboard import rebuild_dashboard
 from code_analyzer.errors import UserError
 from code_analyzer.html_report import render
-
-
-ROOT = Path(__file__).parents[1]
-
-
-def run_cli(*args: object) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "code_analyzer", *(str(arg) for arg in args)],
-        cwd=ROOT,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
 
 
 def report_directory(tmp_path: Path, *, review: bool = True, interrupted: bool = False) -> Path:
@@ -79,6 +65,8 @@ def executable_scripts(html: str) -> list[str]:
 
 
 def test_all_dashboard_javascript_is_syntax_checked_by_node(tmp_path: Path) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required to syntax-check the inline dashboard scripts")
     html = render({"artifacts": [], "tools": {}}, None)
     scripts = executable_scripts(html)
     assert len(scripts) == 2

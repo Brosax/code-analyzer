@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-
 GRADING_MAPPING_VERSION = 1
 UNMAPPED_REVIEW_LEVEL = "unmapped"
 REVIEW_LEVEL_RANK = {

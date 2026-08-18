@@ -10,6 +10,7 @@ from .config import validate_config
 from .doctor import probe_tool
 from .errors import UserError
 from .inventory import discover
+from .tools import TOOL_NAMES
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
     if not source.is_dir():
         issues.append(PreflightIssue("error", "SOURCE", f"source is not a directory: {source}"))
         return PreflightResult(False, tuple(issues), None, None, {})
-    selected = [name for name in ("cppcheck", "flawfinder", "splint") if checked["tools"][name]["enabled"]]
+    selected = [name for name in TOOL_NAMES if checked["tools"][name]["enabled"]]
     if not selected:
         issues.append(PreflightIssue("error", "tools", "至少选择一个分析工具"))
 

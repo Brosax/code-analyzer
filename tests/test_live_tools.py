@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 import shutil
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).parents[1]
 

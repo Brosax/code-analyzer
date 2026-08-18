@@ -4,7 +4,26 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m ruff check code_analyzer tests run_code_analyzer.py
+      - run: git diff --check
+
   tests:
     runs-on: ubuntu-latest
     strategy:
@@ -16,8 +35,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+          cache: pip
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest -m 'not live_tools and not tfm_full'
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*

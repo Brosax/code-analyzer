@@ -16,11 +16,11 @@ from .grading import (
     grading_reference,
     reference_review_level,
 )
-
+from .tools import TOOL_NAMES
 
 REVIEW_SCHEMA_VERSION = 2
-SEVERITY_MAPPING_VERSION = 1
-TOOL_ORDER = ("cppcheck", "flawfinder", "splint")
+SEVERITY_MAPPING_VERSION = 2
+TOOL_ORDER = TOOL_NAMES
 SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 OVERLAP_LINE_DISTANCE = 3
 
@@ -61,7 +61,9 @@ def build_review(
     for item in findings:
         _check_cancelled(cancelled)
         item["canonical_path"] = cached_canonical(item.get("file", ""))
-        item["severity"] = _normalize_severity(item["tool"], item.get("original_severity", ""))
+        item["severity"] = _normalize_severity(
+            item["tool"], item.get("original_severity", ""), item.get("severity_scale")
+        )
         # Splint deliberately remains unknown: its native output has no stable
         # severity scale that can support an authoritative gate.
         if item["tool"] == "splint":
@@ -435,7 +437,7 @@ def _parse_flawfinder_units(source: Path, run_dir: Path, tool: dict[str, Any]) -
                 message_value = result.get("message", {})
                 message = str(message_value.get("text", "")) if isinstance(message_value, dict) else str(message_value)
                 locations = result.get("locations") or [{}]
-                raw = _sarif_raw_severity(result, rule)
+                raw, severity_scale = _sarif_raw_severity(result, rule)
                 cwe = _extract_cwe(" ".join((rule_id, message, json.dumps(rule, ensure_ascii=False))))
                 for location in locations:
                     physical = location.get("physicalLocation", {})
@@ -451,7 +453,8 @@ def _parse_flawfinder_units(source: Path, run_dir: Path, tool: dict[str, Any]) -
                         diagnostics.append({**common, "severity": "warning", "category": _diagnostic_category(message), "fatal": False})
                     else:
                         findings.append({
-                            **common, "original_severity": raw, "rule_id": rule_id, "cwe": cwe,
+                            **common, "original_severity": raw, "severity_scale": severity_scale,
+                            "rule_id": rule_id, "cwe": cwe,
                         })
             for notification in run.get("invocations", [{}])[0].get("toolExecutionNotifications", []) if run.get("invocations") else []:
                 message_value = notification.get("message", {})
@@ -601,11 +604,13 @@ def _parse_splint_text(text: str, artifact: str, evidence_context: str = "source
             continue
         unknown = _SPLINT_UNKNOWN.match(raw)
         if unknown:
-            flush(); add(unknown.group(1).strip(), "< Location unknown >")
+            flush()
+            add(unknown.group(1).strip(), "< Location unknown >")
             wrapped_location, pending_prefix = None, None
             continue
         if current is not None and raw[:1].isspace():
-            continuation.append(raw); continue
+            continuation.append(raw)
+            continue
         wrapped_path = _SPLINT_WRAPPED_PATH.match(raw)
         if pending_prefix is not None and wrapped_path:
             flush()
@@ -620,11 +625,15 @@ def _parse_splint_text(text: str, artifact: str, evidence_context: str = "source
             continue
         wrapped = _SPLINT_WRAPPED_LOCATION.match(raw)
         if wrapped:
-            flush(); wrapped_location, pending_prefix = (wrapped.group(1), wrapped.group(2)), None; continue
+            flush()
+            wrapped_location, pending_prefix = (wrapped.group(1), wrapped.group(2)), None
+            continue
         if current is not None and not raw[:1].isspace():
             flush()
         if current is None and _is_diagnostic(raw):
-            add(raw.strip()); wrapped_location, pending_prefix = None, None; continue
+            add(raw.strip())
+            wrapped_location, pending_prefix = None, None
+            continue
         if current is None and ":" not in raw and "/" in raw and not raw[:1].isspace():
             pending_prefix, wrapped_location = raw.strip(), None
     flush()
@@ -755,7 +764,7 @@ def _validate_splint_report(path: Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def _normalize_severity(tool: str, value: str) -> str:
+def _normalize_severity(tool: str, value: str, scale: str | None = None) -> str:
     raw = str(value or "").strip().lower()
     if tool == "cppcheck":
         return {
@@ -767,32 +776,45 @@ def _normalize_severity(tool: str, value: str) -> str:
             numeric = float(raw)
         except ValueError:
             return {"error": "high", "warning": "medium", "note": "info", "none": "unknown"}.get(raw, "unknown")
-        if numeric >= 9 or numeric == 5:
-            return "critical"
-        if numeric >= 7 or numeric == 4:
-            return "high"
-        if numeric >= 4 or numeric == 3:
-            return "medium"
+        if scale == "security-severity":
+            # SARIF security-severity is a CVSS-like 0-10 scale.
+            if numeric >= 9:
+                return "critical"
+            if numeric >= 7:
+                return "high"
+            if numeric >= 4:
+                return "medium"
+        else:
+            # Flawfinder's native risk level is a 0-5 scale.
+            if numeric >= 5:
+                return "critical"
+            if numeric >= 4:
+                return "high"
+            if numeric >= 3:
+                return "medium"
         if numeric > 0:
             return "low"
         return "info" if numeric == 0 else "unknown"
     return "unknown"
 
 
-def _sarif_raw_severity(result: dict[str, Any], rule: dict[str, Any]) -> str:
+def _sarif_raw_severity(result: dict[str, Any], rule: dict[str, Any]) -> tuple[str, str | None]:
     properties = result.get("properties", {})
     rule_properties = rule.get("properties", {})
     if not isinstance(properties, dict):
         properties = {}
     if not isinstance(rule_properties, dict):
         rule_properties = {}
-    for value in (
-        properties.get("security-severity"), properties.get("level"),
-        rule_properties.get("security-severity"), rule_properties.get("level"), result.get("level"),
+    for value, scale in (
+        (properties.get("security-severity"), "security-severity"),
+        (properties.get("level"), "level"),
+        (rule_properties.get("security-severity"), "security-severity"),
+        (rule_properties.get("level"), "level"),
+        (result.get("level"), "level"),
     ):
         if value is not None and str(value) != "":
-            return str(value)
-    return "unknown"
+            return str(value), scale
+    return "unknown", None
 
 
 def _is_diagnostic(value: str) -> bool:

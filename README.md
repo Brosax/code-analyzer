@@ -168,9 +168,16 @@ export instead of discarding every safe artifact.
 ## Tests
 
 ```bash
+python3 -m pip install -e '.[dev]'
 python3 -m pytest
-python3 -m pytest -m live_tools
+CODE_ANALYZER_LIVE_TOOLS=1 python3 -m pytest -m live_tools
 ```
 
-The `tfm_full` acceptance profile is manual and intentionally excluded from a
-normal test run; see [docs/tfm_full.md](docs/tfm_full.md).
+The dashboard JavaScript syntax check additionally needs `node` on `PATH`;
+without it that one test is skipped. The `live_tools` tests require both the
+`-m live_tools` marker selection and `CODE_ANALYZER_LIVE_TOOLS=1`, so they
+never run by accident. The `tfm_full` acceptance profile is manual, requires
+`CODE_ANALYZER_TFM_FULL=1`, and is intentionally excluded from a normal test
+run; see [docs/tfm_full.md](docs/tfm_full.md).
+
+Lint with `python3 -m ruff check code_analyzer tests run_code_analyzer.py`.

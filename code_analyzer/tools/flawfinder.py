@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from ..process import run_process
 from ..status import aggregate_units, counts
-from .common import attach_artifacts, utf8_validation
+from .common import attach_artifacts, unit_outcome, utf8_validation
 
 
 def shard_files(files: list[str], prefix_bytes: int = 200) -> list[list[str]]:
@@ -93,15 +93,10 @@ def run(
             # A .sarif name is only assigned after the native stdout has
             # passed the SARIF 2.1.0 contract.
             shutil.copyfile(stdout, report)
-        if process.interrupted:
-            state = "interrupted"
-        elif process.timed_out:
-            state = "partial" if valid else "timed_out"
-        elif process.exit_code == 0 and valid:
-            state = "completed"
-        else:
-            state = "partial" if valid else "failed"
-            reason = reason or f"unexpected exit status {process.exit_code}"
+        state, reason = unit_outcome(
+            process, valid, process.exit_code == 0 and valid, reason,
+            f"unexpected exit status {process.exit_code}",
+        )
         unit = {
             "id": name, "status": state, "input_files": paths,
             "valid_report": valid, "process": process.as_dict(), "reason": reason,

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 import sys
 import textwrap
 import time
 from pathlib import Path
+
+import pytest
 
 from code_analyzer.compile_db import splint_flags
 from code_analyzer.config import load_config
@@ -127,6 +128,7 @@ def test_review_parses_native_reports_separates_diagnostics_and_groups_overlap(t
     assert summary["review_schema_version"] == 2
     assert summary["total_findings"] == 3
     assert {item["severity"] for item in summary["findings"] if item["tool"] == "splint"} == {"unknown"}
+    assert {item["severity"] for item in summary["findings"] if item["tool"] == "flawfinder"} == {"medium"}
     assert {item["review_level"] for item in summary["findings"] if item["tool"] == "cppcheck"} == {"error"}
     assert {item["review_level"] for item in summary["findings"] if item["tool"] != "cppcheck"} == {"unmapped"}
     assert summary["review_level_counts"] == {"error": 1, "unmapped": 2}
@@ -137,6 +139,17 @@ def test_review_parses_native_reports_separates_diagnostics_and_groups_overlap(t
     assert len(summary["overlap_groups"]) == 1
     assert should_fail(summary, "medium")
     assert not should_fail(summary, "critical")
+
+
+def test_flawfinder_severity_scales_are_not_conflated() -> None:
+    from code_analyzer.review import _normalize_severity
+
+    assert _normalize_severity("flawfinder", "4", "security-severity") == "medium"
+    assert _normalize_severity("flawfinder", "4", "level") == "high"
+    assert _normalize_severity("flawfinder", "5", "level") == "critical"
+    assert _normalize_severity("flawfinder", "9.1", "security-severity") == "critical"
+    assert _normalize_severity("flawfinder", "0", "level") == "info"
+    assert _normalize_severity("flawfinder", "error", None) == "high"
 
 
 def test_dashboard_embeds_all_data_safely_and_uses_text_content() -> None:
@@ -161,6 +174,33 @@ def test_dashboard_embeds_all_data_safely_and_uses_text_content() -> None:
     assert "Code review grading reference" in rendered
     assert "review-level" in rendered
     assert "http://" not in rendered and "https://" not in rendered
+
+
+def test_dashboard_embed_is_capped_and_reports_the_omission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from code_analyzer import html_report
+
+    monkeypatch.setattr(html_report, "MAX_EMBED_FINDINGS", 2)
+    finding = {
+        "tool": "cppcheck", "severity": "high", "rank": 4, "rule_id": "x", "cwe": "",
+        "canonical_path": "main.c", "file": "main.c", "line": "1", "column": "", "message": "m",
+        "fingerprint": "f", "source_artifact": "tools/cppcheck/one/report.xml",
+    }
+    review = {
+        "review_schema_version": 2, "project": "/tmp/project", "run": {}, "tools": {},
+        "source_manifest": {}, "total_findings": 5, "total_diagnostics": 0,
+        "severity_counts": {"high": 5}, "top_cwes": [], "top_files": [], "overlap_groups": [],
+        "diagnostics": [], "findings": [dict(finding, line=str(n)) for n in range(5)],
+    }
+    rendered = render({"run_id": "x", "tools": {}}, review)
+    marker = '<script id="report-data" type="application/json">'
+    embedded = json.loads(rendered.split(marker, 1)[1].split("</script>", 1)[0])
+    assert len(embedded["findings"]) == 2
+    assert embedded["findings_omitted"] == 3
+    assert embedded["total_findings"] == 5
+    assert "findings_omitted" in rendered
+    assert len(review["findings"]) == 5
 
 
 def test_dashboard_without_review_still_declares_default_grading_reference() -> None:
@@ -208,6 +248,53 @@ def test_explicit_gate_only_changes_complete_exit_and_latest_is_atomic_record(tm
     assert latest["run_id"] == manifest["run_id"] and latest["exit_code"] == 1
 
 
+def test_partial_review_is_not_masked_by_successful_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+    fake = tmp_path / "cppcheck"
+    fake.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import pathlib, sys
+        if '--version' in sys.argv:
+            print('Cppcheck 2.fake'); raise SystemExit()
+        if '--help' in sys.argv:
+            print('usage --xml-version --output-file --project --file-list --check-level --check-library --checkers-report --cppcheck-build-dir')
+            raise SystemExit()
+        report = pathlib.Path(next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--output-file=')))
+        checkers = pathlib.Path(next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--checkers-report=')))
+        report.write_text('<results><errors><error id="nullPointer" severity="error" cwe="476" msg="Null"><location file="main.c" line="1"/></error></errors></results>')
+        checkers.write_text('ok')
+    """), encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    config = load_config(source, None, {
+        "run": {"output_root": str(tmp_path / "reports"), "shareable_export": True},
+        "tools": {
+            "cppcheck": {"enabled": True, "executable": str(fake)},
+            "flawfinder": {"enabled": False}, "splint": {"enabled": False},
+        },
+        "build": {"compile_database_mode": "disabled"},
+    })
+    import code_analyzer.runner as runner_module
+    real_build_review = runner_module.build_review
+
+    def degraded_build_review(*args: object, **kwargs: object) -> dict:
+        summary = real_build_review(*args, **kwargs)
+        summary["report_integrity"]["status"] = "partial"
+        return summary
+
+    monkeypatch.setattr(runner_module, "build_review", degraded_build_review)
+    exit_code, run_dir = analyze(source, config)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert exit_code == 10
+    assert manifest["status"] == "partial"
+    assert manifest["review"]["status"] == "partial"
+    assert manifest["export"]["status"] == "completed"
+    assert (run_dir / "exports" / f"{manifest['run_id']}-shareable.zip").is_file()
+
+
 def test_normal_parent_exit_with_inherited_pipe_is_bounded_and_cleans_process_group(tmp_path: Path) -> None:
     script = tmp_path / "fork.py"
     child_pid = tmp_path / "child.pid"
@@ -222,3 +309,28 @@ def test_normal_parent_exit_with_inherited_pipe_is_bounded_and_cleans_process_gr
     assert result.exit_code == 0
     assert time.monotonic() - started < 2
     assert (tmp_path / "out").read_text() == "parent done\n"
+
+
+def test_setup_failure_after_spawn_reaps_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from code_analyzer import process as process_module
+
+    children: list[object] = []
+    real_terminate = process_module._terminate
+
+    def spying_terminate(proc: object, grace: float) -> str:
+        children.append(proc)
+        return real_terminate(proc, grace)
+
+    def failing_set_blocking(fd: int, blocking: bool) -> None:
+        raise RuntimeError("setup failure after spawn")
+
+    monkeypatch.setattr(process_module, "_terminate", spying_terminate)
+    monkeypatch.setattr(process_module.os, "set_blocking", failing_set_blocking)
+    with pytest.raises(RuntimeError, match="setup failure after spawn"):
+        run_process(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            tmp_path, tmp_path / "out", tmp_path / "err", 5, 0.1,
+        )
+    assert children and children[0].poll() is not None

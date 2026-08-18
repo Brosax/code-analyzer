@@ -7,7 +7,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-
 EXTENSIONS = {".c", ".C", ".cc", ".cpp", ".cxx", ".c++", ".h", ".H", ".hh", ".hpp", ".hxx", ".h++"}
 DEFAULT_DIRS = {
     ".git", ".hg", ".svn", ".agents", ".codex", "__pycache__", ".pytest_cache", ".mypy_cache",
@@ -136,20 +135,6 @@ def _gitignored(relative: str, patterns: list[str]) -> bool:
         if matched:
             ignored = not negate
     return ignored
-
-
-def verify(source: Path, before: list[dict[str, Any]]) -> dict[str, list[str]]:
-    result = {"changed": [], "deleted": []}
-    for item in before:
-        path = source / item["path"]
-        try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            result["deleted"].append(item["path"])
-        else:
-            if digest != item["sha256"]:
-                result["changed"].append(item["path"])
-    return result
 
 
 def git_state(source: Path) -> dict[str, Any]:

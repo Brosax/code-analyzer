@@ -11,8 +11,7 @@ from typing import Any, Callable
 from ..compile_db import splint_flags
 from ..process import run_process
 from ..status import aggregate_units, counts
-from .common import attach_artifacts
-
+from .common import attach_artifacts, unit_outcome
 
 Plan = tuple[int, str, str, list[str], str]
 
@@ -139,15 +138,10 @@ def run(
         fatal = any(marker in lowered for marker in ("cannot continue", "internal bug"))
         fatal |= not finished and any(marker in lowered for marker in ("parse error", "preprocessing error"))
         normal = process.exit_code in {0, 1} and finished and valid and not fatal
-        if process.interrupted:
-            state = "interrupted"
-        elif process.timed_out:
-            state = "partial" if valid else "timed_out"
-        elif normal:
-            state = "completed"
-        else:
-            state = "partial" if valid else "failed"
-            reason = reason or ("Splint did not reach Finished checking" if not finished else f"unexpected exit status {process.exit_code}")
+        state, reason = unit_outcome(
+            process, valid, normal, reason,
+            "Splint did not reach Finished checking" if not finished else f"unexpected exit status {process.exit_code}",
+        )
         unit = {
             "id": unit_id, "status": state, "input_files": [relative], "valid_report": valid,
             "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context,

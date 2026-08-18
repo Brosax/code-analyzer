@@ -27,7 +27,13 @@ from textual.widgets import (
     Static,
 )
 
-from .analysis import AnalysisEvent, AnalysisRequest, AnalysisResult, CancellationToken, run_analysis
+from .analysis import (
+    AnalysisEvent,
+    AnalysisRequest,
+    AnalysisResult,
+    CancellationToken,
+    run_analysis,
+)
 from .config import (
     FIELD_BY_PATH,
     FieldSpec,
@@ -39,7 +45,8 @@ from .config import (
 )
 from .errors import UserError
 from .preflight import PreflightResult, run_preflight
-
+from .progress import single_line
+from .tools import TOOL_NAMES
 
 TUI_FIELDS = (
     "run.output_root",
@@ -493,7 +500,7 @@ class AnalyzerApp(App[TuiOutcome]):
         self._preflight_worker(source, config, True)
 
     def _confirmation_text(self, source: Path, config: dict[str, Any], preflight: PreflightResult) -> str:
-        selected = [name for name in ("cppcheck", "flawfinder", "splint") if config["tools"][name]["enabled"]]
+        selected = [name for name in TOOL_NAMES if config["tools"][name]["enabled"]]
         compile_path = preflight.compile_database["path"] if preflight.compile_database else None
         warnings = [item.message for item in preflight.issues if item.severity == "warning"]
         warning_text = ("\n警告（确认后仍可运行）：\n  • " + "\n  • ".join(warnings) + "\n") if warnings else ""
@@ -552,7 +559,7 @@ class AnalyzerApp(App[TuiOutcome]):
         context = event.tool or "—"
         if event.unit:
             context += "/" + event.unit
-        self.query_one("#run-heading", Static).update(event.message)
+        self.query_one("#run-heading", Static).update(single_line(event.message))
         self.query_one("#run-details", Static).update(
             f"阶段：{event.phase} · 工具/单元：{context} · 已运行：{self._elapsed_text()}"
         )
@@ -582,7 +589,7 @@ class AnalyzerApp(App[TuiOutcome]):
         tool = event.tool or event.phase
         unit = event.unit or "-"
         stream = event.stream or "status"
-        return f"{clock} [{tool}/{unit}][{stream}] {event.message}"
+        return f"{clock} [{tool}/{unit}][{stream}] {single_line(event.message)}"
 
     def _flush_log_queue(self) -> None:
         lines: list[str] = []

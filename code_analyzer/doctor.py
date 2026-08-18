@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import locale
 import os
 import re
@@ -7,13 +8,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-
+from .tools import TOOL_NAMES
 
 REQUIRED = {
     "cppcheck": ["--xml-version", "--output-file", "--project", "--file-list", "--check-level", "--check-library", "--checkers-report", "--cppcheck-build-dir"],
@@ -23,7 +23,7 @@ REQUIRED = {
 
 def probe_all(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"analyzer_version": __version__, "python": _python_probe(), "platform": _platform_probe(), "tools": {}}
-    for name in ("cppcheck", "flawfinder", "splint"):
+    for name in TOOL_NAMES:
         result["tools"][name] = probe_tool(name, config["tools"][name]["executable"])
     result["ok"] = result["python"]["ok"] and all(
         not config["tools"][name]["enabled"] or result["tools"][name]["status"] == "compatible"

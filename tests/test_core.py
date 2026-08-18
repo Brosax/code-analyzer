@@ -1,43 +1,24 @@
 from __future__ import annotations
 
-import json
 import hashlib
-import os
-import stat
-import subprocess
-import sys
+import json
 import textwrap
-import time
 import zipfile
 from pathlib import Path
 
 import pytest
+from helpers import executable, run_cli
 
 from code_analyzer.config import load_config
 from code_analyzer.inventory import discover, source_slug
 from code_analyzer.status import aggregate_units, overall
-
-
-ROOT = Path(__file__).parents[1]
-
-
-def run_cli(*args: object, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    return subprocess.run(
-        [sys.executable, "-m", "code_analyzer", *(str(arg) for arg in args)],
-        cwd=cwd or ROOT, env=env, text=True, capture_output=True, timeout=30,
-    )
-
-
-def executable(path: Path, body: str) -> Path:
-    path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
+from code_analyzer.tools.common import artifact_index
 
 
 def fake_tools(tmp_path: Path, bad_stdout: bool = False) -> dict[str, Path]:
     tools = tmp_path / "fake tools"
     tools.mkdir()
+    stdout_line = "sys.stdout.buffer.write(b'\\xff\\xfe')" if bad_stdout else "print('ordinary output')"
     cppcheck = executable(tools / "cppcheck", f"""
         import pathlib, sys
         if '--version' in sys.argv: print('Cppcheck 2.fake'); raise SystemExit()
@@ -45,7 +26,7 @@ def fake_tools(tmp_path: Path, bad_stdout: bool = False) -> dict[str, Path]:
         checkers = pathlib.Path(next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--checkers-report=')))
         report.write_text('<?xml version="1.0"?><results version="2"><errors><error file="/mnt/c/Users/Test User/project/a.c"/></errors></results>')
         checkers.write_text('checked /home/tester/project\\n')
-        {"sys.stdout.buffer.write(b'\\xff\\xfe')" if bad_stdout else "print('ordinary output')"}
+        {stdout_line}
         print('diagnostic only', file=sys.stderr)
     """)
     flawfinder = executable(tools / "flawfinder", """
@@ -131,6 +112,29 @@ def test_status_semantics() -> None:
     tools = {"x": {"requested": True, "status": "completed", "valid_reports": 1}}
     assert overall(tools, True, "completed") == ("complete", 0)
     assert overall(tools, False, "completed") == ("partial", 10)
+    assert overall(tools, None, "completed") == ("partial", 10)
+    assert overall(tools, True, "completed", "partial") == ("partial", 10)
+    assert overall(tools, True, "completed", "failed") == ("partial", 10)
+    assert overall(tools, True, "completed", "completed") == ("complete", 0)
+
+
+def test_artifact_index_skips_caches_and_reuses_unchanged_hashes(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    for relative in (
+        "manifest.json", ".manifest.json.tmp", ".recover-abc.tmp",
+        "tools/cppcheck/compile-db/build/cache.a1", "tools/splint/u1/tmp/scratch",
+        "tools/cppcheck/compile-db/report.xml", "logs/runner.log",
+    ):
+        target = run_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("data", encoding="utf-8")
+    indexed = artifact_index(run_dir)
+    assert {item["path"] for item in indexed} == {"tools/cppcheck/compile-db/report.xml", "logs/runner.log"}
+    cache: dict[str, tuple[int, int, dict]] = {}
+    artifact_index(run_dir, cache)
+    for _size, _mtime_ns, item in cache.values():
+        item["sha256"] = "from-cache"
+    assert {item["sha256"] for item in artifact_index(run_dir, cache)} == {"from-cache"}
 
 
 def test_cli_dirty_c_exit_semantics_and_private_export(tmp_path: Path) -> None:

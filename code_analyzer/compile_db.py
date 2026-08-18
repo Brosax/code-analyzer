@@ -7,7 +7,6 @@ from typing import Any, Iterable
 
 from .errors import UserError
 
-
 _DATABASE_NAME = "compile_commands.json"
 _SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm"}
 _MAX_CANDIDATES = 64
@@ -41,7 +40,7 @@ def resolve_compile_db(
             reason = candidates[0]["issues"][0] if candidates else "file does not exist"
             raise UserError(f"invalid compile database {explicit}: {reason}")
     else:
-        selected = max(valid, key=_candidate_score, default=None)
+        selected = max(valid, key=candidate_score, default=None)
 
     discovery = _discovery_result(source, candidates, selected, mode)
     if selected is None:
@@ -251,11 +250,16 @@ def _normalize_entry(database: Path, entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_normalized(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return [_normalize_entry(path, entry) for entry in data]
+    # The file was validated by inspect_compile_db, but it can change or vanish
+    # between that read and this one; the second read must stay a user error.
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [_normalize_entry(path, entry) for entry in data]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise UserError(f"cannot load compile database {path}: {exc}") from exc
 
 
-def _candidate_score(candidate: dict[str, Any]) -> tuple[int, float, float]:
+def candidate_score(candidate: dict[str, Any]) -> tuple[int, float, float]:
     return (
         int(candidate["covered_source_tus"]),
         float(candidate["valid_directory_ratio"]),

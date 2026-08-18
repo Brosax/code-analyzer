@@ -2,25 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import stat
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
+from helpers import executable, run_cli
+
 from code_analyzer.compile_db import discover_candidate_paths, resolve_compile_db
 from code_analyzer.config import load_config
-
-
-ROOT = Path(__file__).parents[1]
-
-
-def run_cli(*args: object, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    runtime = {**os.environ, "PYTHONPATH": str(ROOT), **(env or {})}
-    return subprocess.run(
-        [sys.executable, "-m", "code_analyzer", *(str(item) for item in args)],
-        cwd=cwd, env=runtime, text=True, capture_output=True, timeout=20,
-    )
 
 
 def write_db(path: Path, source: Path, names: list[str]) -> None:
@@ -29,12 +18,6 @@ def write_db(path: Path, source: Path, names: list[str]) -> None:
         {"directory": str(path.parent), "file": str(source / name), "arguments": ["cc", "-c", str(source / name)]}
         for name in names
     ]), encoding="utf-8")
-
-
-def executable(path: Path, body: str) -> Path:
-    path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
 
 
 def test_auto_discovery_scores_adjacent_tfm_style_database_by_coverage(tmp_path: Path) -> None:

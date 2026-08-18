@@ -6,7 +6,6 @@ import io
 import json
 import os
 import re
-import shutil
 import socket
 import tempfile
 import xml.etree.ElementTree as ET
@@ -16,6 +15,7 @@ from typing import Any, Callable
 
 from .config import effective_toml
 from .html_report import render
+from .persist import manifest_structure_problem, write_json
 from .review import markdown_report
 
 
@@ -200,8 +200,14 @@ def export_shareable(
             with zipfile.ZipFile(temp_zip) as archive:
                 if archive.testzip() is not None:
                     raise ExportError("ZIP CRC validation failed")
-            os.link(temp_zip, destination)
-            temp_zip.unlink()
+            try:
+                os.link(temp_zip, destination)
+            except OSError:
+                # Hardlinks are unavailable on some target filesystems
+                # (notably WSL DrvFs mounts); fall back to an atomic rename.
+                os.replace(temp_zip, destination)
+            else:
+                temp_zip.unlink()
         except Exception:
             temp_zip.unlink(missing_ok=True)
             raise
@@ -209,15 +215,9 @@ def export_shareable(
 
 
 def _validate_core_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
-    if not isinstance(manifest, dict) or manifest.get("manifest_schema_version") != 2:
-        raise ExportError("invalid core manifest schema")
-    if (
-        not isinstance(manifest.get("tools"), dict)
-        or not all(isinstance(item, dict) for item in manifest["tools"].values())
-        or not isinstance(manifest.get("artifacts"), list)
-        or not all(isinstance(item, dict) for item in manifest["artifacts"])
-    ):
-        raise ExportError("invalid core manifest structure")
+    problem = manifest_structure_problem(manifest)
+    if problem is not None:
+        raise ExportError(f"invalid core manifest: {problem}")
     try:
         persisted = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -359,7 +359,7 @@ def _json_leaks(value: Any, redactor: Redactor) -> list[str]:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(path, value)
 
 
 def _validate_xml_stream(path: Path) -> None:

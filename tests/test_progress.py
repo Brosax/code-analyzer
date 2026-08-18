@@ -4,7 +4,7 @@ import io
 import threading
 import time
 
-from code_analyzer.progress import ProgressDisplay
+from code_analyzer.progress import ProgressDisplay, single_line
 
 
 class TtyBuffer(io.StringIO):
@@ -108,3 +108,12 @@ def test_ascii_terminal_uses_ascii_frames_and_separators(monkeypatch) -> None:
     output = stream.getvalue()
     assert any(f"[code-analyzer] {frame} active" in output for frame in "|/-\\")
     assert " · " not in output and "…" not in output
+
+
+def test_untrusted_text_cannot_inject_terminal_control_sequences() -> None:
+    assert single_line("unit 1/2 a\x1b[2Jb.c: scanning") == "unit 1/2 a [2Jb.c: scanning"
+    assert single_line("first\r\nsecond\tthird\x00") == "first second third"
+    stream = io.StringIO()
+    with ProgressDisplay(stream) as display:
+        display.emit("evil\x1b]0;owned\x07name.c")
+    assert "\x1b" not in stream.getvalue() and "\x07" not in stream.getvalue()

@@ -9,6 +9,7 @@ from typing import Any
 
 from .errors import UserError
 from .html_report import render
+from .persist import json_bytes, manifest_structure_problem
 
 
 def rebuild_dashboard(report_directory: Path) -> Path:
@@ -19,16 +20,10 @@ def rebuild_dashboard(report_directory: Path) -> Path:
 
     manifest_path = report_directory / "manifest.json"
     manifest = _read_object(manifest_path, "manifest")
-    if manifest.get("manifest_schema_version") != 2:
-        raise UserError(
-            f"invalid manifest in {manifest_path}: unsupported or missing manifest schema version"
-        )
-    tools = manifest.get("tools")
-    if not isinstance(tools, dict) or not all(isinstance(item, dict) for item in tools.values()):
-        raise UserError(f"invalid manifest in {manifest_path}: tools must be an object of objects")
-    artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
-        raise UserError(f"invalid manifest in {manifest_path}: artifacts must be a list of objects")
+    problem = manifest_structure_problem(manifest)
+    if problem is not None:
+        raise UserError(f"invalid manifest in {manifest_path}: {problem}")
+    artifacts = manifest["artifacts"]
 
     review_path = report_directory / "review" / "summary.json"
     review = _read_object(review_path, "review summary") if review_path.exists() else None
@@ -54,9 +49,7 @@ def rebuild_dashboard(report_directory: Path) -> Path:
         index_bytes = render(render_manifest, review).encode("utf-8")
         updated_manifest = dict(manifest)
         updated_manifest["artifacts"] = _updated_artifacts(artifacts, index_bytes)
-        manifest_bytes = (
-            json.dumps(updated_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        ).encode("utf-8")
+        manifest_bytes = json_bytes(updated_manifest)
     except (TypeError, ValueError) as exc:
         raise UserError(f"cannot rebuild dashboard from {report_directory}: {exc}") from exc
 

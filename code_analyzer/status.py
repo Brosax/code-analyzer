@@ -3,6 +3,14 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+# Process exit codes shared by the CLI, the runner, and the status algebra.
+EXIT_COMPLETE = 0
+EXIT_GATE_FAILED = 1
+EXIT_USAGE = 2
+EXIT_PARTIAL = 10
+EXIT_FAILED = 20
+EXIT_INTERRUPTED = 130
+
 
 def aggregate_units(units: list[dict[str, Any]], applicable: bool = True) -> str:
     if not applicable or not units:
@@ -32,17 +40,23 @@ def counts(units: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def overall(tools: dict[str, Any], source_stable: bool, export_status: str) -> tuple[str, int]:
+def overall(
+    tools: dict[str, Any],
+    source_stable: bool | None,
+    export_status: str,
+    review_status: str = "disabled",
+) -> tuple[str, int]:
     requested = [item for item in tools.values() if item["requested"]]
     if any(item["status"] == "interrupted" for item in requested):
-        return "interrupted", 130
+        return "interrupted", EXIT_INTERRUPTED
     valid = any(item.get("valid_reports", 0) > 0 for item in requested)
     applicable = [item for item in requested if item["status"] != "not_applicable"]
     complete = bool(applicable) and all(item["status"] == "completed" for item in applicable)
     complete &= all(item["status"] in {"completed", "not_applicable"} for item in requested)
-    complete &= source_stable and export_status in {"completed", "disabled"}
+    complete &= source_stable is True and export_status in {"completed", "disabled"}
+    complete &= review_status in {"completed", "disabled"}
     if complete:
-        return "complete", 0
+        return "complete", EXIT_COMPLETE
     if valid:
-        return "partial", 10
-    return "failed", 20
+        return "partial", EXIT_PARTIAL
+    return "failed", EXIT_FAILED

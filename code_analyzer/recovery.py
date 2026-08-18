@@ -4,7 +4,6 @@ import copy
 import hashlib
 import json
 import os
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +12,10 @@ from typing import Any
 from .config import DEFAULTS, load_config, validate_config
 from .errors import UserError
 from .html_report import render
+from .persist import json_bytes, manifest_structure_problem
 from .review import build_review, markdown_report
 from .sanitize import ExportError, export_shareable
+from .tools.common import artifact_index
 
 
 def recover_report(report_directory: Path) -> Path:
@@ -45,7 +46,7 @@ def recover_report(report_directory: Path) -> Path:
 
     config = _recovery_config(report_directory, source)
     max_findings = int(config["review"]["max_markdown_findings"])
-    review_json = _json_bytes(review)
+    review_json = json_bytes(review)
     review_markdown = markdown_report(review, max_findings).encode("utf-8")
     recovered = copy.deepcopy(manifest)
     recovered["review"] = {
@@ -84,7 +85,7 @@ def recover_report(report_directory: Path) -> Path:
         # and tool execution records remain byte-for-byte equivalent values.
         for key, value in original_state.items():
             recovered[key] = value
-        artifacts = _artifact_index(report_directory)
+        artifacts = artifact_index(report_directory)
         artifacts = _replace_artifact(artifacts, "review/summary.json", review_json)
         artifacts = _replace_artifact(artifacts, "review/summary.md", review_markdown)
         render_manifest = copy.deepcopy(recovered)
@@ -99,7 +100,7 @@ def recover_report(report_directory: Path) -> Path:
                 archive.relative_to(report_directory).as_posix(),
             }
         ]
-        manifest_bytes = _json_bytes(recovered)
+        manifest_bytes = json_bytes(recovered)
         _replace_transaction(report_directory, {
             report_directory / "review" / "summary.json": review_json,
             report_directory / "review" / "summary.md": review_markdown,
@@ -138,36 +139,11 @@ def _read_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def _validate_manifest(manifest: dict[str, Any], path: Path) -> None:
-    if manifest.get("manifest_schema_version") != 2:
-        raise UserError(f"invalid manifest in {path}: unsupported or missing manifest schema version")
-    if not isinstance(manifest.get("tools"), dict) or not all(
-        isinstance(item, dict) for item in manifest["tools"].values()
-    ):
-        raise UserError(f"invalid manifest in {path}: tools must be an object of objects")
-    if not isinstance(manifest.get("artifacts"), list) or not all(
-        isinstance(item, dict) for item in manifest["artifacts"]
-    ):
-        raise UserError(f"invalid manifest in {path}: artifacts must be a list of objects")
+    problem = manifest_structure_problem(manifest)
+    if problem is not None:
+        raise UserError(f"invalid manifest in {path}: {problem}")
     if not isinstance(manifest.get("run_id"), str) or not manifest["run_id"]:
         raise UserError(f"invalid manifest in {path}: run_id is required")
-
-
-def _json_bytes(value: Any) -> bytes:
-    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-
-
-def _artifact_index(report_directory: Path) -> list[dict[str, Any]]:
-    result = []
-    for path in sorted(report_directory.rglob("*")):
-        if not path.is_file() or path.name == "manifest.json" or path.name.startswith(".recover-"):
-            continue
-        data = path.read_bytes()
-        result.append({
-            "path": path.relative_to(report_directory).as_posix(),
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        })
-    return result
 
 
 def _replace_artifact(artifacts: list[dict[str, Any]], relative: str, data: bytes) -> list[dict[str, Any]]:

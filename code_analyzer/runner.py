@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import shlex
 import shutil
 import socket
-import shlex
 import subprocess
 import sys
 import time
@@ -17,16 +16,18 @@ from . import __version__
 from .analysis import AnalysisEvent, CancellationToken, EventSink
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
-from .errors import UserError
 from .doctor import verify_canary
+from .errors import UserError
 from .html_report import render
 from .inventory import discover, git_state, source_slug
+from .persist import json_bytes
+from .persist import write_json as _write_json
 from .progress import ProgressDisplay
 from .review import build_review, should_fail, write_review
 from .sanitize import ExportError, export_shareable
 from .status import overall
-from .tools import cppcheck, flawfinder, splint
-from .tools.common import artifact
+from .tools import TOOL_NAMES, cppcheck, flawfinder, splint
+from .tools.common import artifact_index
 
 
 class AnalysisCancelled(Exception):
@@ -106,7 +107,7 @@ def _analyze(
     config_path_values: list[Path] = [Path(value) for value in config.get("_config_paths", [])]
     config_path_values.extend(Path(item["path"]) for item in compile_discovery["candidates"])
     _write_inputs(run_dir, inventory, config, filtered_db, source, output_root, config_path_values)
-    requested = {name: bool(config["tools"][name]["enabled"]) for name in ("cppcheck", "flawfinder", "splint")}
+    requested = {name: bool(config["tools"][name]["enabled"]) for name in TOOL_NAMES}
     manifest: dict[str, Any] = {
         "manifest_schema_version": 2,
         "analyzer_version": __version__,
@@ -145,7 +146,7 @@ def _analyze(
     event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=0.1)
 
     interrupted = cancellation.cancelled
-    requested_names = [name for name in ("cppcheck", "flawfinder", "splint") if requested[name]]
+    requested_names = [name for name in TOOL_NAMES if requested[name]]
     tool_count = max(1, len(requested_names))
     for tool_index, name in enumerate(requested_names, 1):
         tool_prefix = f"tool {tool_index}/{len(requested_names)} {name}"
@@ -183,8 +184,11 @@ def _analyze(
         event("tool", "started", f"{name} starting", tool=name, value=tool_start_progress)
         def unit_progress(message: str, prefix: str = tool_prefix, tool_name: str = name) -> None:
             progress(f"{prefix}: {message}")
-        def structured_unit(unit: str, status: str, message: str, value: float | None, tool_name: str = name) -> None:
-            overall_value = None if value is None else tool_start_progress + 0.7 * value / tool_count
+        def structured_unit(
+            unit: str, status: str, message: str, value: float | None,
+            tool_name: str = name, tool_start: float = tool_start_progress,
+        ) -> None:
+            overall_value = None if value is None else tool_start + 0.7 * value / tool_count
             event("unit", status, message, tool=tool_name, unit=unit, value=overall_value)
         def streamed_output(unit: str, stream: str, message: str, tool_name: str = name) -> None:
             event("output", "running", message, tool=tool_name, unit=unit, stream=stream)
@@ -243,12 +247,10 @@ def _analyze(
     event("stability", "finished", "source is stable" if stable else "source changed during analysis", value=0.85)
     manifest["source_inventory"]["stable"] = stable
     manifest["source_inventory"]["changes"] = changes
-    # Set the intended final state before deriving and exporting reports. A
-    # failed review/export is corrected below without modifying native evidence.
-    if config["run"]["shareable_export"]:
-        manifest["export"]["status"] = "completed"
-        manifest["export"]["archive"] = f"exports/{run_id}-shareable.zip"
-    status, exit_code = overall(manifest["tools"], stable, manifest["export"]["status"])
+    # Compute the intended final state before deriving and exporting reports,
+    # without persisting export success ahead of the export actually running.
+    intended_export = "completed" if config["run"]["shareable_export"] else manifest["export"]["status"]
+    status, exit_code = overall(manifest["tools"], stable, intended_export)
     manifest["status"], manifest["exit_code"] = status, exit_code
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     review_summary: dict[str, Any] | None = None
@@ -287,9 +289,9 @@ def _analyze(
     if manifest["exit_code"] == 0 and review_summary is not None and should_fail(review_summary, config["review"]["fail_on"]):
         manifest["gate"]["triggered"] = True
         manifest["exit_code"] = 1
-    manifest["artifacts"] = _artifact_index(run_dir)
+    artifact_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
+    manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     _save_manifest(run_dir, manifest)
-    (run_dir / "index.html").write_text(render(manifest, review_summary), encoding="utf-8")
 
     if config["run"]["shareable_export"] and exit_code != 130:
         progress("creating redacted shareable export")
@@ -301,13 +303,15 @@ def _analyze(
         except (ExportError, OSError, ValueError, json.JSONDecodeError) as exc:
             manifest["export"].update({"status": "failed", "archive": None, "error": str(exc)})
             _log(run_dir, f"shareable export failed: {exc}")
-            status, exit_code = overall(manifest["tools"], stable, "failed")
+            status, exit_code = overall(manifest["tools"], stable, "failed", manifest["review"]["status"])
             manifest["status"], manifest["exit_code"] = status, exit_code
             manifest["gate"]["triggered"] = False
             progress("shareable export failed; private evidence was retained")
             event("export", "failed", str(exc), value=0.98)
         else:
-            status, exit_code = overall(manifest["tools"], stable, manifest["export"]["status"])
+            status, exit_code = overall(
+                manifest["tools"], stable, manifest["export"]["status"], manifest["review"]["status"]
+            )
             if manifest["gate"].get("triggered") and status == "complete":
                 exit_code = 1
             elif status != "complete":
@@ -322,7 +326,7 @@ def _analyze(
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     (run_dir / "index.html").write_text(render(manifest, review_summary), encoding="utf-8")
-    manifest["artifacts"] = _artifact_index(run_dir)
+    manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     _save_manifest(run_dir, manifest)
     try:
         _update_latest(run_dir.parent, manifest)
@@ -333,7 +337,7 @@ def _analyze(
             manifest["gate"]["triggered"] = False
         manifest["publication_error"] = str(exc)
         (run_dir / "index.html").write_text(render(manifest, review_summary), encoding="utf-8")
-        manifest["artifacts"] = _artifact_index(run_dir)
+        manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
         _save_manifest(run_dir, manifest)
         progress("latest.json publication failed; unique run evidence was retained")
     progress(f"run finished: status {manifest['status']}, exit code {manifest['exit_code']}")
@@ -365,10 +369,11 @@ def _finish_interrupted(
     if manifest["export"]["enabled"]:
         manifest["export"].update({"status": "failed", "archive": None, "error": "run interrupted"})
     manifest["gate"]["triggered"] = False
-    manifest["artifacts"] = _artifact_index(run_dir)
+    artifact_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
+    manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     _save_manifest(run_dir, manifest)
     (run_dir / "index.html").write_text(render(manifest, None), encoding="utf-8")
-    manifest["artifacts"] = _artifact_index(run_dir)
+    manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     _save_manifest(run_dir, manifest)
     try:
         _update_latest(run_dir.parent, manifest)
@@ -411,12 +416,8 @@ def _write_inputs(run_dir: Path, inventory: list[dict[str, Any]], config: dict[s
 def _save_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     target = run_dir / "manifest.json"
     temporary = run_dir / ".manifest.json.tmp"
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_bytes(json_bytes(manifest))
     temporary.replace(target)
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _log(run_dir: Path, message: str) -> None:
@@ -427,15 +428,6 @@ def _log(run_dir: Path, message: str) -> None:
 def _inventory_digest(inventory: list[dict[str, Any]]) -> str:
     canonical = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
-
-
-def _artifact_index(run_dir: Path) -> list[dict[str, Any]]:
-    result = []
-    for path in sorted(run_dir.rglob("*")):
-        if not path.is_file() or path.name == "manifest.json" or path.name == ".manifest.json.tmp":
-            continue
-        result.append(artifact(path, run_dir))
-    return result
 
 
 def _update_latest(source_root: Path, manifest: dict[str, Any]) -> None:
@@ -450,7 +442,7 @@ def _update_latest(source_root: Path, manifest: dict[str, Any]) -> None:
     target = source_root / "latest.json"
     temporary = source_root / f".latest.{manifest['run_id']}.tmp"
     try:
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.write_bytes(json_bytes(payload))
         temporary.replace(target)
     finally:
         temporary.unlink(missing_ok=True)

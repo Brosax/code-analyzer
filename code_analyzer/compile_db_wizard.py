@@ -10,8 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Any, TextIO
 
-from .compile_db import discover_candidate_paths, inspect_compile_db
+from .compile_db import candidate_score, discover_candidate_paths, inspect_compile_db
 from .errors import UserError
+from .persist import write_json
 from .process import run_process
 from .progress import ProgressDisplay
 
@@ -285,7 +286,7 @@ def _preset_build_dir(source: Path, preset: dict[str, Any] | None, name: str) ->
 
 def _best_valid(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     valid = [item for item in candidates if item["usable"]]
-    return max(valid, key=lambda item: (item["covered_source_tus"], item["valid_directory_ratio"], item["mtime"] or 0), default=None)
+    return max(valid, key=candidate_score, default=None)
 
 
 def _print_preview(argv: list[str], cwd: Path, expected: Path, impact: str, stderr: TextIO) -> None:
@@ -343,7 +344,7 @@ def _preparation_directory(source: Path) -> Path:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(path, value)
 
 
 def _interactive(stream: TextIO) -> bool:

@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Collection
 
-
 OutputSink = Callable[[str, str], None]
 
 
@@ -102,6 +101,7 @@ def run_process(
     after the direct child has been reaped.
     """
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
     started_wall = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     started = time.monotonic()
@@ -119,19 +119,29 @@ def run_process(
     assert proc.stdout is not None and proc.stderr is not None
     selector = selectors.DefaultSelector()
     selected_streams = frozenset(output_streams)
-    outputs = {
-        proc.stdout: (
+    outputs = {}
+    try:
+        outputs[proc.stdout] = (
             stdout_path.open("wb"),
             _LineForwarder("stdout", output if "stdout" in selected_streams else None),
-        ),
-        proc.stderr: (
+        )
+        outputs[proc.stderr] = (
             stderr_path.open("wb"),
             _LineForwarder("stderr", output if "stderr" in selected_streams else None),
-        ),
-    }
-    for pipe in outputs:
-        os.set_blocking(pipe.fileno(), False)
-        selector.register(pipe, selectors.EVENT_READ)
+        )
+        for pipe in outputs:
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ)
+    except Exception:
+        # A setup failure must not leave the spawned child running or any
+        # already-opened descriptor behind.
+        _terminate(proc, grace)
+        selector.close()
+        for destination, _forwarder in outputs.values():
+            destination.close()
+        proc.stdout.close()
+        proc.stderr.close()
+        raise
     timed_out = interrupted = False
     termination = None
     deadline = started + timeout

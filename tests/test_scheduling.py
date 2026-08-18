@@ -6,11 +6,9 @@ import stat
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 from code_analyzer.process import run_process
-
 
 ROOT = Path(__file__).parents[1]
 
