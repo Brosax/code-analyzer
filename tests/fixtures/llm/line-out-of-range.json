@@ -1,0 +1,24 @@
+{
+  "events": [
+    {
+      "skill": "llm-memory-safety",
+      "skill_version": "1",
+      "type": "session.started"
+    },
+    {
+      "arguments": {
+        "path": "src/parser.c"
+      },
+      "name": "fs.read",
+      "type": "tool.call"
+    },
+    {
+      "stop_reason": "completed",
+      "type": "session.finished"
+    }
+  ],
+  "final_response": "{\"findings\": [{\"category\": \"buffer\", \"confidence\": 0.72, \"cwe\": \"CWE-787\", \"line_end\": 905, \"line_start\": 900, \"message\": \"stack buffer overflow in a function the unit does not contain\", \"severity\": \"high\", \"symbol\": \"parse_packet\"}], \"unit_id\": \"src-parser-c-parse_packet\"}",
+  "finish_reason": "completed",
+  "notifications": [],
+  "session_id": "9e4a17d0b8c25f36"
+}

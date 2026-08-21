@@ -31,5 +31,6 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
   "live_tools: requires installed native analyzers",
+  "live_llm: requires a reachable LLM endpoint",
   "tfm_full: slow, manual full-repository acceptance test",
 ]

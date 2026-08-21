@@ -1,0 +1,24 @@
+{
+  "events": [
+    {
+      "skill": "llm-memory-safety",
+      "skill_version": "1",
+      "type": "session.started"
+    },
+    {
+      "arguments": {
+        "path": "src/parser.c"
+      },
+      "name": "fs.read",
+      "type": "tool.call"
+    },
+    {
+      "stop_reason": "completed",
+      "type": "session.finished"
+    }
+  ],
+  "final_response": "```json\n{\"findings\": [{\"category\": \"buffer\", \"confidence\": 0.72, \"cwe\": \"CWE-787\", \"line_end\": 121, \"line_start\": 118, \"message\": \"memcpy length is taken from the packet header without a bounds check\", \"severity\": \"high\", \"symbol\": \"parse_packet\"}], \"unit_id\": \"src-parser-c-parse_packet\"}\n```",
+  "finish_reason": "completed",
+  "notifications": [],
+  "session_id": "8a3b5e2170c9d4f6"
+}

@@ -1,0 +1,22 @@
+{
+  "events": [
+    {
+      "skill": "llm-memory-safety",
+      "skill_version": "1",
+      "type": "session.started"
+    },
+    {
+      "message": "provider closed the stream",
+      "type": "session.error"
+    }
+  ],
+  "final_response": "",
+  "finish_reason": "error",
+  "notifications": [
+    {
+      "level": "error",
+      "text": "provider closed the stream"
+    }
+  ],
+  "session_id": "1b6f2a8c503d74e9"
+}

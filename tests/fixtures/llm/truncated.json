@@ -1,0 +1,24 @@
+{
+  "events": [
+    {
+      "skill": "llm-memory-safety",
+      "skill_version": "1",
+      "type": "session.started"
+    },
+    {
+      "arguments": {
+        "path": "src/parser.c"
+      },
+      "name": "fs.read",
+      "type": "tool.call"
+    },
+    {
+      "stop_reason": "max-tokens",
+      "type": "session.finished"
+    }
+  ],
+  "final_response": "{\"unit_id\": \"src-parser-c-parse_packet\", \"findings\": [{\"category\": \"buffer\", \"line_start\": 118, \"line_e",
+  "finish_reason": "max-tokens",
+  "notifications": [],
+  "session_id": "c7048e1b6a2f3d95"
+}
