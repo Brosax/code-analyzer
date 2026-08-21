@@ -26,6 +26,48 @@ def _json_for_html(value: dict[str, Any]) -> str:
 # finding set always remains available in review/summary.json.
 MAX_EMBED_FINDINGS = 2000
 
+# Findings arrive sorted by descending rank, so a plain head slice can push a
+# whole engine below the cut and hide an entire detection path; the cap is
+# therefore shared out per engine.
+EMBED_ENGINE_ORDER: tuple[str, ...] = ("static", "llm")
+
+
+def _finding_engine(item: Any) -> str:
+    engine = item.get("engine") if isinstance(item, dict) else None
+    return engine if isinstance(engine, str) and engine else "static"
+
+
+def embedded_findings(findings: list[Any], cap: int) -> list[Any]:
+    """Take at most ``cap`` findings, reserving an equal share per engine.
+
+    Relative order is preserved, and an engine that leaves its share unused
+    releases it to the others, so the payload still holds exactly ``cap``
+    findings whenever that many exist.
+    """
+    if cap <= 0 or len(findings) <= cap:
+        return list(findings[: max(0, cap)])
+    engines = sorted(
+        {_finding_engine(item) for item in findings},
+        key=lambda name: (
+            EMBED_ENGINE_ORDER.index(name) if name in EMBED_ENGINE_ORDER else len(EMBED_ENGINE_ORDER),
+            name,
+        ),
+    )
+    totals = {name: sum(_finding_engine(item) == name for item in findings) for name in engines}
+    quota = {name: min(totals[name], cap // len(engines)) for name in engines}
+    spare = cap - sum(quota.values())
+    for name in engines:
+        granted = min(spare, totals[name] - quota[name])
+        quota[name] += granted
+        spare -= granted
+    kept: list[Any] = []
+    for item in findings:
+        name = _finding_engine(item)
+        if quota[name] > 0:
+            quota[name] -= 1
+            kept.append(item)
+    return kept
+
 
 def render(manifest: dict[str, Any], review: dict[str, Any] | None = None) -> str:
     data = dict(review or {
@@ -40,8 +82,8 @@ def render(manifest: dict[str, Any], review: dict[str, Any] | None = None) -> st
     })
     findings = data.get("findings")
     if isinstance(findings, list) and len(findings) > MAX_EMBED_FINDINGS:
-        data["findings"] = findings[:MAX_EMBED_FINDINGS]
-        data["findings_omitted"] = len(findings) - MAX_EMBED_FINDINGS
+        data["findings"] = embedded_findings(findings, MAX_EMBED_FINDINGS)
+        data["findings_omitted"] = len(findings) - len(data["findings"])
     data["execution_manifest"] = manifest
     return _TEMPLATE.replace("__CODE_ANALYZER_DATA__", _json_for_html(data))
 
@@ -183,10 +225,14 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 .bar-count{min-width:2.2rem;text-align:right}
 .tone-build{background:var(--bar-build)}
 .tone-source{background:var(--bar-source)}
+.tone-eng-static{background:var(--bar-source)}
+.tone-eng-llm{background:var(--bar-build)}
 .legend{display:flex;gap:1.1rem;font-size:.8rem;color:var(--muted);margin:.1rem 0 .5rem}
 .comp-row{margin:.7rem 0}
 .comp-row .ctx{font-size:.85rem;color:var(--muted);margin-bottom:.3rem}
 .comp-row .stack{margin-bottom:.35rem}
+.comp-cap{margin:.85rem 0 .1rem;font-family:inherit;font-size:.8rem;letter-spacing:.05em;
+  font-weight:600;color:var(--muted)}
 .grp{margin:.65rem 0}
 .grp .g-name{font-family:var(--mono);font-size:.9rem;margin-bottom:.15rem}
 .grp .bar{margin:.12rem 0;grid-template-columns:4.6rem 1fr auto}
@@ -325,15 +371,18 @@ _JS_MAIN = r"""
       card_source_files: "源文件", card_context_split: "构建感知 / 仅源码",
       card_mapping_split: "已映射 / 未映射参考等级",
       card_diagnostics: "诊断", card_valid_reports: "有效报告",
+      card_llm_coverage: "LLM 覆盖 · 已扫描 / 未扫描",
       hero_label: "条发现 · 全部证据层",
       integrity_notice: "出于完整性原因省略了 {units} 个报告单元;{files} 个文件被排除或未分析。",
       omitted_notice: "有 {n} 条发现超出仪表盘内嵌上限,未在此显示;完整数据仍在 review/summary.json 中。",
       chart_rl_comp: "评分等级构成", chart_sev_comp: "规范化严重度构成",
+      chart_engine_comp: "引擎构成 · 静态工具与 LLM",
       chart_heatmap: "文件 × 严重度", chart_tools: "各分析器",
       chart_top_rules: "规则 · 前列", chart_top_cwes: "CWE · 前列",
       heat_total: "合计",
       heat_partial: "矩阵基于内嵌的前 {n} 条发现;完整数据见 review/summary.json。",
       legend_build: "构建感知", legend_source: "仅源码",
+      legend_static: "静态工具", legend_llm: "LLM 扫描",
       no_data: "暂无数据",
       tool_build_findings: "构建感知发现", tool_source_findings: "仅源码发现",
       tool_diagnostics: "诊断", tool_version: "版本", tool_coverage: "有效覆盖",
@@ -348,13 +397,14 @@ _JS_MAIN = r"""
       th_category: "类别", th_location: "位置", th_tools: "工具", th_evidence: "证据",
       th_action: "操作", th_severity: "严重度", th_tool: "分析器", th_diag_category: "类别",
       th_fatal: "致命", th_message: "消息", th_review_level: "评分等级", th_native: "原生等级",
-      th_context: "上下文", th_rule: "规则", th_cwe: "CWE",
+      th_context: "上下文", th_provenance: "来源", th_rule: "规则", th_cwe: "CWE",
       overlap_view: "查看发现", overlap_groups_n: "{n} 组", diag_n: "{n} 条诊断",
       findings_n: "{n} 条发现", fatal_yes: "是", fatal_no: "否",
       no_overlap: "无跨工具重叠组。", no_diags: "无工具诊断。",
       no_findings: "没有符合筛选条件的发现。",
       search_label: "搜索", search_placeholder: "规则、CWE、文件或消息",
       filter_context: "上下文", opt_all_contexts: "全部上下文", opt_build: "构建感知", opt_source: "仅源码",
+      filter_engine: "引擎", opt_all_engines: "全部引擎", opt_static: "静态工具", opt_llm: "LLM 扫描",
       filter_review_level: "评分等级", opt_all_levels: "全部等级",
       filter_severity: "规范化严重度", opt_all_sev: "全部严重度",
       filter_tool: "分析器", opt_all_tools: "全部分析器",
@@ -383,15 +433,18 @@ _JS_MAIN = r"""
       card_source_files: "Source files", card_context_split: "Build-aware / source-only",
       card_mapping_split: "Mapped / unmapped reference level",
       card_diagnostics: "Diagnostics", card_valid_reports: "Valid reports",
+      card_llm_coverage: "LLM coverage · scanned / unscanned",
       hero_label: "findings · all evidence layers",
       integrity_notice: "{units} report unit(s) were omitted for integrity reasons; {files} file(s) are excluded or unanalyzed.",
       omitted_notice: "{n} finding(s) beyond the dashboard embed limit are omitted here; the complete set remains in review/summary.json.",
       chart_rl_comp: "Review level composition", chart_sev_comp: "Normalized severity composition",
+      chart_engine_comp: "Engine composition · static tools and LLM",
       chart_heatmap: "Files × severity", chart_tools: "By analyzer",
       chart_top_rules: "Top rules", chart_top_cwes: "Top CWE",
       heat_total: "total",
       heat_partial: "Matrix based on the {n} embedded findings; the complete data remains in review/summary.json.",
       legend_build: "build-aware", legend_source: "source-only",
+      legend_static: "static tools", legend_llm: "LLM scanners",
       no_data: "No data available.",
       tool_build_findings: "Build-aware findings", tool_source_findings: "Source-only findings",
       tool_diagnostics: "Diagnostics", tool_version: "Version", tool_coverage: "Effective coverage",
@@ -406,13 +459,14 @@ _JS_MAIN = r"""
       th_category: "Category", th_location: "Location", th_tools: "Tools", th_evidence: "Evidence",
       th_action: "Action", th_severity: "Severity", th_tool: "Analyzer", th_diag_category: "Category",
       th_fatal: "Fatal", th_message: "Message", th_review_level: "Review level", th_native: "Native level",
-      th_context: "Context", th_rule: "Rule", th_cwe: "CWE",
+      th_context: "Context", th_provenance: "Provenance", th_rule: "Rule", th_cwe: "CWE",
       overlap_view: "View findings", overlap_groups_n: "{n} groups", diag_n: "{n} diagnostics",
       findings_n: "{n} findings", fatal_yes: "yes", fatal_no: "no",
       no_overlap: "No cross-tool overlap groups.", no_diags: "No tool diagnostics.",
       no_findings: "No findings match the filters.",
       search_label: "Search", search_placeholder: "Rule, CWE, file, or message",
       filter_context: "Context", opt_all_contexts: "All contexts", opt_build: "Build-aware", opt_source: "Source-only",
+      filter_engine: "Engine", opt_all_engines: "All engines", opt_static: "Static tools", opt_llm: "LLM scanners",
       filter_review_level: "Review level", opt_all_levels: "All review levels",
       filter_severity: "Normalized severity", opt_all_sev: "All severities",
       filter_tool: "Analyzer", opt_all_tools: "All analyzers",
@@ -462,6 +516,8 @@ _JS_MAIN = r"""
   const rawReviewLevels = ["error", "warning", "style", "information", "unmapped"];
   const sevTone = s => "tone-sev-" + (sevOrder.includes(s) ? s : "unknown");
   const rlTone = l => "tone-rl-" + (rawReviewLevels.includes(l) ? l : "unmapped");
+  const engineTone = e => "tone-eng-" + (e === "llm" ? "llm" : "static");
+  const engineLabel = e => t(e === "llm" ? "legend_llm" : "legend_static");
   const statusTone = s => s === "complete" || s === "completed" ? "ok"
     : (s === "failed" ? "bad" : (s === "partial" || s === "interrupted" ? "warn" : "muted"));
   const tableEmpty = (body, columns, text) => {
@@ -477,6 +533,9 @@ _JS_MAIN = r"""
     ...x,
     evidence_context: x.evidence_context || "source-only",
     review_level: x.review_level || "unmapped",
+    engine: x.engine === "llm" ? "llm" : "static",
+    producer: x.producer || x.tool || "",
+    evidence_class: x.evidence_class || (x.engine === "llm" ? "generated" : "native"),
   }));
   const countBy = (list, key) => list.reduce((out, item) => {
     const value = item[key] || "unknown";
@@ -502,6 +561,14 @@ _JS_MAIN = r"""
       sevByContext = { "build-aware": {}, "source-only": sevCounts };
     }
   }
+  const contextSeries = [["build-aware", "legend_build"], ["source-only", "legend_source"]];
+  const engineSeries = [["static", "legend_static"], ["llm", "legend_llm"]];
+  const byEngine = key => ({
+    static: countBy(findings.filter(x => x.engine === "static"), key),
+    llm: countBy(findings.filter(x => x.engine === "llm"), key),
+  });
+  const sevByEngine = review.severity_counts_by_engine || byEngine("severity");
+  const levelByEngine = review.review_level_counts_by_engine || byEngine("review_level");
   const run = review.run || {};
   const startedAt = manifest.started_at || run.started_at;
   const finishedAt = manifest.finished_at || run.completed_at;
@@ -659,6 +726,13 @@ _JS_MAIN = r"""
     stat("card_diagnostics", single(review.total_diagnostics));
     stat("card_valid_reports", single(
       Object.values(manifest.tools || {}).reduce((n, x) => n + Number(x.valid_reports || 0), 0)));
+    const coverage = review.llm_coverage || {};
+    const unit = Number((coverage.functions || {}).total) > 0 ? coverage.functions : (coverage.files || {});
+    const scanned = Number(unit.scanned || 0);
+    const pending = Math.max(0, Number(unit.total || 0) - scanned);
+    if (scanned + pending > 0) {
+      stat("card_llm_coverage", splitTile(scanned, pending, "tone-eng-llm", "tone-neutral"));
+    }
   };
 
   /* ---------- distribution charts ---------- */
@@ -684,12 +758,12 @@ _JS_MAIN = r"""
       root.append(row);
     });
   };
-  const compPanel = (target, byContext, order, tone) => {
+  const compPanel = (target, countsByKey, order, tone, series) => {
     const root = id(target);
     root.replaceChildren();
     let any = false;
-    [["build-aware", "legend_build"], ["source-only", "legend_source"]].forEach(([context, labelKey]) => {
-      const stackNode = stackedBar(byContext[context] || {}, order, tone, true);
+    (series || contextSeries).forEach(([key, labelKey]) => {
+      const stackNode = stackedBar(countsByKey[key] || {}, order, tone, true);
       if (!stackNode) return;
       const row = make("div", "comp-row");
       row.append(make("div", "ctx", t(labelKey)), stackNode);
@@ -779,6 +853,8 @@ _JS_MAIN = r"""
   const renderCharts = () => {
     compPanel("rl-comp", levelByContext, rawReviewLevels, rlTone);
     compPanel("sev-comp", sevByContext, sevOrder, sevTone);
+    compPanel("engine-sev-comp", sevByEngine, sevOrder, sevTone, engineSeries);
+    compPanel("engine-rl-comp", levelByEngine, rawReviewLevels, rlTone, engineSeries);
     renderHeatmap();
     renderToolChart();
     bars("rule-chart", (review.top_rules || []).map(x => [x.rule_id, x.count]), null, true);
@@ -948,6 +1024,7 @@ _JS_MAIN = r"""
     id("finding-total").textContent = fmt("findings_n", { n: number(findings.length) });
     const q = id("search").value.toLowerCase();
     const context = id("context").value;
+    const engine = id("engine").value;
     const reviewLevel = id("review-level").value;
     const sev = id("severity").value;
     const tool = id("tool").value;
@@ -956,6 +1033,7 @@ _JS_MAIN = r"""
     let rows = findings.filter(x =>
       (!state.fingerprints || state.fingerprints.has(x.fingerprint))
       && (!context || x.evidence_context === context)
+      && (!engine || x.engine === engine)
       && (!reviewLevel || x.review_level === reviewLevel)
       && (!sev || x.severity === sev)
       && (!tool || x.tool === tool)
@@ -979,12 +1057,17 @@ _JS_MAIN = r"""
       levelCell.append(chip(rlTone(x.review_level), x.review_level));
       const sevCell = make("td");
       sevCell.append(chip(sevTone(x.severity), x.severity || "unknown"));
+      const provenance = make("td");
+      provenance.append(
+        chip(engineTone(x.engine), engineLabel(x.engine)),
+        make("span", "muted", " · " + x.evidence_class));
       tr.append(
         levelCell,
         sevCell,
         make("td", "mono", x.original_severity === undefined || x.original_severity === null ? "—" : x.original_severity),
         make("td", "", x.evidence_context),
         make("td", "mono", x.tool),
+        provenance,
         make("td", "mono", x.rule_id),
         make("td", "mono", x.cwe || "—"),
         make("td", "loc", locText(x)),
@@ -992,19 +1075,19 @@ _JS_MAIN = r"""
         evidence);
       body.append(tr);
     });
-    if (!body.childNodes.length) tableEmpty(body, 10, t("no_findings"));
+    if (!body.childNodes.length) tableEmpty(body, 11, t("no_findings"));
     id("page-status").textContent = fmt("page_status", { results: number(rows.length), page: state.page, pages: pages });
     id("previous").disabled = state.page <= 1;
     id("next").disabled = state.page >= pages;
   }
 
   /* ---------- wiring ---------- */
-  ["search", "context", "review-level", "severity", "tool", "cwe", "sort", "page-size"].forEach(x =>
+  ["search", "context", "engine", "review-level", "severity", "tool", "cwe", "sort", "page-size"].forEach(x =>
     id(x).addEventListener("input", () => { state.page = 1; renderFindings(); }));
   id("previous").onclick = () => { state.page--; renderFindings(); };
   id("next").onclick = () => { state.page++; renderFindings(); };
   id("reset").onclick = () => {
-    ["search", "context", "review-level", "severity", "tool", "cwe"].forEach(x => { id(x).value = ""; });
+    ["search", "context", "engine", "review-level", "severity", "tool", "cwe"].forEach(x => { id(x).value = ""; });
     id("sort").value = "priority";
     state.page = 1;
     state.fingerprints = null;
@@ -1077,6 +1160,9 @@ _HTML_BODY = r"""<div class="sheet">
 <div class="charts">
 <article class="panel wide"><h3 data-i18n="chart_rl_comp">评分等级构成</h3><div id="rl-comp"></div></article>
 <article class="panel wide"><h3 data-i18n="chart_sev_comp">规范化严重度构成</h3><div id="sev-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_engine_comp">引擎构成 · 静态工具与 LLM</h3>
+<h4 class="comp-cap" data-i18n="chart_sev_comp">规范化严重度构成</h4><div id="engine-sev-comp"></div>
+<h4 class="comp-cap" data-i18n="chart_rl_comp">评分等级构成</h4><div id="engine-rl-comp"></div></article>
 <article class="panel wide"><h3 data-i18n="chart_heatmap">文件 × 严重度</h3><div id="heatmap"></div></article>
 <article class="panel"><h3 data-i18n="chart_tools">各分析器</h3><div id="tool-chart"></div></article>
 <article class="panel"><h3 data-i18n="chart_top_rules">规则 · 前列</h3><div id="rule-chart"></div></article>
@@ -1135,6 +1221,11 @@ _HTML_BODY = r"""<div class="sheet">
 <option value="build-aware" data-i18n="opt_build">构建感知</option>
 <option value="source-only" data-i18n="opt_source">仅源码</option>
 </select></label>
+<label class="control"><span data-i18n="filter_engine">引擎</span><select id="engine">
+<option value="" data-i18n="opt_all_engines">全部引擎</option>
+<option value="static" data-i18n="opt_static">静态工具</option>
+<option value="llm" data-i18n="opt_llm">LLM 扫描</option>
+</select></label>
 <label class="control"><span data-i18n="filter_review_level">评分等级</span><select id="review-level">
 <option value="" data-i18n="opt_all_levels">全部等级</option>
 </select></label>
@@ -1161,6 +1252,7 @@ _HTML_BODY = r"""<div class="sheet">
 <th data-i18n="th_native">原生等级</th>
 <th data-i18n="th_context">上下文</th>
 <th data-i18n="th_tool">分析器</th>
+<th data-i18n="th_provenance">来源</th>
 <th data-i18n="th_rule">规则</th>
 <th data-i18n="th_cwe">CWE</th>
 <th data-i18n="th_location">位置</th>

@@ -20,6 +20,7 @@ from .doctor import verify_canary
 from .errors import UserError
 from .html_report import render
 from .inventory import discover, git_state, source_slug
+from .llm import scan as llm_scan
 from .persist import json_bytes
 from .persist import write_json as _write_json
 from .progress import ProgressDisplay
@@ -71,6 +72,19 @@ def _analyze(
     output_root = Path(config["run"]["output_root"]).expanduser().resolve()
     if output_root == source:
         raise UserError("output root must not be identical to source")
+    # A first-round LLM scanner is blind by construction: its cwd is the
+    # scanned tree and its only input is one scan unit.  The default output
+    # root is relative, so `analyze .` would drop the run directory -- with
+    # tools/*/report.xml, tools/*/report.sarif and the sanitizer map in it --
+    # straight into that tree, and the LLM-only measurement stops meaning
+    # anything.  Static-only runs are unaffected: nothing there reads back.
+    if config["llm"]["enabled"] and output_root.is_relative_to(source):
+        raise UserError(
+            f"output root {output_root} is inside the scanned tree {source}: an LLM scanner runs "
+            f"with that tree as its working directory and would be able to read the static "
+            f"analyzers' reports it is supposed to be independent of. Point [run] output_root "
+            f"(or --output-root) at a directory outside the source, or set [llm] enabled = false"
+        )
     progress("discovering source files and build context")
     event("discovery", "started", "discovering source files and build context")
     compile_path, compile_entries, degraded, compile_discovery = resolve_compile_db(source, config)
@@ -130,6 +144,10 @@ def _analyze(
         "source_options": {"include": config["source"]["include"], "exclude": config["source"]["exclude"]},
         "source_inventory": {"total": len(inventory), "sha256": _inventory_digest(inventory), "git": git_state(source), "stable": None, "changes": {}},
         "tools": {name: _not_requested(inventory, name) for name in requested},
+        # A new top-level key, never inside manifest["tools"]: status.overall()
+        # walks the tools, so a model timeout must not be able to turn a
+        # complete/0 run into a partial/10 one.
+        "llm": llm_scan.not_requested(),
         "export": {"enabled": bool(config["run"]["shareable_export"]), "status": "pending" if config["run"]["shareable_export"] else "disabled", "archive": None, "error": None},
         "review": {
             "enabled": bool(config["review"]["enabled"]),
@@ -227,6 +245,32 @@ def _analyze(
 
     if interrupted or cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
+
+    if config["llm"]["enabled"]:
+        progress("llm: starting semantic scan")
+        event("llm", "started", "starting LLM semantic scan", value=0.8)
+        def llm_unit(producer: str, unit: str, status: str, message: str, value: float | None) -> None:
+            event("unit", status, message, tool=producer, unit=unit, value=None if value is None else 0.8 + 0.04 * value)
+        def llm_output(producer: str, unit: str, stream: str, message: str) -> None:
+            event("output", "running", message, tool=producer, unit=unit, stream=stream)
+        try:
+            manifest["llm"] = llm_scan.run(
+                source, run_dir, inventory, config, progress,
+                cancelled=cancellation.is_cancelled, unit_event=llm_unit,
+                output_event=llm_output if live_events else None,
+            )
+        except InterruptedError:
+            manifest["llm"] = llm_scan.failed(config["llm"], "run interrupted")
+            manifest["llm"]["status"] = "interrupted"
+        except Exception as exc:
+            manifest["llm"] = llm_scan.failed(config["llm"], f"llm phase failure: {exc}")
+        llm_status = manifest["llm"]["status"]
+        _log(run_dir, f"llm: {llm_status}")
+        progress(f"llm: finished with status {llm_status}")
+        event("llm", llm_status, f"LLM scan finished with status {llm_status}", value=0.84)
+        _save_manifest(run_dir, manifest)
+        if llm_status == "interrupted" or cancellation.cancelled:
+            return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
 
     progress("verifying source stability")
     event("stability", "started", "verifying source stability", value=0.8)

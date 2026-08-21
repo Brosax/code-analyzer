@@ -13,6 +13,7 @@ from code_analyzer.html_report import render
 from code_analyzer.persist import json_bytes, manifest_structure_problem
 from code_analyzer.review import (
     _build_overlap_groups,
+    _finding_category,
     _producer_rank,
     build_review,
     should_fail,
@@ -21,8 +22,75 @@ from code_analyzer.sanitize import _validate_core_review
 from code_analyzer.tools import LLM_PRODUCERS, PRODUCER_ORDER, TOOL_NAMES
 
 # Pinned by invariant #2: a static-only corpus must keep producing these exact
-# bytes.  Regenerate only alongside a deliberate, documented format change.
+# bytes.  Generated from the pre-LLM tree (commit 4dbb5c0) via a git worktree,
+# never from the current one -- a self-generated expectation would only pin
+# whatever the classifier does today.  Regenerate the same way, and only
+# alongside a deliberate, documented format change.
 EXPECTED_STATIC_OVERLAP_GROUPS = b"""[
+  {
+    "canonical_path": "main.c",
+    "category": "CWE-190",
+    "fingerprints": [
+      "8c61f8f25f072b0c16a89bb76531ed092c7eda7380f84f5925d42a42b6da6234",
+      "1abce44a9038a510d0f0b8185d7390aa9d50a5f87c9a7b1b02de34199b70402a"
+    ],
+    "id": "c4d1b4b895b1528b",
+    "line": "20-21",
+    "line_end": 21,
+    "line_start": 20,
+    "tools": [
+      "cppcheck",
+      "flawfinder"
+    ]
+  },
+  {
+    "canonical_path": "main.c",
+    "category": "CWE-416",
+    "fingerprints": [
+      "6fd30384746e639a876ccb4a9d690d209e64239e497359ea917d116c3c95efa0",
+      "e638f67ee893c997b464e456c1cf32f0efb14c56cd42452443f692e04aa00c6d"
+    ],
+    "id": "7150f9ea6a8db470",
+    "line": "30-31",
+    "line_end": 31,
+    "line_start": 30,
+    "tools": [
+      "cppcheck",
+      "flawfinder"
+    ]
+  },
+  {
+    "canonical_path": "main.c",
+    "category": "CWE-807",
+    "fingerprints": [
+      "2edb3764639f7429494fbaa1ebf17bff143bdfa07499b28e34828e27132c36d6",
+      "fa78a7b1bc71ee1ed8d1f881fbb49c433ab7a0538be7967a42e8597fc51065e1"
+    ],
+    "id": "9ac3724480f18c5d",
+    "line": "35-36",
+    "line_end": 36,
+    "line_start": 35,
+    "tools": [
+      "cppcheck",
+      "flawfinder"
+    ]
+  },
+  {
+    "canonical_path": "main.c",
+    "category": "format",
+    "fingerprints": [
+      "e89fc0e874e9b0bc350e781771fc6fe27942451f7b7c69f77f8a16eabcabb161",
+      "9985051366159831d2712972f89a072325f83bbf495dfb1e1f206803594ab252"
+    ],
+    "id": "1e617d24ed2d5bdf",
+    "line": "25-26",
+    "line_end": 26,
+    "line_start": 25,
+    "tools": [
+      "cppcheck",
+      "flawfinder"
+    ]
+  },
   {
     "canonical_path": "main.c",
     "category": "null-dereference",
@@ -81,6 +149,64 @@ def _static_corpus(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], list[dic
         },
     }
     return source, run_dir, manifest, [{"path": "main.c"}]
+
+
+# Every entry below feeds a category table that did not exist at 4dbb5c0:
+# CWE-190/416/20/807 plus two un-CWE'd wordings ("reset", "race").  Static
+# findings must keep classifying exactly as they did before those tables.
+_EXTRA_CPPCHECK = (
+    ("atoiConversion", "error", "190", "Signed value from atoi is not checked", 20),
+    ("invalidScanfArgType", "warning", "20", "format string is not a string literal", 25),
+    ("doubleFree", "error", "416", "Memory pointed to by buf is freed twice", 30),
+    ("getenvUsage", "warning", "807", "Environment value drives a security decision", 35),
+    ("resetHandler", "warning", "", "Peripheral state is not restored after reset", 42),
+    ("raceCondition", "warning", "", "Possible race on the shared flag", 52),
+)
+_EXTRA_FLAWFINDER = (
+    ("atoi", "Unchecked atoi result CWE-190", 21),
+    ("format_string", "Unvalidated format string CWE-20", 26),
+    ("free", "Pointer used after free CWE-416", 31),
+    ("getenv", "Environment variable used in a security decision CWE-807", 36),
+    ("shared_flag", "Data race on the shared flag", 50),
+)
+_EXTRA_SPLINT = (
+    ("41", "Peripheral not restored after reset"),
+    ("51", "Possible race on the shared flag"),
+)
+
+
+def _category_corpus(tmp_path: Path) -> tuple[Path, Path, dict[str, Any], list[dict[str, Any]]]:
+    source, run_dir, manifest, inventory = _static_corpus(tmp_path)
+    report = run_dir / "tools/cppcheck/one/report.xml"
+    errors = "".join(
+        '<error id="{0}" severity="{1}"{2} msg="{3}">'
+        '<location file="main.c" line="{4}" column="1"/></error>'.format(
+            rule, severity, ' cwe="{0}"'.format(cwe) if cwe else "", message, line,
+        )
+        for rule, severity, cwe, message, line in _EXTRA_CPPCHECK
+    )
+    report.write_text(
+        report.read_text(encoding="utf-8").replace("</errors>", errors + "</errors>"), encoding="utf-8",
+    )
+    report = run_dir / "tools/flawfinder/one/report.sarif"
+    sarif = json.loads(report.read_text(encoding="utf-8"))
+    sarif["runs"][0]["results"].extend(
+        {
+            "ruleId": rule, "level": "warning", "message": {"text": message},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": "main.c"}, "region": {"startLine": line},
+            }}],
+        }
+        for rule, message, line in _EXTRA_FLAWFINDER
+    )
+    report.write_text(json.dumps(sarif), encoding="utf-8")
+    report = run_dir / "tools/splint/one/report.csv"
+    report.write_text(
+        report.read_text(encoding="utf-8")
+        + "".join("main.c,{0},{1}\n".format(line, message) for line, message in _EXTRA_SPLINT),
+        encoding="utf-8",
+    )
+    return source, run_dir, manifest, inventory
 
 
 def _llm_finding(line: str, **overrides: Any) -> dict[str, Any]:
@@ -152,9 +278,41 @@ def test_build_review_accepts_an_llm_producer_and_stamps_the_engine_axis(
 
 
 def test_static_only_overlap_groups_stay_byte_identical(tmp_path: Path) -> None:
-    source, run_dir, manifest, inventory = _static_corpus(tmp_path)
+    source, run_dir, manifest, inventory = _category_corpus(tmp_path)
     summary = build_review(source, run_dir, manifest, inventory)
     assert json_bytes(summary["overlap_groups"]) == EXPECTED_STATIC_OVERLAP_GROUPS
+
+
+def test_llm_findings_still_reach_the_categories_static_findings_must_not(tmp_path: Path) -> None:
+    source, run_dir, manifest, inventory = _category_corpus(tmp_path)
+    summary = build_review(source, run_dir, manifest, inventory)
+    static = sorted(
+        (item["tool"], int(item["line"]), _finding_category(item))
+        for item in summary["findings"] if item["engine"] == "static"
+    )
+    # Every entry below was read off the pre-LLM tree (4dbb5c0), not this one.
+    assert static == [
+        ("cppcheck", 10, "null-dereference"), ("cppcheck", 20, "CWE-190"),
+        ("cppcheck", 25, "format"), ("cppcheck", 30, "CWE-416"),
+        ("cppcheck", 35, "CWE-807"), ("cppcheck", 42, "unknown"),
+        ("cppcheck", 52, "unknown"), ("flawfinder", 12, "null-dereference"),
+        ("flawfinder", 21, "CWE-190"), ("flawfinder", 26, "format"),
+        ("flawfinder", 31, "CWE-416"), ("flawfinder", 36, "CWE-807"),
+        ("flawfinder", 50, "unknown"), ("splint", 40, "uninitialized"),
+        ("splint", 41, "unknown"), ("splint", 51, "unknown"),
+    ]
+
+    llm = [
+        dict(_llm_finding("20"), cwe="CWE-190", message="atoi result is not checked", engine="llm"),
+        dict(_llm_finding("30"), cwe="CWE-416", message="pointer used after free", engine="llm"),
+        dict(_llm_finding("35"), cwe="CWE-807", message="environment value drives a decision", engine="llm"),
+        dict(_llm_finding("42"), cwe="", message="peripheral state is not restored after reset", engine="llm"),
+        dict(_llm_finding("52"), cwe="", message="possible race on the shared flag", engine="llm"),
+        dict(_llm_finding("60"), cwe="", category="use-after-free", message="freed twice", engine="llm"),
+    ]
+    assert [_finding_category(item) for item in llm] == [
+        "integer-overflow", "lifetime", "trust-boundary", "reset-behavior", "race", "lifetime",
+    ]
 
 
 def test_gate_ignores_llm_findings_but_still_fires_for_static_ones() -> None:

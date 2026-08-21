@@ -101,6 +101,11 @@ def _validate_review(review: dict[str, Any], path: Path) -> None:
             raise UserError(f"invalid review summary in {path}: {key} must be an object")
     if not all(isinstance(item, dict) for item in review["tools"].values()):
         raise UserError(f"invalid review summary in {path}: tools must contain objects")
+    scanners = review.get("scanners")
+    if scanners is not None and (
+        not isinstance(scanners, dict) or not all(isinstance(item, dict) for item in scanners.values())
+    ):
+        raise UserError(f"invalid review summary in {path}: scanners must contain objects")
     for key in ("findings", "diagnostics", "overlap_groups"):
         value = review.get(key)
         if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):

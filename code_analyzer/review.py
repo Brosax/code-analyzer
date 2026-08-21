@@ -55,6 +55,16 @@ def build_review(
         tool_findings, tool_diagnostics = parsers[tool](source, run_dir, execution)
         findings.extend(tool_findings)
         diagnostics.extend(tool_diagnostics)
+    # Scanners are parsed alongside the native tools but never inside the
+    # native loops: llm/ evidence has its own layout, coverage and status.
+    scanner_executions = _scanner_executions(manifest)
+    for scanner in sorted(scanner_executions, key=_producer_rank):
+        _check_cancelled(cancelled)
+        scanner_findings, scanner_diagnostics = _parse_llm_units(
+            source, run_dir, {**scanner_executions[scanner], "producer": scanner}
+        )
+        findings.extend(scanner_findings)
+        diagnostics.extend(scanner_diagnostics)
 
     findings = _deduplicate(findings, diagnostic=False)
     diagnostics = _deduplicate(diagnostics, diagnostic=True)
@@ -69,8 +79,14 @@ def build_review(
     for item in findings:
         _check_cancelled(cancelled)
         item["canonical_path"] = cached_canonical(item.get("file", ""))
+        engine = "llm" if item.get("engine") == "llm" else "static"
+        item["engine"] = engine
+        item["producer"] = str(item.get("producer") or item["tool"])
+        item["evidence_class"] = "generated" if engine == "llm" else "native"
+        # A hallucinated critical must never be able to fail somebody's build.
+        item["gate_eligible"] = engine == "static"
         item["severity"] = _normalize_severity(
-            item["tool"], item.get("original_severity", ""), item.get("severity_scale")
+            item["tool"], item.get("original_severity", ""), item.get("severity_scale"), engine=engine
         )
         # Splint deliberately remains unknown: its native output has no stable
         # severity scale that can support an authoritative gate.
@@ -81,10 +97,6 @@ def build_review(
         item["review_level"] = reference_review_level(item.get("original_severity", ""))
         item["review_level_mapping_version"] = GRADING_MAPPING_VERSION
         item["review_level_rank"] = REVIEW_LEVEL_RANK[item["review_level"]]
-        item["engine"] = "static"
-        item["producer"] = item["tool"]
-        item["evidence_class"] = "native"
-        item["gate_eligible"] = True
         item["fingerprint"] = _fingerprint(item)
     for item in diagnostics:
         _check_cancelled(cancelled)
@@ -176,6 +188,10 @@ def build_review(
             },
             "total_diagnostics": sum(item["tool"] == tool for item in diagnostics),
         }
+    scanners: dict[str, Any] = {
+        name: _scanner_summary(name, scanner_executions[name], findings, diagnostics)
+        for name in sorted(scanner_executions, key=_producer_rank)
+    }
     source_manifest = {
         "total_files": len(inventory),
         "files": [item["path"] for item in inventory],
@@ -203,6 +219,8 @@ def build_review(
             "status": manifest.get("status"),
         },
         "tools": tools,
+        "scanners": scanners,
+        "llm_coverage": _llm_coverage(manifest),
         "source_manifest": source_manifest,
         "coverage_gaps": [
             {
@@ -306,6 +324,12 @@ def markdown_report(summary: dict[str, Any], max_findings: int = 200) -> str:
     for tool, data in summary.get("tools", {}).items():
         reason = f" — {data['reason']}" if data.get("reason") else ""
         lines.append(f"- `{tool}`: `{data.get('status', 'unknown')}`; findings: `{data.get('total_findings', 0)}`{reason}")
+    for scanner, data in summary.get("scanners", {}).items():
+        reason = f" — {data['reason']}" if data.get("reason") else ""
+        lines.append(
+            f"- `{scanner}` (llm, `{data.get('version') or 'unknown model'}`): "
+            f"`{data.get('status', 'unknown')}`; findings: `{data.get('total_findings', 0)}`{reason}"
+        )
     lines.extend(["", "## Severity Counts", ""])
     counts = summary.get("severity_counts", {})
     lines.extend([f"- `{key}`: {value}" for key, value in counts.items()] or ["- No findings."])
@@ -391,6 +415,64 @@ def _normalized_review_coverage(
         "ratio": len(analyzed) / effective_total if effective_total else None,
     })
     return coverage
+
+
+def _scanner_executions(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-scanner execution records from the new top-level manifest["llm"]."""
+    llm = manifest.get("llm")
+    scanners = llm.get("scanners") if isinstance(llm, dict) else None
+    if not isinstance(scanners, dict):
+        return {}
+    return {
+        str(name): dict(execution)
+        for name, execution in scanners.items()
+        if isinstance(execution, dict)
+    }
+
+
+def _scanner_summary(
+    name: str,
+    execution: dict[str, Any],
+    findings: list[dict[str, Any]],
+    diagnostics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The `scanners` entry: structurally the sibling of a `tools` entry."""
+    return {
+        "status": execution.get("status", "unknown"),
+        "reason": execution.get("reason"),
+        "requested": execution.get("requested", False),
+        "version": execution.get("version"),
+        "executable": execution.get("executable"),
+        "skill_version": execution.get("skill_version"),
+        "coverage": _normalized_review_coverage(execution, []),
+        "excluded_files": [],
+        "unit_counts": execution.get("unit_counts", {}),
+        "units": execution.get("units", []),
+        "valid_reports": execution.get("valid_reports", 0),
+        "total_findings": sum(item["tool"] == name for item in findings),
+        "finding_counts": {
+            "total": sum(item["tool"] == name for item in findings),
+            "build-aware": sum(
+                item["tool"] == name and item.get("evidence_context") == "build-aware" for item in findings
+            ),
+            "source-only": sum(
+                item["tool"] == name and item.get("evidence_context") == "source-only" for item in findings
+            ),
+        },
+        "total_diagnostics": sum(item["tool"] == name for item in diagnostics),
+    }
+
+
+def _llm_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
+    llm = manifest.get("llm")
+    coverage = llm.get("coverage") if isinstance(llm, dict) else None
+    if isinstance(coverage, dict) and coverage:
+        return coverage
+    empty = {"scanned": 0, "total": 0, "ratio": 0.0}
+    return {
+        "files": dict(empty), "functions": dict(empty), "bytes": dict(empty),
+        "by_scanner": {}, "risk_tiers": {}, "unscanned_reasons": {},
+    }
 
 
 def _parse_cppcheck_units(source: Path, run_dir: Path, tool: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -682,6 +764,121 @@ def _parse_splint_text(text: str, artifact: str, evidence_context: str = "source
     return findings, diagnostics
 
 
+# Host paths a model can invent out of thin air.  Scrubbed here rather than in
+# the export stage so review/summary.json is clean at source (design 11.1).
+_HOST_PATH_PATTERNS = (
+    re.compile(r"/home/[^/\s\"'<>]+"),
+    re.compile(r"/mnt/[A-Za-z]/(?:[^/\s\"'<>]+/)*Users/[^/\s\"'<>]+", re.I),
+    re.compile(r"[A-Za-z]:\\+(?:[^\\\r\n\"'<>]+\\+)*Users\\+[^\\\r\n\"'<>]+", re.I),
+)
+
+
+def _scrub_host_paths(value: str) -> str:
+    """Replace invented host paths with the same token the export stage uses."""
+    for pattern in _HOST_PATH_PATTERNS:
+        value = pattern.sub("<HOME>", value)
+    return value
+
+
+def _parse_llm_units(source: Path, run_dir: Path, scanner: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read one scanner's per-unit findings.json, and nothing else.
+
+    Reading only the parsed report -- exactly as the cppcheck parser reads only
+    report.xml -- is what makes rebuild-dashboard and recover-report work
+    offline with no endpoint, no credential and no network.
+    """
+    findings: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    declared = str(scanner.get("producer", ""))
+    model = str(scanner.get("version") or "")
+    for unit in scanner.get("units", []):
+        if not isinstance(unit, dict):
+            continue
+        producer = str(unit.get("producer") or declared)
+        unit_id = str(unit.get("id", ""))
+        directory = run_dir / "llm" / "sessions" / producer / unit_id
+        report = directory / "findings.json"
+        context = _evidence_context(producer, unit, scanner)
+        integrity = _report_integrity(unit, report, run_dir, producer, _validate_llm_report, scanner)
+        if integrity is not None:
+            diagnostics.append(_as_llm_diagnostic(integrity))
+            continue
+        artifact = report.relative_to(run_dir).as_posix()
+        rationale = (directory / "response.json").relative_to(run_dir).as_posix()
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            diagnostics.append(_as_llm_diagnostic(_integrity_diagnostic(
+                producer, unit, report, run_dir, f"LLM findings parse failed: {exc}", context
+            )))
+            continue
+        fallback = next((item for item in unit.get("input_files", []) if isinstance(item, str)), "")
+        for item in data.get("findings", []):
+            if not isinstance(item, dict):
+                continue
+            message = _scrub_host_paths(str(item.get("message", "")).strip())
+            if not message:
+                continue
+            span = _line_span(item)
+            category = str(item.get("category", "")).strip().lower()
+            findings.append({
+                "tool": producer, "producer": producer, "engine": "llm",
+                "evidence_class": "generated", "gate_eligible": False,
+                "message": message,
+                "file": _scrub_host_paths(str(item.get("file", "")).strip()) or fallback,
+                "line": str(span[0]) if span else "", "column": "",
+                "rule_id": _scrub_host_paths(str(item.get("rule_id", "")).strip()) or category or "llm-finding",
+                "cwe": _extract_cwe(str(item.get("cwe", ""))),
+                "original_severity": str(item.get("severity", "")).strip().lower() or "unknown",
+                "source_artifact": artifact,
+                "evidence_context": context,
+                "category": category or "unknown",
+                "confidence": item["confidence"] if isinstance(item.get("confidence"), (int, float)) and not isinstance(item.get("confidence"), bool) else None,
+                "symbol": _scrub_host_paths(str(item.get("symbol", "")).strip()),
+                "line_range": list(span),
+                "unit_id": str(data.get("unit_id") or unit_id),
+                "model": model,
+                "skill_version": str(unit.get("skill_version", "")),
+                "rationale_artifact": rationale,
+            })
+        dropped = [str(reason) for reason in data.get("malformed", []) if str(reason).strip()]
+        if dropped:
+            diagnostics.append({
+                "tool": producer, "severity": "warning", "category": "llm-malformed",
+                "message": _scrub_host_paths(
+                    f"{len(dropped)} model finding(s) failed validation and were dropped: {dropped[0]}"
+                ),
+                "file": fallback, "line": "", "column": "", "fatal": False,
+                "source_artifact": artifact, "unit_id": unit_id, "evidence_context": context,
+            })
+    return findings, diagnostics
+
+
+def _as_llm_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    """Re-tag a scanner integrity problem so it cannot gate the run.
+
+    `report-integrity` marks the derived review partial, which the runner turns
+    into exit code 10.  A model timeout must never do that, so the shared
+    mechanism is reused and only its category and severity change.
+    """
+    return {
+        **diagnostic, "category": "llm-report-integrity", "severity": "warning", "fatal": False,
+    }
+
+
+def _line_span(item: dict[str, Any]) -> tuple[int, int] | tuple[()]:
+    value = item.get("line_range")
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        value = [item.get("line"), item.get("line")]
+    numbers: list[int] = []
+    for entry in value:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            return ()
+        numbers.append(entry)
+    start, end = numbers
+    return (start, max(start, end)) if start > 0 else ()
+
+
 def _evidence_context(tool_name: str, unit: dict[str, Any], tool: dict[str, Any]) -> str:
     declared = unit.get("evidence_context")
     if declared in {"build-aware", "source-only"}:
@@ -806,8 +1003,37 @@ def _validate_splint_report(path: Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def _normalize_severity(tool: str, value: str, scale: str | None = None) -> str:
+def _validate_llm_report(path: Path) -> tuple[bool, str | None]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"invalid LLM findings report: {exc}"
+    if not isinstance(value, dict):
+        return False, "invalid LLM findings report: expected a JSON object"
+    if not isinstance(value.get("schema_version"), int) or isinstance(value.get("schema_version"), bool):
+        return False, "invalid LLM findings report: schema_version must be an integer"
+    if not isinstance(value.get("valid_report"), bool):
+        return False, "invalid LLM findings report: valid_report must be a boolean"
+    if not isinstance(value.get("producer"), str) or not value["producer"]:
+        return False, "invalid LLM findings report: producer must be a non-empty string"
+    items = value.get("findings")
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return False, "invalid LLM findings report: findings must be an array of objects"
+    malformed = value.get("malformed", [])
+    if not isinstance(malformed, list) or not all(isinstance(item, str) for item in malformed):
+        return False, "invalid LLM findings report: malformed must be an array of strings"
+    for item in items:
+        if not str(item.get("message", "")).strip():
+            return False, "invalid LLM findings report: every finding needs a message"
+    return True, None
+
+
+def _normalize_severity(tool: str, value: str, scale: str | None = None, *, engine: str = "static") -> str:
     raw = str(value or "").strip().lower()
+    if engine == "llm":
+        # Without a real normalized severity every LLM finding ranks 0, sorts
+        # last, and is the first thing the dashboard embed limit discards.
+        return raw if raw in SEVERITY_RANK else "unknown"
     if tool == "cppcheck":
         return {
             "error": "high", "warning": "medium", "style": "low", "performance": "low",
@@ -924,7 +1150,98 @@ def _line_number(value: Any) -> int:
         return 2**31 - 1
 
 
+# Correlation groups by (path, category), and an "unknown" category collapses
+# the line distance to zero.  So every vocabulary an LLM scanner can emit needs
+# a home here, or cross-engine correlation simply never happens.  Aliases map
+# the wording the skills use onto the canonical names.
+_CATEGORY_ALIASES = {
+    "": "unknown",
+    "other": "unknown",
+    "out-of-bounds": "buffer",
+    "unsafe-copy": "buffer",
+    "overflow": "buffer",
+    "use-after-free": "lifetime",
+    "undefined-behaviour": "undefined-behavior",
+    "concurrency": "race",
+    "isr": "isr-safety",
+    "isr-race": "isr-safety",
+    "interrupt": "isr-safety",
+    "register-access": "mmio",
+    "reset-behaviour": "reset-behavior",
+    "information-leak": "info-leak",
+    "volatile": "volatile-misuse",
+    "rtos": "rtos-sync",
+    "secrets": "hardcoded-secret",
+    "hardcoded-key": "hardcoded-secret",
+    "crypto": "crypto-misuse",
+    "protocol": "protocol-parsing",
+    "auth": "authentication",
+}
+
+_CWE_CATEGORIES: tuple[tuple[str, frozenset[int]], ...] = (
+    ("integer-overflow", frozenset({190, 191, 192, 194, 195, 196, 197, 680, 681})),
+    ("lifetime", frozenset({415, 416, 562, 590, 761, 825})),
+    ("input-validation", frozenset({20, 129, 1284})),
+    ("protocol-parsing", frozenset({112, 130, 240, 444})),
+    ("info-leak", frozenset({200, 209, 212, 226, 532})),
+    ("hardcoded-secret", frozenset({259, 321, 798})),
+    ("authentication", frozenset({287, 288, 290, 306, 592})),
+    ("trust-boundary", frozenset({250, 269, 501, 668, 807})),
+    ("crypto-misuse", frozenset({261, 310, 326, 328, 347, 916})),
+    ("race", frozenset({362, 364, 366, 367, 421, 543, 821})),
+    ("firmware-update", frozenset({345, 494, 565, 829})),
+    ("debug-backdoor", frozenset({489, 506, 511, 912})),
+    ("stack-usage", frozenset({674, 770, 789})),
+    ("undefined-behavior", frozenset({188, 469, 588, 704, 758})),
+)
+
+# The static vocabulary, frozen at 4dbb5c0.  Native findings are classified by
+# these six rules and nothing else, because overlap group ids hash the category:
+# reclassifying a flawfinder finding silently rewrites a static-only report.
+_KEYWORD_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("null-dereference", r"null pointer|nullpointer|nullderef"),
+    ("buffer", r"buffer|overflow|strcpy|strcat|memcpy|memmove"),
+    ("uninitialized", r"uninit|used before definition|use.?def"),
+    ("resource-leak", r"memory leak|resource leak|not released"),
+    ("format", r"format|string format|printf|scanf"),
+    ("randomness", r"random|srand|rand\("),
+)
+
+# Reached only by LLM findings, and appended rather than merged so the static
+# rules above keep the meaning they had before the LLM vocabulary existed.
+_LLM_KEYWORD_CATEGORIES: tuple[tuple[str, str], ...] = _KEYWORD_CATEGORIES + (
+    ("integer-overflow", r"integer overflow|signed overflow|unsigned wrap|truncat|sign.?(?:ed )?conversion"),
+    ("lifetime", r"use.?after.?free|double free|dangling|freed memory|after it is freed"),
+    ("race", r"\brace\b|data race|concurrent|reentran|thread.?unsafe"),
+    ("isr-safety", r"\bisr\b|\birq\b|interrupt (?:handler|context|service)"),
+    ("volatile-misuse", r"\bvolatile\b"),
+    ("atomicity", r"atomic|read.?modify.?write"),
+    ("rtos-sync", r"\brtos\b|mutex|semaphore|spinlock|critical section|freertos"),
+    ("watchdog", r"watchdog"),
+    ("mmio", r"\bmmio\b|memory.?mapped|register (?:access|write|read)"),
+    ("dma", r"\bdma\b"),
+    ("timeout", r"timeout|deadline|busy.?wait|infinite loop"),
+    ("reset-behavior", r"\breset\b|reboot|power.?on"),
+    ("protocol-parsing", r"protocol|packet|frame header|decoder|\btlv\b"),
+    ("input-validation", r"input validation|unvalidated|untrusted input|sanitiz"),
+    ("trust-boundary", r"trust boundary|privilege|attacker.?controlled"),
+    ("crypto-misuse", r"crypto|cipher|\baes\b|\brsa\b|\bhmac\b|nonce"),
+    ("hardcoded-secret", r"hard.?coded (?:key|secret|password|credential)|api key"),
+    ("info-leak", r"information (?:leak|disclosure)|leaks? (?:the )?(?:key|address|memory)"),
+    ("authentication", r"authenticat|authoriz|password check"),
+    ("firmware-update", r"firmware update|\bota\b|image signature|signature verif"),
+    ("debug-backdoor", r"backdoor|debug port|\bjtag\b|\bswd\b"),
+    ("stack-usage", r"stack (?:usage|overflow|frame)|alloca|variable.?length array"),
+    ("undefined-behavior", r"undefined behaviou?r|strict aliasing|unsequenced"),
+)
+
+
 def _finding_category(item: dict[str, Any]) -> str:
+    generated = item.get("engine") == "llm"
+    if generated:
+        declared = str(item.get("category", "")).strip().lower()
+        if declared:
+            return _CATEGORY_ALIASES.get(declared, declared)
     value = f"{item.get('cwe', '')} {item.get('rule_id', '')} {item.get('message', '')}"
     match = re.search(r"CWE-?(\d+)", value, re.I)
     cwe = int(match.group(1)) if match else None
@@ -940,14 +1257,11 @@ def _finding_category(item: dict[str, Any]) -> str:
         return "format"
     if cwe in {327, 330, 338}:
         return "randomness"
-    for category, pattern in (
-        ("null-dereference", r"null pointer|nullpointer|nullderef"),
-        ("buffer", r"buffer|overflow|strcpy|strcat|memcpy|memmove"),
-        ("uninitialized", r"uninit|used before definition|use.?def"),
-        ("resource-leak", r"memory leak|resource leak|not released"),
-        ("format", r"format|string format|printf|scanf"),
-        ("randomness", r"random|srand|rand\("),
-    ):
+    if generated and cwe is not None:
+        for category, numbers in _CWE_CATEGORIES:
+            if cwe in numbers:
+                return category
+    for category, pattern in (_LLM_KEYWORD_CATEGORIES if generated else _KEYWORD_CATEGORIES):
         if re.search(pattern, value, re.I):
             return category
     return f"CWE-{cwe}" if cwe is not None else "unknown"

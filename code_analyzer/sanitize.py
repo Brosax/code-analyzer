@@ -10,6 +10,7 @@ import socket
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,13 +19,32 @@ from .html_report import render
 from .persist import manifest_structure_problem, write_json
 from .review import markdown_report
 
+# Rendered scan units and session logs quote the analyzed source verbatim, so
+# they stay out of a shareable archive unless the operator asks for them.
+# findings.json is the one file the review parser reads, so it is always
+# exported and recover-report keeps working on an unpacked ZIP (design 11.3).
+SESSION_EXCERPT_REASON = "contains source excerpts"
+# llm/index.json is the symbol table: every typedef, struct, enum, macro and
+# global verbatim, plus every function signature in the analyzed tree.  Nothing
+# downstream reads it -- the review parser reads findings.json and coverage is
+# already in the manifest -- so it is withheld whole rather than stripped.
+SYMBOL_TABLE_REASON = "contains the analyzed source symbol table (verbatim definitions and signatures)"
+_SESSION_EXPORTED: tuple[str, ...] = ("findings.json",)
+_SYMBOL_TABLE = "llm/index.json"
+
+# A credential is redacted as a literal value, not by pattern: the harness
+# formats arbitrary SDK exception text into unit reasons, and a pydantic
+# ValidationError echoes its input_value, so the key can arrive in any shape.
+SECRET_TOKEN = "<SECRET>"
+_MIN_SECRET_CHARS = 8
+
 
 class ExportError(Exception):
     pass
 
 
 class Redactor:
-    def __init__(self, values: list[tuple[str, str]]):
+    def __init__(self, values: list[tuple[str, str]], *, secrets: Iterable[str] = ()):
         unique: dict[str, str] = {}
         for value, token in values:
             if value and len(value) > 2:
@@ -33,9 +53,22 @@ class Redactor:
                 if windows:
                     unique[windows] = token
         self.mapping = sorted(unique.items(), key=lambda pair: (-len(pair[0]), pair[0]))
-        self.counts: dict[str, int] = {"prefix": 0, "linux_home_pattern": 0, "windows_user_pattern": 0, "unc_pattern": 0}
+        # A value too short to be a credential would rewrite unrelated text.
+        self.secrets = sorted(
+            {value for value in secrets if value and len(value) >= _MIN_SECRET_CHARS},
+            key=lambda value: (-len(value), value),
+        )
+        self.counts: dict[str, int] = {
+            "prefix": 0, "secret_value": 0,
+            "linux_home_pattern": 0, "windows_user_pattern": 0, "unc_pattern": 0,
+        }
 
     def text(self, value: str) -> str:
+        for secret in self.secrets:
+            found = value.count(secret)
+            if found:
+                value = value.replace(secret, SECRET_TOKEN)
+                self.counts["secret_value"] += found
         for original, token in self.mapping:
             found = value.count(original)
             if found:
@@ -69,7 +102,8 @@ class Redactor:
         return value
 
     def leaks(self, text: str) -> list[str]:
-        leaks = ["dynamic_prefix" for original, _ in self.mapping if original in text]
+        leaks = ["secret_value" for secret in self.secrets if secret in text]
+        leaks.extend("dynamic_prefix" for original, _ in self.mapping if original in text)
         lowered = text.lower()
         generic = []
         if "/home/" in lowered:
@@ -108,7 +142,7 @@ def export_shareable(
         (socket.gethostname(), "<HOST>"),
     ]
     values.extend((str(path.resolve()), "<HOST>") for path in sensitive_paths if path)
-    redactor = Redactor(values)
+    redactor = Redactor(values, secrets=_configured_secrets(config))
     exports = run_dir / "exports"
     exports.mkdir(parents=True, exist_ok=True)
     archive_name = archive_name or f"{manifest['run_id']}-shareable.zip"
@@ -134,7 +168,8 @@ def export_shareable(
         if safe_review is not None:
             _validate_core_review(safe_review)
             safe_review = redactor.json_value(safe_review)
-        for source in _export_files(run_dir):
+        export_sessions = bool(config.get("llm", {}).get("export_sessions", False))
+        for source, omission in _export_files(run_dir, export_sessions=export_sessions):
             _check_cancelled(cancelled)
             relative = source.relative_to(run_dir)
             if relative.as_posix() in {
@@ -143,6 +178,9 @@ def export_shareable(
             }:
                 continue
             safe_name = redactor.text(relative.as_posix())
+            if omission is not None:
+                omitted_entries.append(_excluded_entry(source, safe_name, omission))
+                continue
             target: Path | None = None
             digest: str | None = None
             source_size: int | None = None
@@ -166,7 +204,11 @@ def export_shareable(
                 })
                 continue
             report_entries.append({"artifact_sha256": digest, "size": len(source_bytes), "entry": safe_name, "format": kind, "validated": True})
-        export_status = "partial" if omitted_entries else "completed"
+        # Withholding source excerpts is policy, not failure: it must not
+        # degrade the run status and with it somebody's exit code.
+        export_status = "partial" if any(
+            entry["status"] == "omitted" for entry in omitted_entries
+        ) else "completed"
         manifest["export"].update({
             "status": export_status, "archive": f"exports/{archive_name}", "error": None,
             "omitted_artifacts": omitted_entries,
@@ -234,6 +276,12 @@ def _validate_core_review(review: dict[str, Any]) -> None:
     for key in ("tools", "source_manifest"):
         if not isinstance(review.get(key), dict):
             raise ExportError(f"invalid core review: {key} must be an object")
+    # Schema 3 adds the isomorphic sibling of tools; older reviews have none.
+    if "scanners" in review and (
+        not isinstance(review["scanners"], dict)
+        or not all(isinstance(item, dict) for item in review["scanners"].values())
+    ):
+        raise ExportError("invalid core review: scanners must be an object of objects")
     for key in ("findings", "diagnostics", "overlap_groups"):
         if not isinstance(review.get(key), list) or not all(isinstance(item, dict) for item in review[key]):
             raise ExportError(f"invalid core review: {key} must be an array of objects")
@@ -247,7 +295,37 @@ def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
         raise ExportError("run interrupted")
 
 
-def _export_files(run_dir: Path):
+def _configured_secrets(config: dict[str, Any]) -> list[str]:
+    """The credential values that must not appear anywhere in an archive.
+
+    The key itself lives only in the environment; this resolves it so the
+    exported text can be checked against the value rather than a shape.
+    """
+    llm = config.get("llm")
+    name = str(llm.get("api_key_env", "") or "").strip() if isinstance(llm, dict) else ""
+    return [os.environ.get(name, "")] if name else []
+
+
+def _quotes_source(relative: Path) -> str | None:
+    """Why an artifact reproduces the analyzed source, or ``None`` if it does not."""
+    parts = relative.parts
+    if parts[:2] == ("llm", "sessions"):
+        excerpt = len(parts) > 3 and parts[-1] not in _SESSION_EXPORTED
+        return SESSION_EXCERPT_REASON if excerpt else None
+    if parts[:2] == ("llm", "units"):
+        return SESSION_EXCERPT_REASON
+    if relative.as_posix() == _SYMBOL_TABLE:
+        return SYMBOL_TABLE_REASON
+    return None
+
+
+def _export_files(run_dir: Path, *, export_sessions: bool = False):
+    """Yield every archive candidate as ``(path, omission reason or None)``.
+
+    A reason marks a deliberate policy exclusion: the file is reported in the
+    redaction report instead of being shipped. Paths that never belonged in an
+    archive at all are simply not yielded.
+    """
     for path in sorted(run_dir.rglob("*")):
         if not path.is_file():
             continue
@@ -256,7 +334,23 @@ def _export_files(run_dir: Path):
             continue
         if "build" in relative.parts or "tmp" in relative.parts:
             continue
-        yield path
+        reason = None if export_sessions else _quotes_source(relative)
+        if reason is not None:
+            yield path, reason
+            continue
+        yield path, None
+
+
+def _excluded_entry(source: Path, entry: str, reason: str) -> dict[str, Any]:
+    """Report a file withheld by policy, not by a sanitizer failure."""
+    try:
+        payload = source.read_bytes()
+    except OSError:
+        return {"artifact_sha256": None, "size": None, "entry": entry, "status": "excluded", "reason": reason}
+    return {
+        "artifact_sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload),
+        "entry": entry, "status": "excluded", "reason": reason,
+    }
 
 
 def _sanitize_file(source: Path, target: Path, redactor: Redactor) -> str:
@@ -269,7 +363,7 @@ def _sanitize_file(source: Path, target: Path, redactor: Redactor) -> str:
                 for line in input_stream:
                     safe = redactor.text(line)
                     # Redaction tokens are data, never XML markup.
-                    for token in ("SRC", "OUT", "HOME", "HOST"):
+                    for token in ("SRC", "OUT", "HOME", "HOST", "SECRET"):
                         safe = safe.replace(f"<{token}>", f"&lt;{token}&gt;")
                     output_stream.write(safe)
             _validate_xml_stream(target)

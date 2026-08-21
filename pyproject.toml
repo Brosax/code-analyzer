@@ -9,16 +9,24 @@ description = "Evidence-first C/C++ static analysis runner for WSL"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["textual>=8.2.8,<9"]
+# deepseek-harness-sdk is pinned exactly: upstream is a release candidate that
+# states it will make compatibility-breaking changes.
+dependencies = ["textual>=8.2.8,<9", "deepseek-harness-sdk==0.1.1rc1"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.5"]
+# setuptools: tests/test_llm_config.py builds a wheel to prove the skills ship.
+dev = ["pytest>=8", "ruff>=0.5", "setuptools>=77"]
 
 [project.scripts]
 code-analyzer = "code_analyzer.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["code_analyzer*"]
+
+# The scanner skills live in hyphenated, non-package directories: without this
+# they are missing from every non-editable install and the LLM phase fails.
+[tool.setuptools.package-data]
+"code_analyzer.skills" = ["*/SKILL.md"]
 
 [tool.ruff]
 target-version = "py311"

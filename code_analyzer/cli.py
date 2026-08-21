@@ -12,9 +12,10 @@ from .config import load_config
 from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
+from .llm.profiles import PROFILE_NAMES, third_party_warning
 from .recovery import recover_report
 from .runner import analyze
-from .tools import TOOL_NAMES
+from .tools import LLM_PRODUCERS, TOOL_NAMES
 
 
 def parser() -> argparse.ArgumentParser:
@@ -68,6 +69,16 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--splint-scope", choices=("auto", "build", "inventory"))
     run.add_argument("--splint-jobs", type=_positive_int)
     run.add_argument("--splint-heartbeat", type=_positive_float)
+    run.add_argument("--llm", action=argparse.BooleanOptionalAction, default=None, help="run the LLM scanners as a second, independent detection path")
+    run.add_argument("--llm-profile", choices=PROFILE_NAMES, help="built-in provider profile supplying endpoint, model and api_key_env defaults")
+    run.add_argument("--llm-endpoint", metavar="URL")
+    run.add_argument("--llm-model", metavar="NAME")
+    run.add_argument("--llm-scanner", choices=LLM_PRODUCERS, action="append")
+    run.add_argument("--llm-jobs", type=_positive_int)
+    run.add_argument("--llm-total-timeout", type=_positive_float, metavar="SECONDS")
+    run.add_argument("--llm-token-budget", type=_positive_int, metavar="N", help="prompt token budget for the whole LLM phase")
+    run.add_argument("--llm-risk", action="append", metavar="PATTERN=TIER")
+    run.add_argument("--llm-no-cache", action="store_true")
     run.add_argument("--termination-grace", type=_positive_float)
     run.add_argument("--follow-symlinks", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--respect-gitignore", action=argparse.BooleanOptionalAction, default=None)
@@ -111,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             return outcome.exit_code
         if args.command == "doctor":
             config = load_config(Path.cwd(), args.config, None)
+            _warn_third_party(config)
             result = probe_all(config)
             if args.as_json:
                 print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
@@ -128,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         source = args.source.expanduser().resolve()
         overrides = _overrides(args)
         config = load_config(source, args.config, overrides)
+        if config["llm"]["enabled"]:
+            _warn_third_party(config)
         exit_code, run_dir = analyze(source, config)
         print(run_dir)
         return exit_code
@@ -137,6 +151,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("code-analyzer: interrupted", file=sys.stderr)
         return 130
+
+
+def _warn_third_party(config: dict[str, Any]) -> None:
+    warning = third_party_warning(config["llm"])
+    if warning:
+        print(f"code-analyzer: warning: {warning}", file=sys.stderr)
 
 
 def _has_tty() -> bool:
@@ -150,6 +170,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
     build: dict[str, Any] = {}
     tools: dict[str, Any] = {}
     review: dict[str, Any] = {}
+    llm: dict[str, Any] = {}
     if args.output_root is not None:
         run["output_root"] = str(args.output_root.resolve())
     if args.shareable_export is not None:
@@ -191,6 +212,26 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         tools.setdefault("splint", {})["jobs"] = args.splint_jobs
     if args.splint_heartbeat is not None:
         tools.setdefault("splint", {})["heartbeat_seconds"] = args.splint_heartbeat
+    if args.llm is not None:
+        llm["enabled"] = args.llm
+    if args.llm_profile is not None:
+        llm["profile"] = args.llm_profile
+    if args.llm_endpoint is not None:
+        llm["endpoint"] = args.llm_endpoint
+    if args.llm_model is not None:
+        llm["model"] = args.llm_model
+    if args.llm_scanner:
+        llm["scanners"] = [name for name in LLM_PRODUCERS if name in set(args.llm_scanner)]
+    if args.llm_jobs is not None:
+        llm["jobs"] = args.llm_jobs
+    if args.llm_total_timeout is not None:
+        llm["total_timeout_seconds"] = args.llm_total_timeout
+    if args.llm_token_budget is not None:
+        llm["total_prompt_tokens"] = args.llm_token_budget
+    if args.llm_risk:
+        llm["risk_overrides"] = args.llm_risk
+    if args.llm_no_cache:
+        llm["cache"] = False
     if args.review is not None:
         review["enabled"] = args.review
     if args.fail_on is not None:
@@ -209,6 +250,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         value["tools"] = tools
     if review:
         value["review"] = review
+    if llm:
+        value["llm"] = llm
     return value
 
 
