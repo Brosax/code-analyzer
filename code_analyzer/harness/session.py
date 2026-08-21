@@ -36,8 +36,8 @@ SESSIONS_ROOT = ("llm", "sessions")
 # appendix A3), so each knob is filed under the gate that really applies it and
 # the ones no channel carries are named as such instead of being listed beside
 # the ones that work.
-TRANSMITTED_KEYS: tuple[str, ...] = ("max_completion_tokens",)
-LOCAL_KEYS: tuple[str, ...] = ("max_steps", "max_turns", "request_timeout_seconds")
+TRANSMITTED_KEYS: tuple[str, ...] = ("max_completion_tokens", "request_timeout_seconds")
+LOCAL_KEYS: tuple[str, ...] = ("max_steps", "max_turns")
 CORDIS_KEYS: tuple[str, ...] = ("context_window",)
 UNAPPLIED_KEYS: tuple[str, ...] = ("temperature", "top_p", "seed")
 
@@ -47,6 +47,27 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 def unit_directory(run_dir: Path, producer: str, unit_id: str) -> Path:
     """Evidence directory for one (producer, unit) pair."""
     return Path(run_dir).joinpath(*SESSIONS_ROOT, _safe(producer, "producer"), _safe(unit_id, "unit id"))
+
+
+def resync_meta_status(directory: Path, status: str, reason: str) -> None:
+    """Re-file meta.json after a caller demotes the unit it describes.
+
+    run_unit persists meta.json before the scanner can reclassify a provider
+    stop, so without this the per-unit evidence and the manifest report
+    different words for the same unit -- and an offline auditor reads the
+    evidence, not the manifest.  Missing or unreadable meta is not worth
+    failing a run over; the manifest remains authoritative.
+    """
+    path = Path(directory) / "meta.json"
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(meta, dict) or meta.get("status") == status:
+        return
+    meta["status"] = status
+    meta["reason"] = reason
+    write_json(path, meta)
 
 
 def run_unit(

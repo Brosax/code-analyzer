@@ -1,6 +1,7 @@
 """Phase 0 guardrails: producer ordering, the engine axis, and the static gate."""
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -240,9 +241,16 @@ def test_llm_producer_findings_sort_and_group_without_raising() -> None:
     findings.sort(key=lambda item: (-item["rank"], _producer_rank(item["tool"]), item["line"]))
     assert [item["tool"] for item in findings] == ["cppcheck", "llm-memory-safety", "llm-unregistered"]
 
+    # Design 6.1 freezes overlap_groups to native tools; an LLM finding must not
+    # join a static cluster and move its line span. Cross-engine correlation is
+    # the audit layer's artifact, not this one.
     groups = _build_overlap_groups(findings)
-    assert [group["tools"] for group in groups] == [["cppcheck", "llm-memory-safety"]]
-    assert groups[0]["line"] == "10-11"
+    assert groups == []
+    static_pair = [item for item in findings if item["tool"] == "cppcheck"]
+    static_pair.append(dict(static_pair[0], tool="flawfinder", line="11", fingerprint="d" * 64))
+    native = _build_overlap_groups(static_pair)
+    assert [group["tools"] for group in native] == [["cppcheck", "flawfinder"]]
+    assert native[0]["line"] == "10-11"
 
 
 def test_build_review_accepts_an_llm_producer_and_stamps_the_engine_axis(
@@ -274,7 +282,9 @@ def test_build_review_accepts_an_llm_producer_and_stamps_the_engine_axis(
     assert summary["severity_counts_by_engine"]["llm"] == {}
     assert summary["severity_counts_by_engine"]["static"] == summary["severity_counts"]
     assert summary["review_level_counts_by_engine"]["static"] == summary["review_level_counts"]
-    assert {group["tools"][-1] for group in summary["overlap_groups"]} == {"llm-memory-safety"}
+    assert all(
+        set(group["tools"]) <= set(TOOL_NAMES) for group in summary["overlap_groups"]
+    ), "overlap_groups is frozen to native tools (design 6.1)"
 
 
 def test_static_only_overlap_groups_stay_byte_identical(tmp_path: Path) -> None:
@@ -348,3 +358,44 @@ def test_schema_three_review_with_an_llm_producer_passes_the_offline_validators(
     # The manifest schema is deliberately untouched by this phase.
     assert manifest_structure_problem({"manifest_schema_version": 3, "tools": {}, "artifacts": []})
     assert manifest_structure_problem({"manifest_schema_version": 2, "tools": {}, "artifacts": []}) is None
+
+
+def test_deduplicate_keeps_identical_findings_from_different_producers() -> None:
+    """Invariant 1 rests on ``tool`` being part of the dedup key.
+
+    Pre-LLM this was nearly inert: cppcheck and flawfinder rarely emit an
+    identical (file, line, column, rule_id, message).  With three scanners
+    sharing one output schema over the same units, byte-identical cross-producer
+    findings are the expected case, so dropping one would silently merge them.
+    """
+    shared = {
+        "message": "buffer overflow", "file": "main.c", "line": "10", "column": "5",
+        "rule_id": "buffer", "evidence_context": "source-only",
+    }
+    items = [
+        dict(shared, tool="llm-memory-safety"),
+        dict(shared, tool="llm-security"),
+        dict(shared, tool="cppcheck"),
+    ]
+    kept = review_module._deduplicate(copy.deepcopy(items), diagnostic=False)
+    assert [item["tool"] for item in kept] == [
+        "llm-memory-safety", "llm-security", "cppcheck",
+    ]
+    # And genuine duplicates from one producer still collapse.
+    twice = [dict(shared, tool="cppcheck"), dict(shared, tool="cppcheck")]
+    assert len(review_module._deduplicate(twice, diagnostic=False)) == 1
+
+
+def test_an_aborted_finish_reason_keeps_its_own_status_word() -> None:
+    """The exit code is covered elsewhere; the status word was not.
+
+    Mapping ``aborted`` onto ``completed`` would report a truncated agent run as
+    a clean one, and the demotion path would never notice.
+    """
+    from code_analyzer.harness.runtime import FINISH_REASON_STATUS, finish_status
+
+    assert FINISH_REASON_STATUS["aborted"] == "interrupted"
+    assert FINISH_REASON_STATUS["cancelled"] == "interrupted"
+    assert finish_status("aborted", True) == "interrupted"
+    assert finish_status("completed", True) == "completed"
+    assert finish_status("completed", False) == "failed"

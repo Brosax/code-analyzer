@@ -38,9 +38,28 @@ import threading
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from ..errors import UserError
 from ..persist import json_bytes
+
+
+def endpoint_url(settings: dict[str, Any]) -> str:
+    """The endpoint with any userinfo removed, safe to persist as evidence."""
+    value = str(settings.get("endpoint", "") or "").strip()
+    if not value:
+        return ""
+    try:
+        split = urlsplit(value)
+    except ValueError:
+        return ""
+    if not (split.username or split.password):
+        return value
+    host = split.hostname or ""
+    if split.port:
+        host = f"{host}:{split.port}"
+    return urlunsplit(split._replace(netloc=host))
+
 
 SKILL_PACKAGE = "code_analyzer"
 SKILL_RESOURCE = "skills"
@@ -224,7 +243,7 @@ def _provider_package(settings: dict[str, Any]) -> dict[str, Any]:
     provider: dict[str, Any] = {
         "displayName": "code-analyzer endpoint",
         "api": "openai-completions",
-        "baseURL": endpoint,
+        "baseURL": endpoint_url(settings),
         "models": [entry],
     }
     key_env = str(settings.get("api_key_env", "") or "").strip()

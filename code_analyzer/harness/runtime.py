@@ -14,10 +14,9 @@ import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
 
 from ..errors import UserError
-from .cordis import confined, write_cordis_config
+from .cordis import confined, endpoint_url, write_cordis_config
 
 SDK_MODULE = "deepseek_harness"
 DEFAULT_PROVIDER = "deepseek-official"
@@ -157,23 +156,6 @@ def _replace_secret(value: Any, secret: str) -> Any:
     if isinstance(value, list):
         return [_replace_secret(item, secret) for item in value]
     return value
-
-
-def endpoint_url(settings: dict[str, Any]) -> str:
-    """The endpoint with any userinfo removed, safe to persist as evidence."""
-    value = str(settings.get("endpoint", "") or "").strip()
-    if not value:
-        return ""
-    try:
-        split = urlsplit(value)
-    except ValueError:
-        return ""
-    if not (split.username or split.password):
-        return value
-    host = split.hostname or ""
-    if split.port:
-        host = f"{host}:{split.port}"
-    return urlunsplit(split._replace(netloc=host))
 
 
 def request_description(settings: dict[str, Any]) -> dict[str, Any]:

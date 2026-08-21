@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from code_analyzer.config import DEFAULTS
 from code_analyzer.errors import UserError
 from code_analyzer.harness import cordis, runtime, schema, session
 
@@ -221,8 +222,15 @@ def test_request_records_only_parameters_that_were_really_applied(
     sent = FakeHarness.instances[0].config.arguments
 
     # Everything filed as transmitted has to be findable in what the SDK got.
-    assert parameters["transmitted"] == {"max_completion_tokens": 800}
+    assert parameters["transmitted"] == {
+        "max_completion_tokens": 800, "request_timeout_seconds": 600.0,
+    }
     assert sent["max_tokens"] == 800
+    assert float(sent["request_timeout_seconds"]) == 600.0
+    # And the reverse: nothing filed as locally enforced may have been sent.
+    # Checking only the transmitted bucket let request_timeout_seconds sit under
+    # enforced_locally while the SDK was in fact applying it.
+    assert not set(parameters["enforced_locally"]) & set(sent)
     # temperature and seed reach no channel at all: the SDK config has no field
     # for them and run() takes only input/session_id/on_notification.
     assert parameters["requested_but_not_applied"] == {"temperature": 0.0, "seed": 0}
@@ -692,3 +700,26 @@ def test_skill_directory_either_resolves_or_explains_itself() -> None:
         assert "skills" in str(error)
     else:
         assert path.is_dir() and path.name == "skills"
+
+
+def test_the_cordis_provider_route_strips_endpoint_userinfo(tmp_path: Path) -> None:
+    """llm/cordis.json ships in the archive, so it redacts at the point of write.
+
+    _validate_endpoint rejects userinfo long before this code runs, which makes
+    the leak unreachable today -- but that puts the whole defence one validator
+    away, while every other persistence site redacts itself. This pins the
+    second layer independently of the first.
+    """
+    settings = {
+        **DEFAULTS["llm"],
+        "endpoint": "https://svc:sk-live-SUPERSECRET@gpu-host.internal:8000/v1",
+        "model": "test-model",
+        "api_key_env": "CODE_ANALYZER_LLM_API_KEY",
+    }
+    document = cordis.cordis_document(
+        settings, skill_dir=tmp_path / "skills", provider_routing=True
+    )
+    text = json.dumps(document)
+    assert "sk-live-SUPERSECRET" not in text
+    assert "svc:" not in text
+    assert "https://gpu-host.internal:8000/v1" in text

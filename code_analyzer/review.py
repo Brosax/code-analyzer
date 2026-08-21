@@ -1268,8 +1268,14 @@ def _finding_category(item: dict[str, Any]) -> str:
 
 
 def _build_overlap_groups(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Design 6.1 freezes this key to native tools.  Cross-engine correlation is
+    # the audit layer's job and gets its own artifact; letting an LLM finding
+    # join a static cluster here would silently move a frozen group's line span
+    # and fingerprint list on any mixed run.
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in findings:
+        if item.get("tool") not in TOOL_NAMES:
+            continue
         if item["canonical_path"] and _line_number(item.get("line")) < 2**31 - 1:
             grouped[(item["canonical_path"], _finding_category(item))].append(item)
     result = []

@@ -35,7 +35,7 @@ from ..harness.runtime import (
     redact_credential,
     sdk_version,
 )
-from ..harness.session import run_unit, unit_directory
+from ..harness.session import resync_meta_status, run_unit, unit_directory
 from ..persist import json_bytes, write_json
 from ..status import aggregate_units, counts
 from ..tools import LLM_PRODUCERS
@@ -528,8 +528,19 @@ class _Phase:
         finally:
             stop.set()
             beat.join(timeout=1.0)
-        record = _provider_stop(record)
-        if cached is None and record.get("status") in {"completed", "partial"}:
+        record, provider_stopped = _provider_stop(record)
+        if provider_stopped:
+            resync_meta_status(
+                unit_directory(self.run_dir, producer, unit_id),
+                str(record.get("status", "")),
+                str(record.get("reason", "")),
+            )
+        # A provider stop yields a truncated unit.  Caching it would replay one
+        # transient abort into every later run of the same prompt -- the very
+        # "operator believes they ran a full scan" hazard the prompt-keyed cache
+        # exists to prevent.
+        cacheable = record.get("status") in {"completed", "partial"} and not provider_stopped
+        if cached is None and cacheable:
             self.cache.store(key, unit_directory(self.run_dir, producer, unit_id), self.run_dir.name)
         return self._report(task, self._decorate(record, task, skill))
 
@@ -649,7 +660,7 @@ class _Phase:
         return record
 
 
-def _provider_stop(record: dict[str, Any]) -> dict[str, Any]:
+def _provider_stop(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Demote a provider-reported abort from a cancellation to a unit outcome.
 
     ``harness/runtime.py`` maps the SDK stop reasons ``aborted``/``cancelled``
@@ -660,14 +671,17 @@ def _provider_stop(record: dict[str, Any]) -> dict[str, Any]:
     notifier raises out of the run -- so a finish reason is exactly what
     separates the two.  Left alone, one such unit cancels the phase and takes
     the whole review, every static finding included, with it.
+
+    Returns the record and whether it was demoted, because a demoted unit is
+    truncated and must stay out of the cross-run cache.
     """
     if record.get("status") != "interrupted" or not record.get("finish_reason"):
-        return record
+        return record, False
     detail = f"provider stopped the scan (finish_reason {record['finish_reason']})"
     existing = record.get("reason")
     record["status"] = "partial" if record.get("valid_report") else "failed"
     record["reason"] = f"{detail}; {existing}" if existing else detail
-    return record
+    return record, True
 
 
 def _scanner_record(

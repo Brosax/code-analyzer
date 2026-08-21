@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_harness import FakeHarness, HarnessTimeout, install, response, timed_out
+from fake_harness import FakeHarness, HarnessTimeout, response, timed_out
 from helpers import executable
 
 from code_analyzer.analysis import AnalysisRequest, run_analysis
@@ -260,8 +260,12 @@ def test_llm_findings_reach_the_review_with_full_provenance(
         "total": len(summary["findings"]), "static": len(static), "llm": len(llm_findings),
     }
     assert summary["severity_counts_by_engine"]["llm"]["high"] == len(llm_findings)
-    # Same path, same category, three lines apart: correlation now spans engines.
-    assert ["cppcheck", "llm-memory-safety"] in [group["tools"] for group in summary["overlap_groups"]]
+    # overlap_groups stays native-only (design 6.1) even though a static and an
+    # LLM finding sit three lines apart in the same category. Cross-engine
+    # correlation belongs to the audit layer's own artifact.
+    assert all(
+        "llm-memory-safety" not in group["tools"] for group in summary["overlap_groups"]
+    )
     assert manifest["export"]["status"] == "completed"
 
 
@@ -774,11 +778,46 @@ def test_cli_flags_map_onto_the_llm_section(tmp_path: Path) -> None:
     }
     assert "llm" not in _overrides(parser().parse_args(["analyze", str(tmp_path)]))
 
-
-def test_the_fake_harness_helper_still_installs_where_tests_expect_it(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_provider_stopped_unit_is_never_written_to_the_cache(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str
 ) -> None:
-    module = type("module", (), {"run_unit": None})()
-    installed = install(monkeypatch, module, "run_unit")
-    installed.script_default(response(_report()))
-    assert module.run_unit(producer="llm-security", unit_id="u1").finish_reason == "completed"
+    """A transient abort must not be baked into every later run of the prompt.
+
+    ``_provider_stop`` demotes an aborted unit to ``partial`` so it cannot
+    cancel the phase, which also walked it straight through the store gate.
+    Caching a truncated unit is the "operator believes they ran a full scan"
+    hazard the prompt-keyed cache exists to prevent.
+    """
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding()), finish_reason="aborted"))
+    _code, _run_dir, aborted = _analyze(source, _config(tmp_path, closed_endpoint))
+    assert aborted["llm"]["cache"]["stores"] == 0
+
+    # A healthy provider on the same tree must really call the model again
+    # rather than replay the truncated unit.
+    fake.calls.clear()
+    fake.script_default(response(_report(_finding()), finish_reason="completed"))
+    _code2, _dir2, healthy = _analyze(source, _config(tmp_path, closed_endpoint))
+    assert healthy["llm"]["cache"]["hits"] == 0
+    assert len(fake.calls) > 0
+    assert healthy["llm"]["cache"]["stores"] == len(fake.calls)
+
+
+def test_a_provider_stop_leaves_the_evidence_and_the_manifest_telling_one_story(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str
+) -> None:
+    """meta.json is written before the scanner can reclassify a provider stop.
+
+    An offline auditor reads the per-unit evidence, not the manifest, so the two
+    must not use the same status vocabulary to say different things.
+    """
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding()), finish_reason="aborted"))
+    _code, run_dir, manifest = _analyze(source, _config(tmp_path, closed_endpoint))
+
+    unit = manifest["llm"]["scanners"]["llm-memory-safety"]["units"][0]
+    assert unit["status"] in {"partial", "failed"}
+    meta_path = run_dir / "llm" / "sessions" / "llm-memory-safety" / unit["id"] / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["status"] == unit["status"]
+    assert meta["status"] != "interrupted"
