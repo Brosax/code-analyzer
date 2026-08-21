@@ -16,13 +16,21 @@ from .grading import (
     grading_reference,
     reference_review_level,
 )
-from .tools import TOOL_NAMES
+from .tools import PRODUCER_ORDER, TOOL_NAMES
 
-REVIEW_SCHEMA_VERSION = 2
+REVIEW_SCHEMA_VERSION = 3
 SEVERITY_MAPPING_VERSION = 2
 TOOL_ORDER = TOOL_NAMES
 SEVERITY_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
 OVERLAP_LINE_DISTANCE = 3
+
+
+def _producer_rank(name: str) -> int:
+    """Total ordering key; unknown producers sort last instead of raising."""
+    try:
+        return PRODUCER_ORDER.index(name)
+    except ValueError:
+        return len(PRODUCER_ORDER)
 
 
 def build_review(
@@ -73,22 +81,27 @@ def build_review(
         item["review_level"] = reference_review_level(item.get("original_severity", ""))
         item["review_level_mapping_version"] = GRADING_MAPPING_VERSION
         item["review_level_rank"] = REVIEW_LEVEL_RANK[item["review_level"]]
+        item["engine"] = "static"
+        item["producer"] = item["tool"]
+        item["evidence_class"] = "native"
+        item["gate_eligible"] = True
         item["fingerprint"] = _fingerprint(item)
     for item in diagnostics:
         _check_cancelled(cancelled)
         item["canonical_path"] = cached_canonical(item.get("file", ""))
 
     findings.sort(key=lambda item: (
-        -item["rank"], TOOL_ORDER.index(item["tool"]), item["canonical_path"],
+        -item["rank"], _producer_rank(item["tool"]), item["canonical_path"],
         _line_number(item.get("line")), str(item.get("line", "")), item["fingerprint"],
     ))
     diagnostics.sort(key=lambda item: (
-        TOOL_ORDER.index(item["tool"]), not item.get("fatal", False), item["canonical_path"],
+        _producer_rank(item["tool"]), not item.get("fatal", False), item["canonical_path"],
         _line_number(item.get("line")), item.get("message", ""),
     ))
     severity_counts = Counter(item["severity"] for item in findings)
     review_level_counts = Counter(item["review_level"] for item in findings)
     context_counts = Counter(item.get("evidence_context", "source-only") for item in findings)
+    engine_counts = Counter(item.get("engine", "static") for item in findings)
     severity_by_context = {
         context: {
             name: count for name in SEVERITY_RANK
@@ -108,6 +121,26 @@ def build_review(
             ))
         }
         for context in ("build-aware", "source-only")
+    }
+    severity_by_engine = {
+        engine: {
+            name: count for name in SEVERITY_RANK
+            if (count := sum(
+                item["severity"] == name and item.get("engine") == engine
+                for item in findings
+            ))
+        }
+        for engine in ("static", "llm")
+    }
+    review_level_by_engine = {
+        engine: {
+            name: count for name in REVIEW_LEVEL_RANK
+            if (count := sum(
+                item["review_level"] == name and item.get("engine") == engine
+                for item in findings
+            ))
+        }
+        for engine in ("static", "llm")
     }
     tools: dict[str, Any] = {}
     for tool in TOOL_ORDER:
@@ -166,6 +199,7 @@ def build_review(
         "run": {
             "id": manifest.get("run_id"), "started_at": manifest.get("started_at"),
             "completed_at": manifest.get("finished_at"), "tool_order": list(TOOL_ORDER),
+            "producer_order": list(PRODUCER_ORDER),
             "status": manifest.get("status"),
         },
         "tools": tools,
@@ -193,13 +227,18 @@ def build_review(
             "total": len(findings), "build-aware": context_counts["build-aware"],
             "source-only": context_counts["source-only"],
         },
+        "finding_counts_by_engine": {
+            "total": len(findings), "static": engine_counts["static"], "llm": engine_counts["llm"],
+        },
         "total_diagnostics": len(diagnostics),
         "severity_counts": {name: severity_counts[name] for name in SEVERITY_RANK if severity_counts[name]},
         "severity_counts_by_context": severity_by_context,
+        "severity_counts_by_engine": severity_by_engine,
         "review_level_counts": {
             name: review_level_counts[name] for name in REVIEW_LEVEL_RANK if review_level_counts[name]
         },
         "review_level_counts_by_context": review_level_by_context,
+        "review_level_counts_by_engine": review_level_by_engine,
         "top_files": _top_counts((item["canonical_path"] for item in findings), "file"),
         "top_rules": _top_counts((item["rule_id"] for item in findings), "rule_id"),
         "top_cwes": _top_counts((item["cwe"] for item in findings if item.get("cwe")), "cwe"),
@@ -306,7 +345,10 @@ def should_fail(summary: dict[str, Any], policy: str) -> bool:
     if policy == "none":
         return False
     minimum = SEVERITY_RANK[policy]
-    return any(int(item.get("rank", 0)) >= minimum for item in summary.get("findings", []))
+    return any(
+        int(item.get("rank", 0)) >= minimum and item.get("gate_eligible", True)
+        for item in summary.get("findings", [])
+    )
 
 
 def canonical_path(file_value: str, source: Path) -> str:
@@ -918,7 +960,7 @@ def _build_overlap_groups(findings: list[dict[str, Any]]) -> list[dict[str, Any]
             grouped[(item["canonical_path"], _finding_category(item))].append(item)
     result = []
     for (path, category), items in sorted(grouped.items()):
-        items.sort(key=lambda item: (_line_number(item["line"]), TOOL_ORDER.index(item["tool"])))
+        items.sort(key=lambda item: (_line_number(item["line"]), _producer_rank(item["tool"])))
         distance = OVERLAP_LINE_DISTANCE if category != "unknown" else 0
         current: list[dict[str, Any]] = []
         first_line: int | None = None
@@ -944,6 +986,6 @@ def _emit_overlap(result: list[dict[str, Any]], path: str, category: str, items:
     result.append({
         "id": hashlib.sha256(stable.encode()).hexdigest()[:16], "canonical_path": path,
         "line": str(start) if start == end else f"{start}-{end}", "line_start": start, "line_end": end,
-        "category": category, "tools": sorted(tools, key=TOOL_ORDER.index),
+        "category": category, "tools": sorted(tools, key=_producer_rank),
         "fingerprints": [item["fingerprint"] for item in items],
     })

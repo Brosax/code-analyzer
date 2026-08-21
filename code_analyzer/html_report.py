@@ -29,7 +29,7 @@ MAX_EMBED_FINDINGS = 2000
 
 def render(manifest: dict[str, Any], review: dict[str, Any] | None = None) -> str:
     data = dict(review or {
-        "review_schema_version": 2, "findings": [], "diagnostics": [],
+        "review_schema_version": 3, "findings": [], "diagnostics": [],
         "tools": manifest.get("tools", {}),
         "source_manifest": {"total_files": manifest.get("source_inventory", {}).get("total", 0), "files": []},
         "overlap_groups": [], "total_findings": 0, "total_diagnostics": 0,

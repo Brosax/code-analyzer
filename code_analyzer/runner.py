@@ -23,7 +23,7 @@ from .inventory import discover, git_state, source_slug
 from .persist import json_bytes
 from .persist import write_json as _write_json
 from .progress import ProgressDisplay
-from .review import build_review, should_fail, write_review
+from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_review
 from .sanitize import ExportError, export_shareable
 from .status import overall
 from .tools import TOOL_NAMES, cppcheck, flawfinder, splint
@@ -134,7 +134,7 @@ def _analyze(
         "review": {
             "enabled": bool(config["review"]["enabled"]),
             "status": "pending" if config["review"]["enabled"] else "disabled",
-            "schema_version": 2 if config["review"]["enabled"] else None,
+            "schema_version": REVIEW_SCHEMA_VERSION if config["review"]["enabled"] else None,
             "summary": "review/summary.json" if config["review"]["enabled"] else None,
             "error": None,
         },

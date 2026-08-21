@@ -27,7 +27,7 @@ def rebuild_dashboard(report_directory: Path) -> Path:
 
     review_path = report_directory / "review" / "summary.json"
     review = _read_object(review_path, "review summary") if review_path.exists() else None
-    if review is not None and review.get("review_schema_version") not in {1, 2}:
+    if review is not None and review.get("review_schema_version") not in {1, 2, 3}:
         raise UserError(
             f"invalid review summary in {review_path}: unsupported or missing review schema version"
         )

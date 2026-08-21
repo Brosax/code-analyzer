@@ -125,7 +125,7 @@ def test_review_parses_native_reports_separates_diagnostics_and_groups_overlap(t
         },
     }
     summary = build_review(source, run_dir, manifest, [{"path": "main.c"}])
-    assert summary["review_schema_version"] == 2
+    assert summary["review_schema_version"] == 3
     assert summary["total_findings"] == 3
     assert {item["severity"] for item in summary["findings"] if item["tool"] == "splint"} == {"unknown"}
     assert {item["severity"] for item in summary["findings"] if item["tool"] == "flawfinder"} == {"medium"}

@@ -13,7 +13,7 @@ from .config import DEFAULTS, load_config, validate_config
 from .errors import UserError
 from .html_report import render
 from .persist import json_bytes, manifest_structure_problem
-from .review import build_review, markdown_report
+from .review import REVIEW_SCHEMA_VERSION, build_review, markdown_report
 from .sanitize import ExportError, export_shareable
 from .tools.common import artifact_index
 
@@ -53,7 +53,7 @@ def recover_report(report_directory: Path) -> Path:
         **recovered.get("review", {}),
         "enabled": True,
         "status": "partial" if review.get("report_integrity", {}).get("status") == "partial" else "completed",
-        "schema_version": 2,
+        "schema_version": REVIEW_SCHEMA_VERSION,
         "summary": "review/summary.json",
         "error": None,
         "findings": review["total_findings"],

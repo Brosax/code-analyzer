@@ -229,7 +229,7 @@ def _validate_core_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
 
 
 def _validate_core_review(review: dict[str, Any]) -> None:
-    if not isinstance(review, dict) or review.get("review_schema_version") not in {1, 2}:
+    if not isinstance(review, dict) or review.get("review_schema_version") not in {1, 2, 3}:
         raise ExportError("invalid core review schema")
     for key in ("tools", "source_manifest"):
         if not isinstance(review.get(key), dict):
