@@ -52,7 +52,7 @@ audit/assessment.json        新增，明确非权威
                              verdict 是标签，附在 candidate 组上。
 ```
 
-这样，既有的 76 个测试、字节稳定性契约和 `manifest.json` 执行契约全部不受影响，
+这样，既有的 77 个测试、字节稳定性契约和 `manifest.json` 执行契约全部不受影响，
 同时也满足了需求方自己提出的规范："每个最终 Finding 必须保留完整来源"。
 
 `README.md` 的相应措辞修订属于第 3 期（见 §12），在 `audit/` 层真正落地时才改。
@@ -174,6 +174,22 @@ code_analyzer/harness/
 上游破坏兼容时，修改面限于这四个文件。
 
 ### 2.4 指向自有 GPU 服务器
+
+> **实现期核实（2026-08-21）。** 对已安装的 `deepseek-harness-sdk==0.1.1rc1` 做 introspection
+> 后确认，基本的远程端点场景**不需要手写 cordis YAML**：`base_url` 与 `api_key` 是
+> `DeepSeekHarnessConfig` 的顶层字段，分别映射到 `DEEPSEEK_BASE_URL` 与 `DEEPSEEK_API_KEY`
+> 环境变量。真实签名：
+>
+> ```python
+> DeepSeekHarnessConfig(provider, model, max_tokens, cwd, runtime_cwd, session_root,
+>                       cordis, env, runtime_bin, launch_args_override,
+>                       request_timeout_seconds, shutdown_timeout_seconds, base_url, api_key)
+> DeepSeekHarness(config).run(input, *, session_id=None, on_notification=None) -> RunResult
+> RunResult(session_id, final_response, finish_reason, events, notifications, session_root)
+> ```
+>
+> `RunResult.events` 即 §8.2 所需的 session 事件流证据。
+> 下面的 `llm-pi-ai` 手写路由仍适用于需要多 provider 或精细路由的进阶场景。
 
 推理端点是远程 GPU 服务器上的 **OpenAI 兼容 `/v1`**（vLLM 或 Ollama 均可）。
 `dsh` 通过 `llm-pi-ai` 适配器的**手写路由**支持任意 OpenAI 兼容网关：
@@ -731,7 +747,9 @@ llm/index.json                                    符号表与扫描单元计划
 llm/units/<unit_id>.json                          单元的完整渲染载荷
 llm/sessions/<producer>/<unit_id>/
     events.jsonl                                  完整 session 事件日志（agent loop 的原生证据）
-    request.json                                  model、endpoint、skill 版本、outputSchema、采样参数
+    request.json                                  model、endpoint（已去除 userinfo）、skill 版本、
+                                                  outputSchema 哈希、prompt_sha256、采样参数
+                                                  —— 只存哈希，不存 prompt 原文
     response.json                                 原始 SubagentResult envelope
     findings.json                                 解析校验后的结果 —— parser 只读这一个
     meta.json                                     时延、token 计数、step 数、stopReason、缓存命中
@@ -768,7 +786,15 @@ agent loop 的确定性**显著弱于**单次补全：工具调用顺序、文�
 
 ### 8.5 跨运行缓存
 
-键：`sha256(unit_sha256 | skill_version | model | endpoint_id | sampling_params | role)`
+键：`sha256(rendered_prompt_sha256 | skill_version | model | endpoint_id | sampling_params | role)`
+
+> **订正。** 本节最初写的是以 `unit_sha256` 为键。那是错的：§5.5 的风险分级通过
+> `TIER_BUDGETS` 决定上下文预算，因此**同一个 unit 在不同 tier 下渲染出的 prompt 并不相同**。
+> 以 unit 字节为键会导致改了 `risk_profile` 却静默命中旧结果——操作者以为跑了完整上下文的
+> CRITICAL 扫描，实际拿到的是精简上下文的结果；更糟的是 `request.json` 会记录一个
+> 并未产生相邻 `response.json` 的 prompt 哈希，违反 §8.4。
+> 以**渲染后的 prompt 哈希**为键可一并覆盖 tier、`risk_overrides`，以及"另一个文件里
+> 被调函数签名变了"这类跨文件影响。
 
 位置：`<output_root>/.llm-cache/<key[:2]>/<key>.json`，**位于运行目录之外**——
 运行目录是不可变证据，不能被后续运行写入。
@@ -961,7 +987,8 @@ Skill 发现路径——每次升版逐项复核。
 ```toml
 [llm]
 enabled = false
-endpoint = "https://gpu-host.internal:8000/v1"
+profile = "gpu-host"                            # 内置 provider profile，见下
+endpoint = "https://gpu-host.internal:8000/v1"  # 显式设置时覆盖 profile 的值
 api_key_env = "CODE_ANALYZER_LLM_API_KEY"
 model = "qwen3.6-27b"
 context_window = 32768
@@ -990,6 +1017,36 @@ enabled = false
 validation_model = ""
 validation_max_candidates = 200
 ```
+
+#### Provider profile
+
+默认端点是自有 GPU 服务器；OpenRouter 等第三方端点做成**可切换 profile**。
+
+**不使用 `[llm.profiles.<任意名>]` 形式的 TOML 表。** 本配置层是严格类型白名单：
+`_ALLOWED` 按前缀精确匹配键集，且 `tests/test_tui.py:49` 断言 `FIELD_REGISTRY` 覆盖每一个
+schema 叶子。任意命名的嵌套表会同时破坏这两者——与 §5.5 给 `risk_overrides` 选择扁平形式
+是同一个理由。
+
+改为**内置 profile 表 + 显式覆盖**：
+
+```python
+# code_analyzer/llm/profiles.py
+PROFILES = {
+    "gpu-host":   {"endpoint": "https://gpu-host.internal:8000/v1",
+                   "model": "qwen3.6-27b",
+                   "api_key_env": "CODE_ANALYZER_LLM_API_KEY"},
+    "openrouter": {"endpoint": "https://openrouter.ai/api/v1",
+                   "model": "stealth/ox-alpha",
+                   "api_key_env": "OPENROUTER_API_KEY"},
+}
+```
+
+`profile` 提供 `endpoint` / `model` / `api_key_env` 的默认值；TOML 或 CLI 中显式给出的
+同名键覆盖之。`profile` 是枚举，只占 `_ALLOWED` 与 `FIELD_REGISTRY` 各一个叶子。
+CLI 开关：`--llm-profile {gpu-host,openrouter}`。
+
+**切到第三方 profile 时必须告警**：被扫描的固件源码会离开本机，发给该服务商及其背后的模型
+提供方。`llm-doctor` 与运行进度输出都要显示这条警告，且**任何情况下都不打印密钥**。
 
 **`enabled = false` 是刻意的默认值。** 一次可能耗时数小时的 LLM 扫描，
 绝不能是 `code-analyzer analyze .` 顺手触发的结果。
@@ -1214,23 +1271,45 @@ CI 其余部分（ruff `E4,E7,E9,F,I,B`、dashboard 内联 JS 的 node `--check`
 
 ---
 
-## 附录 A：实现期待验证的开放项
+## 附录 A：开放项与验证状态
 
-以下四项在设计阶段无法从公开文档确定，实现时必须先验证：
+设计阶段有四项无法从公开文档确定。实现期的核实结果如下。
 
-1. **`deepseek-harness-sdk` 0.1.1rc1 与 `pydantic>=2.12` 在 Python 3.14 上能否安装。**
-   这是 CI 矩阵的最高版本，也是第一期的第一个验证项。若不可行，
-   需要调整 CI 矩阵或把 LLM 层降为可选 extra。
-2. **`dsh-lsp-stdio` 接 clangd 的具体配置。** 上游 `docs/subsystems/lsp.md`
-   只描述了通用抽象（provider 声明扩展名到 language-id 的映射），未点名任何
-   C/C++ language server。若不可行，agent 侧退回 `fs` + `shell` 导航，
-   §5.3 的增强作废但不影响主线。
-3. **Python SDK 传递 `outputSchema` 与选择 Skill/preset 的确切签名。**
-   已知入口为 `DeepSeekHarness()` 上下文管理器、`run()` 方法、`final_response`
-   属性，以及 `launch_args_override` 与 `cordis` 两个参数；
-   精确签名需查 `sdk/README.md` 或直接读包。
-4. **RC 版本升级策略。** 建议在 `pyproject.toml` 中精确钉住版本，
-   并维护 §10.1 的升级验证清单。
+### A1 · 依赖可安装性 —— 部分解决
+
+**已验证**：`deepseek-harness-sdk==0.1.1rc1` 在 **Python 3.11.15** 上安装、import 均正常，
+拉入 `deepseek-harness-runtime-bin==0.1.1rc1` 与 `pydantic 2.13.4`。
+
+**仍未验证**：**Python 3.14**。本机没有 3.14 解释器，而它是 CI 矩阵最高的一条腿。
+若装不上，需要调整 CI 矩阵，或把 LLM 层从必需依赖降为可选 extra
+（`[project.optional-dependencies]`）——后者与实现的实际形态更吻合：代码全程按 SDK
+可能缺席来写（延迟 import、`harness_available()` 门控、以及一个断言"import 本包时不加载
+SDK"的测试）。当前按用户决定保留为**必需依赖**。
+
+### A2 · clangd 接入 —— 未解决
+
+上游 `docs/subsystems/lsp.md` 只描述通用抽象（provider 声明扩展名到 language-id 的映射），
+未点名任何 C/C++ language server。若不可行，agent 侧退回 `fs` 导航，§5.3 的增强作废，
+不影响主线。
+
+### A3 · Python SDK 签名 —— 已解决
+
+见 §2.4 的实现期核实注记。完整签名已确认。
+
+**但引出一个新的已知缺口**：`run()` 只接受 `input` / `session_id` / `on_notification`，
+`DeepSeekHarnessConfig` 也没有 `temperature` / `seed` / step 上限字段。因此：
+
+- **结构化输出**目前靠 prompt 约定 + 解析期严格校验实现，而非 provider 侧强制。
+  `SubagentStartRequest.outputSchema`（§5.2）在 Python SDK 这条路径上不可达。
+- **§5.4 的四道闸中，step 上限与 turn 上限必须在本项目侧实现**，SDK 不提供。
+- **`temperature=0` / `seed=0` 这两个确定性默认值送不到 provider**，§8.4 的可复现性
+  相应减弱。`request.json` 只记录**实际生效**的参数，不得记录未传输的参数。
+
+### A4 · RC 版本升级策略 —— 已定
+
+`pyproject.toml` 中精确钉住 `==0.1.1rc1`。每次升版逐项复核：provider 路由格式、
+`DeepSeekHarnessConfig` 字段集、`RunResult.finish_reason` 取值集合、Skill 发现路径、
+cordis 文档中工具 allowlist 与文件系统 scope 的键名。
 
 ## 附录 B：代码锚点索引
 
