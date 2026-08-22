@@ -4,7 +4,8 @@
 它不是从零设计，而是把规范逐项对照本仓库的现状：哪些已经存在，哪些可以扩展，
 哪些与既有契约冲突，哪些是规范自己原则意义上的过度设计。
 
-每一节标注判定并锚定到真实的 `file:line`（基于 HEAD `be723e1`，295 tests，ruff 干净）。
+每一节标注判定并锚定到真实的 `file:line`（基于 HEAD `1a3a370`，296 tests，ruff 干净）。
+本文经过一轮对抗性评审（逐条核对代码）；评审发现的错误已订正，并在相应处标注「评审订正」。
 
 | 判定 | 含义 |
 |---|---|
@@ -24,11 +25,11 @@
 
 | 词 | 规范的用法 | 仓库的用法 | **本文采用** |
 |---|---|---|---|
-| Skill | 静态工具的包装（`cppcheck/SKILL.md + runner.py`） | 给模型看的 Markdown 指令（`llm/skills.py:49`），被挂为 agent 的 skill root（`harness/cordis.py:133-139`） | **仓库用法**。照搬规范会让工具包装文档**可被扫描模型调用**——正是 `cordis.py:136-138` 堵住的注入洞，且炸掉 `tests/test_skills.py:79,93-103` |
+| Skill | 静态工具的包装（`cppcheck/SKILL.md + runner.py`） | 给模型看的 Markdown 指令（`llm/skills.py:49`），被挂为 agent 的 skill root（`harness/cordis.py:211-217`，`includeDefaultRoots: false`） | **仓库用法**。照搬规范会让工具包装文档**可被扫描模型调用**——正是 `includeDefaultRoots: false`（`cordis.py:217`，**已验证**的上游控制）堵住的注入洞，且炸掉 `tests/test_skills.py:79,93-103` |
 | Scanner | 静态工具 + AI agent 的并集 | **只指 LLM**：`summary["scanners"]`、`[llm] scanners`（`config.py:58`）、`--llm-scanner`（`cli.py:76`） | **仓库用法** |
 | — | — | `PRODUCER_ORDER`（`tools/__init__.py:13`）= 静态 + LLM 的并集 | **Producer** = 规范的"Scanner" |
 | — | — | `tools/__init__.py:1` 自称 "adapters" | **Adapter** = 规范的"Skill"（静态工具包装） |
-| — | — | 不存在 | **Producer Manifest** = 新增的声明块 |
+| — | — | 不存在 | **Producer Manifest** = 新增的声明块。为避免与 `manifest.json` 混淆，本文提到运行清单时**一律带扩展名** `manifest.json`；不带扩展名的 Manifest 只指 Producer Manifest |
 
 后文一律：**Producer**（任何产出 finding 的东西）、**Adapter**（静态工具包装）、
 **Scanner**（LLM producer）、**Skill**（dsh 模型指令）、**Manifest**（声明元数据）。
@@ -73,10 +74,10 @@
      │  review/summary.sarif ← CI 接入                  │     │
      └─────────────────────────────────────────────────┘     │
                           │                                   │
-                          ▼  (独立命令，显式调用)              │
+                          ▼                                   │
                   ┌── audit 层 ──────────────────┐            │
-                  │ Correlator  → candidates     │            │
-                  │ Validator   → verdict 标签    │            │
+                  │ Correlator  → candidates     │ ← analyze 内，确定性，零模型
+                  │ Validator   → verdict 标签    │ ← assess 子命令，显式调用
                   │ audit/assessment.json        │            │
                   │ "non-authoritative"          │            │
                   └──────────────────────────────┘            │
@@ -90,6 +91,10 @@
 1. **主干确定性。** `analyze .` 的输出完全可复现；模型只在显式开启的点介入。
 2. **证据层冻结、意见层追加。** `review/` 永不合并、永不删除；`audit/` 明确非权威。
 3. **`manifest.json` 是节点状态的唯一来源。** DAG、实时页、离线页都从它派生，不另存。
+4. **Correlator 是确定性的，跑在 `analyze` 内；Validator 调模型，只在显式的 `assess` 内。**
+   （评审订正：初稿的 §1 图与 §16 时序图对此不一致；既有设计 §10.4 把关联也归给 `assess`，
+   本文改为关联进 `analyze`——它零模型、字节稳定，放在主干上才能让 origin 指标
+   在不调模型时就可用。`assess` 只负责 verdict。）
 
 ---
 
@@ -156,8 +161,10 @@ def run(executable, source, run_dir, inventory, filtered_db, config, progress, *
 ```
 
 因此 `runner.py:214-226` 是硬编码的 `if name == "cppcheck": … elif "flawfinder": … else:`。
-新增一个静态工具今天需要改约 21 处，其中 **4 处是崩溃点**（不改就 `KeyError`/`ValueError`）：
-`runner.py:214,220`、`review.py:46`（`parsers` 字典）、`doctor.py:49,140`。
+新增一个静态工具今天需要改约 21 处。其中 **4 处是崩溃点**（不改就 `KeyError`）：
+`runner.py:526-529`（`_incompatibility` 的字典索引，在 `try` 之外）、`review.py:55`（`parsers[tool]`）、
+`doctor.py:49`、`doctor.py:140`。另有 **1 处静默误派发**，比崩溃更糟：`runner.py:226` 的 `else:`
+会把任何未知名字交给 `splint.run`。（评审订正：初稿把 `runner.py:214,220` 列为崩溃点，实际它们不抛异常。）
 
 ### 3.2 Adapter 协议（P2）
 
@@ -182,7 +189,7 @@ class Adapter(Protocol):
     def probe(self, executable: str) -> dict: ...                         # doctor / preflight
 ```
 
-`review.py:654 _report_integrity()` 已经把 validator 当作参数注入——它是分析层唯一一处
+`review.py:893 _report_integrity()` 已经把 validator 当作参数注入——它是分析层唯一一处
 按值传递 per-tool 行为的地方，是这个协议的雏形。
 
 ### 3.3 LLM 侧接口已存在
@@ -190,9 +197,9 @@ class Adapter(Protocol):
 | 层 | 接口 | 位置 |
 |---|---|---|
 | 运行时生命周期 | `HarnessRuntime`（上下文管理器、`run()`、取消、超时） | `harness/runtime.py:185` |
-| 单元会话 | `run_unit()` → unit 记录 + 四个证据文件 | `harness/session.py:73` |
+| 单元会话 | `run_unit()` → unit 记录 + 五个证据文件（`events.jsonl` / `request.json` / `response.json` / `findings.json` / `meta.json`） | `harness/session.py:73` |
 | 输出契约 | `FINDING_SCHEMA`（`additionalProperties: False`）+ `parse_findings()` 宽松解析/严格校验 | `harness/schema.py:75,121` |
-| 工具授予 | `cordis_document()`，allow-list，`FORBIDDEN_TOOLS` 含 `shell` | `harness/cordis.py:115,86` |
+| 工具授予 | `cordis_document()`，allow-list，`FORBIDDEN_TOOLS` 含 `shell`。**注意**：文档顶层的 `tools` / `skills` / `filesystem` 段是本项目的词汇，上游 loader 是否消费**未验证**（`cordis.py:21-28` 如实记录）；已验证生效的是 `packages` 内的 `includeDefaultRoots: false`（`:217`） | `harness/cordis.py:115,86,211-217` |
 | 执行模型 | `_Phase.execute_all()` | `llm/scan.py:381` |
 
 Validator（§12）作为 `_Phase` 的另一种消费者实现，不另起炉灶。
@@ -235,8 +242,15 @@ cost = "cpu-bound"               # cpu-bound | network-bound
    （`splint.py:35` 只扫 `.c`；`cppcheck.py:34-40` 的 compile-db pass + fallback），只是散落各处。
 2. **manifest 的 timeout 只是 `DEFAULTS["tools"][name]`（`config.py:17`）的种子**，
    不是影子。按运行覆盖的能力（`config.py:84-94`、`cli.py:65-71`）必须保留。
-3. **`LLM_PRODUCERS` 从磁盘派生**（扫描 `skills/` 目录），使"放进一个目录就注册"对 LLM
-   scanner 成立；frontmatter 的 `allowed-tools` 接到 `cordis.py:139`，成为工具授予的权威来源。
+3. **`LLM_PRODUCERS` 保持为声明的元组，但用测试钉住「声明 == 磁盘发现」。**
+   （评审订正：初稿说"从磁盘派生"。那是循环导入——`llm/skills.py:22` 从 `tools` 导入
+   `LLM_PRODUCERS`，`skill_names()` 又按 `_producer_rank` 排序；而且会让 `cli.py:76` 的 choices
+   与 `config.py:58` 的默认值在 import 期做文件系统 I/O，并把 `PRODUCER_ORDER`（决定
+   `review/summary.json` 的排序）从声明序变成发现序。）一个断言 `skill_names() == LLM_PRODUCERS`
+   的测试已存在（`tests/test_skills.py:79`）；放进一个目录而不注册会**响亮地失败**，这就够了。
+   frontmatter 的 `allowed-tools`：每次运行只有**一份** `cordis.json`（`scan.py:101-103`）被所有
+   per-unit 运行时共用（`:576-584`），因此 allow-list = 启用 skill 的 `allowed-tools` 之**并集**，
+   `FORBIDDEN_TOOLS` 永远减去。
 
 "放进一个目录就注册"对静态工具要到 §3.2 的协议落地后才成立。在那之前它是愿景，不是事实。
 
@@ -259,7 +273,7 @@ cost = "cpu-bound"               # cpu-bound | network-bound
 | `function` | LLM 行有 `symbol` | EXTEND：静态行可由索引反查 |
 | `title` | — | NEW：LLM 行由 scanner 产出；静态行用 `rule_id` |
 | `description` | LLM 行在 `findings.json` 已有，未进 review 行 | EXTEND：拷入（~2 行 + `_scrub_host_paths`） |
-| `evidence`（源码原文） | — | **CONFLICTS**：`llm/sessions/**` 正因引用源码才被排除出 ZIP（`sanitize.py:309 _quotes_source`），而 `review/summary.json` 总是导出。按 `[llm] export_sessions` 门控，或在 redactor 剥除 |
+| `evidence`（源码原文） | **已在** `FINDING_SCHEMA`（`harness/schema.py:95`），每个 SKILL.md 都要求它，`parse_findings` 保留它（`:295`）；而 `findings.json` **总是导出**（`sanitize.py:32 _SESSION_EXPORTED`） | **CONFLICTS，且方向与初稿相反**（评审订正）：源码原文**今天就已经在共享 ZIP 里**。化解：`evidence` 进 review 行（私有目录内完整，保证 `recover-report` 可复现），由 **redactor 在导出时从 `findings.json` 与 `review/summary.json` 同时剥除**，除非 `[llm] export_sessions = true`。review 行的内容**不得**依赖导出设置 |
 | `recommendation` | — | **CONFLICTS** README:9-11 "does not suggest fixes" |
 | `status: unverified/validated` | — | **CONFLICTS** README:9-11 "does not decide false positive" |
 
@@ -315,9 +329,12 @@ class AnalysisEvent:
     stream: str | None  # stdout / stderr
 ```
 
-发射点：`runner.py:185-194` 的闭包；`llm/scan.py` 的 `_forward` 与心跳。
-消费者：CLI `ProgressDisplay`、TUI（`tui.py:620 _analysis_event`）。
-`EventSink = Callable[[AnalysisEvent], None]`（`analysis.py:58`）是接入缝。
+发射点：`runner.py:55-67` 的 `event()` 闭包；`llm/scan.py` 的 `_forward` 与心跳。
+消费者：**只有 TUI**（`tui.py:620 _analysis_event`，经 `run_analysis`）。CLI 的 `analyze`
+走 `runner.analyze`（`runner.py:38-40`），只传 `display.emit`，**不传 `event_sink`**；
+`ProgressDisplay` 消费的是进度**字符串**，不是 `AnalysisEvent`。
+（评审订正：初稿把 CLI 列为事件消费者。）`EventSink = Callable[[AnalysisEvent], None]`
+（`analysis.py:58`）是接入缝，但 CLI 路径今天够不到它——见 §6.3。
 
 LLM 单元级别已有 `llm/sessions/**/events.jsonl`。**运行级**没有——只有 `logs/runner.log` 文本。
 
@@ -329,15 +346,27 @@ LLM 单元级别已有 `llm/sessions/**/events.jsonl`。**运行级**没有—�
 | Tool command | unit 记录的 `process.argv`（`process.py:67 ProcessResult`）在 manifest 里，不在事件里 | EXTEND：事件加 `argv` |
 | 执行时间 | `timestamp`；duration 在 manifest | EXISTS |
 | 已发现 finding 数 | LLM unit 完成时可知；静态工具只有报告解析后才知 | EXTEND：LLM 实时、静态事后 |
-| Token usage | **SDK 不报 usage**（`harness/runtime.py:80 RunOutcome` 无计数字段）；`scan.py:54 TOKEN_ACCOUNTING` 是估算 | 显示估算并**永远附带**说明；加一条结构化 budget 事件（今天只在心跳散文里，`scan.py:614-617`） |
+| Token usage | **本项目的** `RunOutcome`（`harness/runtime.py:80-88`）无计数字段；`scan.py:54 TOKEN_ACCOUNTING` 是估算。**上游运行时是否在 notification 中携带 usage 未验证**（评审订正：初稿断言"SDK 不报"，其实只验证了本项目侧） | P1 显示估算并**永远附带**说明；P3 验证上游 notification 是否带 usage，带则改为实测。加一条结构化 budget 事件（今天只在心跳散文里，`scan.py:614-617`） |
 | stdout / stderr | `stream` 字段 + 增量行转发 | EXISTS |
 | Error / Retry | error 有；**仓库零重试逻辑** | `retries` 字段永远是 0，OVERREACH |
-| Pending / Running / Success / Failed | 状态梯子有 10 个词（`status.py:15-40`），`partial ⇒ exit 10` | UI 侧投影函数；**绝不持久化 4 态**。真正缺的只有 `running` 过渡态：`runner.py:202` 后加占位并 `_save_manifest`（~10 行） |
+| Pending / Running / Success / Failed | 状态梯子有 10 个词（7 个在 `status.py:15-40`，3 个在 `runner.py`），`partial ⇒ exit 10` | UI 侧投影函数；**绝不持久化规范的 4 态枚举**。梯子加一个**非终态**词 `running`：`runner.py:202` 后写占位并 `_save_manifest`。评审订正的两个细节：占位必须同时把 `requested` 翻为 `True`（`runner.py:146` 把每个工具先种为 `_not_requested`）；`_finish_interrupted`（`:402`）只改写 `not_requested`，需一并处理 `running` |
 
 ### 6.3 运行级 `events.jsonl`（P1）
 
 在 `analysis.py:61 run_analysis()` 的 `events=` 缝上挂一个 JSONL sink，写到
-`<run_dir>/events.jsonl`。每行一个 `AnalysisEvent` 的 JSON。规则：
+`<run_dir>/events.jsonl`。每行一个 `AnalysisEvent` 的 JSON。
+
+三个评审指出的必须先定的决策：
+
+- **CLI 路径**：给 `runner.analyze()`（`runner.py:38`）加 `event_sink` 参数并由 `cli.py` 传入，
+  而**不是**把 CLI 切到 `run_analysis`——后者会把 `progress` 字符串再发一遍成 `phase="progress"` 事件。
+- **运行目录尚不存在时的事件**：`run_dir` 在 `runner.py:113-119` 才创建，之前已有 `analysis started`
+  与 `discovery started`。sink 在内存缓冲，目录创建后一次性刷出；`--events-file` 可指定别处。
+- **`serve` 的进程模型**（§13）：`serve REPORT_DIR` 是**只读查看器**，尾随另一个进程写的文件；
+  `POST /cancel` 在该模式下**不可用**（`CancellationToken` 是 `threading.Event`，必须与分析同进程）。
+  `serve --analyze SOURCE …` 在同一进程内用线程跑 `run_analysis`，此时才有 cancel。
+
+规则：
 
 - 经 `progress.single_line()` 过滤，与终端输出同源
 - 加入 `sanitize.py:322 _export_files` 的排除表（它含路径与工具输出）
@@ -361,13 +390,17 @@ LLM 单元级别已有 `llm/sessions/**/events.jsonl`。**运行级**没有—�
 | Code Chunk | 按函数切；**每字节恰好落入一个 unit** | `llm/units.py:51 build_plan` |
 
 规范的例子——分析 `process_packet()` 时自动带入 `parse_header()`、`validate_packet()`、
-相关 struct、宏、header、caller/callee——现状已做到，**但 header 是近似的**：
-`index.py` 不解析 `#include` 指向的文件，只解析同一文件内的符号。
+相关 struct、宏、header、caller/callee——现状**已做到**：unit 的 `types` / `macros` / `globals`
+按**项目级**符号表解析（`units.py:312-314` 查 `index["types"]`，由 `index.py:236-238`
+`_definition_table(files, …)` 跨文件构建），所以一个 `.c` 的 unit 已能带上 inventory 内头文件里的 struct。
+（评审订正：初稿说"只解析同一文件内的符号"，不对。）
 
-两处 NEW：
-1. **include 图 + 头文件配对**（`index.py:227,494-510,798-812` 是接入点）：让一个 `.c` 的
-   unit 能带上它 `#include` 的本项目头文件里的 struct/宏定义
-2. **路径限定的调用图键**（`units.py:345`）：同名静态函数在不同文件里今天会混淆
+真正缺的两处 NEW：
+1. **include 图的作用域**：同名符号在多个头文件里冲突时，今天没有按 `#include` 关系挑选；
+   `_symbol_table` 会把同名函数按名字合并（`index.py:829` `_insert(prefer=True)`）。
+   接入点 `index.py:227,494-510,798-812`。
+2. **调用图的路径限定**：调用图的键**已经**是 `path::name`（`index.py:803`）；丢掉路径的是
+   `units.py:347`（`key.rpartition("::")[2]`）。修一行，不是新建。
 
 规范说"按 call graph 切分"是 OVERREACH：多函数 unit 会破坏"每字节恰好一次"不变量
 （`units.py:3-11`），覆盖率失真。调用图留作**上下文**输入，不是切分依据。
@@ -395,14 +428,17 @@ llm/scan.py:60 run()
             → _provider_stop (scan.py:663)：provider abort 降级为单元结果，不取消阶段，不进缓存
 ```
 
-规范要求的隔离：
+规范要求的隔离。**评审订正：下表区分静态 adapter 路径与 LLM agent 路径，初稿把前者的保证误记给了后者。**
+`harness/runtime.py` 与 `session.py` **零次**引用 `process.py` / `subprocess`：dsh 运行时由 SDK 自己
+spawn（`runtime.py:323`），本项目只透传 `request_timeout_seconds` / `shutdown_timeout_seconds`
+（`:263-266`）。既有设计 §2.2 承诺复用 `process.py:82`，实现**没有**做到；这是一项未兑现的设计。
 
-| 项 | 现状 | 判定 |
+| 项 | 静态 adapter 路径 | LLM agent 路径 |
 |---|---|---|
-| subprocess isolation | 进程组、`shell=False`、`stdin=DEVNULL` | EXISTS `process.py:82` |
-| timeout | TERM → grace → KILL，有界 | EXISTS |
+| subprocess isolation | EXISTS：进程组、`shell=False`、`stdin=DEVNULL`（`process.py:82`） | **NEW**：由 SDK spawn，本项目不控制进程组 |
+| timeout | EXISTS：TERM → grace → KILL，有界 | PARTIAL：只有 SDK 的两个超时参数；无进程组清理 |
 | resource limit | 无 | `preexec_fn` 在线程池下（`splint.py:165`、`scan.py:440`）不安全；Docker 违反 README:9 "does not install tools"。**改为输出字节上限**（`process.py:188,202`，~10 行），把 `truncated_bytes` 记进 `ProcessResult`——截断成为证据 |
-| working directory isolation | `cwd` 限定；`output_root` 不得在被扫描树内（`runner.py:81`） | EXISTS |
+| working directory isolation | EXISTS：`cwd` 限定 | **NOT EXISTS**：`cwd` 对 agent **不是**边界——`runtime.py:251-253` 引用上游原话 "a resolution default, NOT a containment boundary"；`cordis.py:21-28` 记录没有任何上游包限制**读取**；证据文件如实盖章 `"confinement": "unenforced-upstream"`（`cordis.py:80`）。今天真正保证 scanner 对静态结果盲的是 `runner.py:81` 的 `output_root` 不得在被扫描树内——且它**只在 `[llm] enabled` 时**生效 |
 | output size limit | 无 | 同上，P3 |
 | Docker | 无 | 路线图：作为 `run_process` 的替代后端，返回同一个 `ProcessResult` |
 
@@ -447,8 +483,10 @@ rounds 循环    scan.py:119 已是 "records = state.execute_all(_tasks(units, s
                        budget_before, budget_after}]
 
 配置           [llm] max_replan_rounds = 0（默认）、planner_max_tokens
-               四个配置改动点（config.py:17 DEFAULTS / :191 _ALLOWED / :117 FIELD_REGISTRY /
-               :439 effective_toml）；tests/test_tui.py:49 强制每个叶子有 FieldSpec。
+               四个配置改动点：config.py:17 DEFAULTS / :117 FIELD_REGISTRY /
+               :361 _validate_llm / :442 effective_toml 的固定段表。
+               （评审订正：_ALLOWED["llm"] 由 DEFAULTS 自动派生（:197），不是改动点。）
+               tests/test_tui.py:49 强制每个叶子有 FieldSpec。
 
 预算           planner 的调用走同一个 _reserve (scan.py:549) 和同一个阶段 deadline。
 
@@ -458,6 +496,12 @@ rounds 循环    scan.py:119 已是 "records = state.execute_all(_tasks(units, s
 重放           --plan FILE 免费得到：缓存按渲染后的 prompt 做键，重放同一计划
                = 全部命中 = 零模型调用。recover-report 语义不变。
 ```
+
+**证据路径必须包含轮次**（评审指出的 P4 设计缺口）：`unit_id` 刻意不含 tier
+（`units.py:324-336`），session 目录按 `(producer, unit_id)` 定位（`session.py:47-49`）。
+`escalate_tier` / `rescan` 对同一 producer 会**覆盖第 0 轮的盲扫证据**。因此 ≥1 轮的证据
+写到 `llm/sessions/<producer>/<unit_id>/r<round>/`，`coverage_report`（`units.py:155-168`）
+按 `(unit_id, round)` 记账，finding 的 `round` 字段由目录推出。
 
 规范的升级例子——"cppcheck 报 `memcpy` 越界 → 调 Memory Agent 确认"——**不是重规划，
 是 Validator**（§12）。第一轮 scanner 对静态结果盲（既有设计 §0.2 #1）；一个被静态结果
@@ -478,7 +522,7 @@ LLM-only 指标只数第 0 轮。
 | splint 内部 | `ThreadPoolExecutor(jobs)` | `splint.py:165` |
 | cppcheck 内部 | `-j min(4, cpu)` | `cppcheck.py:33,69` |
 | LLM 阶段内部 | `ThreadPoolExecutor(jobs)` | `scan.py:427-467` |
-| **三个静态工具之间** | **串行** | `runner.py:400` |
+| **三个静态工具之间** | **串行** | `runner.py:169` |
 | **静态 vs LLM** | **串行** | `runner.py:249` 在工具循环之后 |
 
 ### 10.2 只有静态 ∥ LLM 值得做
@@ -492,9 +536,13 @@ LLM 阶段是网络绑定的，与静态并行几乎白赚壁钟。
 `tests/test_runtime_output.py:200` 断言 progress **单调**；今天 progress 按工具索引分段
 （`runner.py:171-172`），LLM 固定 0.80–0.84（`runner.py:251-270`）。两个阶段并行后这会乱序。
 
+**评审订正：单调性在并行之前就已经是坏的。** `[llm] enabled` 时 LLM 阶段以 0.84 结束，稳定性复扫
+紧接着发 0.8；另外 `0.8 + 0.04 × 1.0` 在浮点下是 `0.8400000000000001`，高于字面量 0.84。
+既有测试只在静态模式下跑所以一直绿。**已在 `1a3a370` 修复**并补了 LLM 模式下的单调性测试。
+
 先做：progress = 已完成工作量 / 总工作量，单调，加锁；或由调度器发一条聚合的
 `phase="progress"` 事件。再做：共享 cancel `Event`（`splint.py:157-171` 模式）；
-`manifest` 的 mutate + `_save_manifest`（`runner.py:236,244,460`）加锁。
+`manifest.json` 的 mutate + `_save_manifest`（12 处调用，`runner.py:460` 定义）加锁。
 
 源码稳定性复扫（`runner.py:275-293`）是后置条件，放在全部阶段之后；并发反而缩短窗口。
 
@@ -527,8 +575,11 @@ def group_nearby(findings, key_fn, distance) -> list[list[dict]]
 Correlator 用**另一套身份键**：`(canonical_path, category, line_span)`，不碰 `fingerprint`。
 
 类别：静态行走原来的路径（`review.py:1239 _finding_category` 的静态分支，字节不变）；
-Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEYWORD_CATEGORIES`）
-同时应用到两个 engine 做分组——否则静态的 `CWE-190` 和 LLM 的 `integer-overflow` 永远对不上。
+Correlator 用一个**变体**同时应用到两个 engine 做分组。**评审订正的关键细节**：该变体必须
+对静态行**先查 `_CWE_CATEGORIES`（`review.py:1181`）再走关键词规则**。否则 flawfinder 的
+`CWE-190` + "integer overflow" 消息会被静态关键词表的 `buffer` 规则（`:1203`）先截住
+（已实测：今天它归类为 `buffer`），而 `_LLM_KEYWORD_CATEGORIES` 以同一张静态表开头
+（`:1212`），所以"把 LLM 词汇应用到两个 engine"本身并不能让 `CWE-190` 对上 `integer-overflow`。
 
 输出 `audit/assessment.json` 的 candidate：
 
@@ -547,6 +598,11 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
   "verdict": null
 }
 ```
+
+candidate `id` 的规则：`<类别前缀>-<运行内序号>`，前缀由类别映射（buffer→MEM、trust-boundary→SEC、
+race→FW …）。**它在一次运行内稳定，跨运行不稳定**——跨运行身份用 `(canonical_path, category,
+line_span)` 键。没有行号的 finding（splint 的 `<Location unknown>`）不参与关联，计入
+`metrics.uncorrelated`，仍以 `origin` 单独计数。
 
 规范的 "Finding #12 — Potential Buffer Overflow — Detected by ✓ cppcheck ✓ flawfinder ✓ AI Memory Agent"
 就是这条 candidate 的渲染。`review/` 的三行原样保留，作为它的 provenance 列表。
@@ -573,7 +629,7 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
 | 入口 | `code-analyzer assess REPORT_DIR`，独立命令，显式调用（D2） |
 | 实现 | `_Phase`（`scan.py:381`）的另一种消费者：任务 = candidate 而非 unit；`VERDICT_SCHEMA` 作为 `FINDING_SCHEMA` 的兄弟；证据落 `llm/sessions/validator/<candidate_id>/` |
 | 输出 | `verdict{label, confidence, rationale_artifact, model, skill_version, validator_saw_static: true}` 写回 candidate |
-| 上限 | `[audit] validation_max_candidates`（`config.py:78`），按 severity × origin 排序优先验证 HIGH/CRITICAL |
+| 上限 | `[audit] validation_max_candidates`（`config.py:81`），按 severity × origin 排序优先验证 HIGH/CRITICAL（既有设计 §7.2 写的是"按风险排序"，本文细化为 severity × origin） |
 | 偏置 | validator 看得到静态结果，所以 `llm_only_confirmed` 的准确含义是"被第二个角色佐证"，不是"独立确认"。`metrics.caveats` 机器可读，dashboard 上**紧挨数字**渲染 |
 | 不做 | 盲验（validator 不看静态结果）会让已经昂贵的流程翻倍，收益不抵成本——写明这个取舍 |
 
@@ -589,7 +645,7 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
   cli.py:21 parser()          argparse 子命令：analyze / tui / doctor / compile-db /
                               rebuild-dashboard / recover-report
   analysis.py:61 run_analysis 无头服务边界：AnalysisRequest → AnalysisResult + EventSink
-  runner.py:43 _analyze       确定性主干；manifest.json 在 10 个检查点原子重写（runner.py:460）
+  runner.py:43 _analyze       确定性主干；manifest.json 经 _save_manifest（runner.py:460）在 12 处原子重写
   persist.py:14 json_bytes    唯一 JSON 编码器，字节稳定
 
 新增（P1）
@@ -598,7 +654,10 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
       GET  /events            text/event-stream，尾随 <run_dir>/events.jsonl
       GET  /graph             graph(manifest) → {nodes, edges}
       GET  /manifest          manifest.json
-      POST /cancel            CancellationToken.cancel()（analysis.py:36，~5 行）
+      POST /cancel            CancellationToken.cancel()（analysis.py:36）——仅 serve --analyze 模式
+  serve REPORT_DIR            只读查看器，尾随另一进程写的 events.jsonl；无 cancel
+  serve --analyze SOURCE …    同进程线程内跑 run_analysis，有 cancel；参数同 analyze
+  /cancel 只接受 127.0.0.1 且校验 Origin 头，防止本机其它页面跨源取消
   events sink                 JSONL EventSink，挂在 analysis.py:61 的 events= 参数
 
 新增（P2）
@@ -611,14 +670,15 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
 用户已决定（D3）：stdlib SSE，**零新依赖**。FastAPI/WebSocket 各带 5–20 个传递依赖，
 需要 doctor/preflight 的配套检查，而 WebSocket 对只读展示没有任何增益。
 
-**不用 dsh 自带的 :3080 Web UI**：它违反四文件隔离（既有设计 §2.3），看不到静态工具，
+**不用 dsh 自带的 Web UI**：它违反四文件隔离（既有设计 §2.3），看不到静态工具，
 且每个 unit 一个运行时（`scan.py:576-584`），没有"一次运行"的概念。
+（评审订正：初稿写的端口号来自上游 README，未在本仓库或已安装运行时中核实，已删。）
 
 ---
 
 ## 14. Web UI 架构 — EXISTS（离线）/ NEW（实时）
 
-### 14.1 离线 dashboard 冻结不动
+### 14.1 离线 dashboard：五条契约冻结，文件可追加
 
 `html_report.py` 有五条被测试钉死的契约：
 
@@ -628,9 +688,12 @@ Correlator 用一个**变体**把完整的 LLM 词汇（`review.py:1212 _LLM_KEY
 | 任何位置无 `http://` / `https://` | `tests/test_v2.py:175` |
 | `safeHref` 拒绝含 `:` 的路径（故 `ws://` 结构上不可能） | `html_report.py:496` |
 | 重建字节幂等 | `tests/test_dashboard.py:131` |
-| 全部经 `textContent` 写入 DOM | `html_report.py:303-307` |
+| 全部经 `textContent` 写入 DOM | `html_report.py:349-353` |
 
 它是**可分享的证据报告**；`file://` 下 CORS 也挡住任何 fetch。把它改成实时页会同时打破五条。
+在五条契约内**追加**内容（§17-6 的 origin 面板）是允许的；既有设计 §11.2 要求的
+**按 engine 分配嵌入配额**（`MAX_EMBED_FINDINGS` `html_report.py:27`）尚未实现，且 candidate
+列表作为第二个嵌入集合也受同一上限约束——P1 一并处理。
 
 ### 14.2 实时页（`serve`，P1）
 
@@ -664,7 +727,8 @@ Code Review · run 2026-08-21T13:02:11Z-ab12cd34ef56
   固定阶段；状态 = 已有的 10 词梯子经投影函数映射到 ○●✓✕；边 = 固定拓扑
 - 运行结束后页面链接到已写好的 `index.html`
 - token 数永远附带 `TOKEN_ACCOUNTING` 说明
-- 双语：沿用 `html_report.py:312-426` 的 `I18N` 表结构
+- 双语：沿用 `html_report.py:357-486` 的 `I18N` 表结构
+- 10 词梯子 → 4 态投影：`completed`→✓；`partial`/`timed_out`/`failed`/`interrupted`→✕（悬停显示原词）；`running`→●；`unscheduled`/`not_requested`/`missing`/`incompatible`/`not_applicable`→○（悬停显示原词）
 
 ---
 
@@ -756,11 +820,11 @@ code_analyzer/
 | # | 内容 | 规模 | 接入缝 |
 |---|---|---|---|
 | 1 | 运行级 `events.jsonl` sink + `--events-file`；cppcheck/flawfinder 心跳；`running` 占位态 | ~60 行 | `analysis.py:61`、`cppcheck.py:69`、`runner.py:202` |
-| 2 | review 行追加 `description`（+门控 `evidence`）、`line_start`/`line_end`、`function` | ~15 行 | `review.py:79-100, 824-843` |
-| 3 | 抽 `group_nearby`；字节钉死 `overlap_groups`；Correlator + `audit/assessment.json`（candidate，无 verdict，`validation_unscheduled = candidates_total`） | ~300 行 | `review.py:1270-1296` |
-| 4 | `code-analyzer serve`：SSE、`graph(manifest)`、`POST /cancel`、链接 `index.html` | ~250 行 | `analysis.py:36,58` |
-| 5 | SARIF 2.1.0 导出：经 `persist.json_bytes`；每 producer 一个 `runs[]`；**LLM 行放独立 run**（`gate_eligible: False` 的 CI 语义在消费者侧得以保留）；`line` 为空时无 `region`；`recovery.py` 可重生成；进 `artifact_index`；字节稳定性测试仿 `test_dashboard.py:131` | ~200 行 | `review.py` 之后、`sanitize.py` 之前 |
-| 6 | dashboard 加 candidate / origin 区。`compPanel`（`html_report.py:761`）**已经**接受 `series` 参数并已用于 engine 轴（`:856-857`）；origin 面板只是第五次调用加一个 `originSeries`，不是泛化任务。`I18N.zh` / `I18N.en` 各加键 | ~60 行 + i18n | `html_report.py:854-857` |
+| 2 | review 行追加 `description`、`evidence`（导出时由 redactor 剥除，见 §5.1）、`line_start`/`line_end`（静态行 `line_end == line_start`，并加 `line_end_known: false`）。**`function` 对静态行不做**：索引只在 `llm_scan.run` 内构建（`scan.py:93`），`build_review` 拿不到，而 `recover-report` 常在无源码树的解压目录上运行——反查会让再派生结果与原始不一致，破坏既有设计 §8.1 | ~20 行 | `review.py:79-100, 824-843` |
+| 3 | 抽 `group_nearby`；字节钉死 `overlap_groups`；Correlator + `audit/assessment.json`（candidate，无 verdict，`validation_unscheduled = candidates_total`）。**跑在 `analyze` 内**，紧随 `build_review`；`recover-report` 重生成它；进 `artifact_index`；进 ZIP（不含源码）。类别先 CWE 后关键词（§11.2） | ~300 行 | `review.py:1270-1296`；`runner.py` 的 review 阶段之后 |
+| 4 | `code-analyzer serve`：SSE、`graph(manifest)`、10→4 态投影表（§14.2）、`POST /cancel`（仅 `--analyze` 模式，校验 Origin）、链接 `index.html` | ~250 行 | `analysis.py:36,58`；`runner.py:38` 加 `event_sink` |
+| 5 | SARIF 2.1.0 导出：经 `persist.json_bytes`；每 producer 一个 `runs[]`；**LLM 行放独立 run**（`gate_eligible: False` 的 CI 语义在消费者侧得以保留）；`line` 为空时无 `region`；`recovery.py` 可重生成；进 `artifact_index`；字节稳定性测试仿 `test_dashboard.py:131`。已定的映射：`level` ← `severity`（critical/high→error，medium→warning，low/info→note，unknown→none）；`ruleId` ← 静态 `rule_id`、LLM `category`；`partialFingerprints.primaryLocationLineHash` ← `fingerprint`；`uriBaseId = SRCROOT`，`uri` ← `canonical_path`。`sanitize.py:373-383` 已处理 `.sarif` | ~200 行 | `review.py` 之后、`sanitize.py` 之前 |
+| 6 | dashboard 加 candidate / origin 区。`compPanel`（`html_report.py:761`）**已经**接受 `series` 参数并已用于 engine 轴（`:856-857`）；origin 面板只是第五次调用加一个 `originSeries`。需要的实际改动：`render(manifest, review)`（`:72`）加 `assessment` 参数；`rebuild_dashboard` 与 `export_shareable`（`sanitize.py:224` 会重渲染）读 `audit/assessment.json`；candidate 列表受按 engine 分配的嵌入配额约束；`test_dashboard.py:131` 的 fixture 加 `audit/`；`I18N.zh` / `I18N.en` 各加键 | ~120 行 + i18n | `html_report.py:72, 854-857` |
 
 MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还没有 verdict。
 
@@ -770,12 +834,17 @@ MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还�
 
 | 期 | 范围 | 解锁 | 前置 |
 |---|---|---|---|
-| **P1 可观察 + 已关联（MVP）** | §17 的 1–6 | origin 指标、实时视图、CI 接入 | 无 |
-| **P2 已验证** | Validator `_Phase` 消费者 + `VERDICT_SCHEMA` + `assess` 子命令 + dashboard verdict 区（caveat 紧挨数字）+ **README:9-11 章程修订**；`Adapter`/`RunContext` 协议重构（消除 4 个崩溃点，字节钉死）；`LLM_PRODUCERS` 从磁盘派生；`allowed-tools` 接 `cordis.py:139`；`recommendation` 上 candidate | **`llm_only_confirmed`**——LLM 层存在的理由 | P1 |
-| **P3 更快 + 更宽** | 先修进度模型再做静态 ∥ LLM（锁、共享 cancel）；输出字节上限；**三个新 scanner**：Resource/Error（枚举加 token + `_LLM_KEYWORD_CATEGORIES` 一行 + memory-safety 的"错误路径未释放"条款迁入）、UB（与 memory-safety **同一 commit** 按 空间/时间 vs 算术/语义 重切，两份 `skill_version` 同升，跨运行缓存失效）、Logic（**只接受闭合 token 集**：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch`；拒绝"找一切逻辑问题"）；`total_*_tokens` 随启用 scanner 数线性缩放；include 图 + 头文件配对；`splint.jobs` 默认提高 | 壁钟 ≈ max(静态, LLM)；6 个 scanner；更准的上下文 | P1 |
-| **P4 自适应** | 有界重规划（§9）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 |
+| **P1 可观察 + 已关联（MVP）** | §17 的 1–6 + **README:9-11 章程修订**（评审订正：`audit/` 在 P1 落地，章程必须同期改，不能让一个版本与 README 自相矛盾） | origin 指标、实时视图、CI 接入 | 无 |
+| **P2 已验证** | Validator `_Phase` 消费者 + `VERDICT_SCHEMA` + `assess` 子命令 + dashboard verdict 区（caveat 紧挨数字）；`Adapter`/`RunContext` 协议重构（消除 4 个崩溃点，字节钉死）；「声明 == 磁盘发现」测试已在；`allowed-tools` 并集接入 `cordis.py`；`recommendation` 上 candidate | **`llm_only_confirmed`**——LLM 层存在的理由 | P1 |
+| **P3 更快 + 更宽** | 进度模型改为工作量比例后做静态 ∥ LLM（锁、共享 cancel）；输出字节上限；`llm-doctor` 与 `llm-resume`（既有设计 Phase 2 的交付物，尚未存在于 `cli.py`）；验证上游 notification 是否携带 token usage；**三个新 scanner**：Resource/Error（枚举加 token + `_LLM_KEYWORD_CATEGORIES` 一行 + memory-safety 的"错误路径未释放"条款迁入）、UB（与 memory-safety **同一 commit** 按 空间/时间 vs 算术/语义 重切，两份 `skill_version` 同升，跨运行缓存失效）、Logic（**只接受闭合 token 集**：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch`；拒绝"找一切逻辑问题"）；`total_*_tokens` 随启用 scanner 数线性缩放（**规则**：仅当用户未显式设置、值仍为 `DEFAULTS` 时，默认值 = 基数 × 启用 scanner 数；显式设置则不缩放；`inputs/effective-config.toml` 记录解析后的数值，`reload` 一致性校验因此不受影响）；include 图 + 头文件配对；`splint.jobs` 默认提高 | 壁钟 ≈ max(静态, LLM)；6 个 scanner；更准的上下文 | P1 |
+| **P4 自适应** | 有界重规划（§9，含按轮次分目录的证据路径）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF）；TUI 的 `[llm]` 字段、可选 LLM 门禁、`docs/usage.md` 新章节（既有设计 Phase 4 的交付物） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 |
 
 每期独立可 ship、测试全绿、不改前一期的契约。
+
+**与既有设计 §12 分期的对应**（评审指出初稿复用了期号却换了内容）：既有 Phase 0–1 已实现；
+既有 Phase 2（三个 Skill、风险图、预算、`llm-resume`、`llm-doctor`）中前三项已实现，后两项归入本文 P3；
+既有 Phase 3（Correlator、Validator、audit、README）对应本文 P1 + P2；既有 Phase 4（TUI 字段、
+LLM 门禁、usage.md）归入本文 P4。既有设计 §2.2 的 `process.py` 复用承诺未兑现，见 §8。
 
 ---
 
@@ -793,14 +862,14 @@ MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还�
 | 8 | Aggregator 再归一化 severity / 评估 confidence | 已两套版本化映射；违反 "native severities retained" | confidence 归 `verdict` |
 | 9 | `agent` 独立于 `source`；4 态 status；`retries` | `producer` 是唯一轴；status 是两轴；零重试逻辑 | 全部删除 |
 | 10 | 按调用图切 chunk | 破坏"每字节恰好一次" | 调用图作上下文 |
-| 11 | 实时 token 表盘 | SDK 不报 usage | 估算 + 永远附带说明 |
+| 11 | 实时 token 表盘 | 本项目侧无 usage 字段；上游是否提供未验证 | P1 估算 + 永远附带说明；P3 验证上游 |
 | 12 | "一切实时可观察" | cppcheck/flawfinder 无心跳 | 6 行心跳 |
 
 ## 附录 B：用户已锁定的决策
 
 | # | 决策 | 取值 |
 |---|---|---|
-| D1 | 章程 | P2 修订 README:9-11；merge / FP / recommendation 全部限在 `audit/` |
+| D1 | 章程 | 修订 README:9-11；merge / FP / recommendation 全部限在 `audit/`。**时点改为 P1**（评审订正：`audit/` 在 P1 落地，README 必须同期改） |
 | D2 | 默认路径 | 全确定性；validator 走 `assess`；`max_replan_rounds = 0` |
 | D3 | Web 面 | stdlib SSE 的 `serve` 命令，零新依赖 |
 | D4 | Agent 名单 | Resource/Error + UB（重切）+ Logic（闭合 token）全上；预算按 scanner 数自动缩放 |
@@ -819,33 +888,38 @@ MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还�
 | `runner.py:81` | `output_root` 不得在被扫描树内 |
 | `runner.py:171-172, 251-270` | progress 分段（并发前必须改） |
 | `runner.py:202` | `running` 占位态插入点 |
-| `runner.py:214, 220` | 硬编码 adapter 分派（崩溃点） |
+| `runner.py:214-226` | 硬编码 adapter 分派；`:226` 的 `else` 静默误派发到 splint |
+| `runner.py:526-529` | `_incompatibility` 的字典索引，真正的 `KeyError` 崩溃点 |
 | `runner.py:249, 275` | LLM 阶段；源码稳定性复扫 |
-| `runner.py:460` | `_save_manifest` |
+| `runner.py:55-67` | `event()` 闭包 |
+| `runner.py:169` | 三个静态工具的串行循环 |
+| `runner.py:460` | `_save_manifest`（12 处调用） |
 | `review.py:28, 36, 46` | `_producer_rank` / `build_review` / `parsers`（崩溃点） |
 | `review.py:368` | `should_fail` + `gate_eligible` |
 | `review.py:783` | `_parse_llm_units` |
+| `review.py:893` | `_report_integrity`，validator 作为参数注入 |
+| `review.py:1181, 1203` | `_CWE_CATEGORIES`；静态关键词表的 `buffer` 规则 |
 | `review.py:1031` | `_normalize_severity` |
 | `review.py:1120, 1135` | `_deduplicate` / `_fingerprint`（均含 `tool`） |
 | `review.py:1212, 1239` | `_LLM_KEYWORD_CATEGORIES` / `_finding_category` |
 | `review.py:1270, 1299` | `_build_overlap_groups`（只认 `TOOL_NAMES`）/ `_emit_overlap` |
 | `llm/scan.py:54, 60, 119, 381, 549, 663` | `TOKEN_ACCOUNTING` / `run` / rounds 缝 / `_Phase` / `_reserve` / `_provider_stop` |
-| `llm/units.py:51, 140` | `build_plan`（字节稳定）/ `coverage_report` |
-| `llm/index.py:188` | `build_index` |
+| `llm/units.py:51, 140, 312-314, 324-336, 347` | `build_plan`（字节稳定）/ `coverage_report` / 项目级类型解析 / `unit_id` 不含 tier / 调用图键去路径 |
+| `llm/index.py:188, 236-238, 803, 829` | `build_index` / 项目级 `_definition_table` / 调用图键 `path::name` / `_symbol_table` 同名合并 |
 | `llm/context.py:33, 52` | `TIER_BUDGETS` / `build_unit_prompt` |
 | `llm/risk.py:104` | `classify` |
 | `llm/skills.py:75, 84` | `skill_names` / `load_skill` |
-| `harness/schema.py:26, 75, 121` | `FINDING_CATEGORIES` / `FINDING_SCHEMA` / `parse_findings` |
+| `harness/schema.py:26, 75, 95, 121, 295` | `FINDING_CATEGORIES` / `FINDING_SCHEMA` / `evidence` 字段 / `parse_findings` / 保留的键 |
 | `harness/session.py:73` | `run_unit` |
-| `harness/runtime.py:80, 185` | `RunOutcome`（无 usage 字段）/ `HarnessRuntime` |
-| `harness/cordis.py:86, 115, 133-139` | `FORBIDDEN_TOOLS` / `cordis_document` / skill root |
+| `harness/runtime.py:80-88, 185, 251-253, 263-266, 323` | `RunOutcome`（本项目侧无 usage 字段）/ `HarnessRuntime` / cwd 非边界的上游原话 / 透传的两个超时 / SDK 自行 spawn |
+| `harness/cordis.py:21-28, 80, 86, 115, 211-217` | 未验证段的如实记录 / `UNENFORCED_UPSTREAM` / `FORBIDDEN_TOOLS` / `cordis_document` / `includeDefaultRoots: false`（已验证的控制） |
 | `process.py:67, 82` | `ProcessResult` / `run_process` |
 | `status.py:15-40, 43` | 状态梯子 / `overall` |
-| `sanitize.py:309, 322` | `_quotes_source` / `_export_files` |
+| `sanitize.py:32, 224, 309, 322, 373-383` | `_SESSION_EXPORTED`（`findings.json` 总是导出）/ 导出时重渲染 / `_quotes_source` / `_export_files` / `.sarif` 处理 |
 | `recovery.py:21, 68` | `recover_report` / `analyzers_invoked = False` |
 | `dashboard.py:15` | `rebuild_dashboard` |
-| `html_report.py:27, 303-307, 496, 761` | `MAX_EMBED_FINDINGS` / `make()` / `safeHref` / `compPanel` |
-| `config.py:17, 58, 78, 117, 191, 306, 439` | `DEFAULTS` / `scanners` / `audit` / `FIELD_REGISTRY` / `_ALLOWED` / `validate_config` / `effective_toml` |
+| `html_report.py:27, 72, 349-353, 357-486, 496, 761, 854-857` | `MAX_EMBED_FINDINGS` / `render()` / `make()` / `I18N` / `safeHref` / `compPanel` / 四处调用 |
+| `config.py:17, 58, 78-81, 117, 191-197, 306, 361, 439-442` | `DEFAULTS` / `scanners` / `audit` / `FIELD_REGISTRY` / `_ALLOWED`（`llm` 段自动派生）/ `validate_config` / `_validate_llm` / `effective_toml` 固定段表 |
 | `cli.py:21, 76` | `parser` / `--llm-scanner` |
 | `inventory.py:34`、`doctor.py:24`、`preflight.py:32` | 确定性的"项目分析" |
 | `persist.py:14` | `json_bytes` |
