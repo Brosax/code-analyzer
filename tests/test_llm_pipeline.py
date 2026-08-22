@@ -821,3 +821,24 @@ def test_a_provider_stop_leaves_the_evidence_and_the_manifest_telling_one_story(
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["status"] == unit["status"]
     assert meta["status"] != "interrupted"
+
+
+def test_progress_stays_monotone_when_the_llm_phase_runs(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str
+) -> None:
+    """tests/test_runtime_output.py pins monotone progress, but only static-only.
+
+    With [llm] enabled the phase ended at 0.84 and the stability rescan then
+    re-announced 0.8, so every LLM run walked the progress bar backwards while
+    the pinned test stayed green.
+    """
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding())))
+    config = _config(tmp_path, closed_endpoint)
+    _analyze(source, config)
+    values = [event.progress for event in config["_events"] if event.progress is not None]
+    assert values and values == sorted(values)
+    # The regression was specifically the LLM phase's end being followed by a
+    # lower stability value; make sure both events are present in the sample.
+    phases = [event.phase for event in config["_events"] if event.progress is not None]
+    assert "llm" in phases and "stability" in phases

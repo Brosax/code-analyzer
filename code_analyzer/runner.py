@@ -250,7 +250,9 @@ def _analyze(
         progress("llm: starting semantic scan")
         event("llm", "started", "starting LLM semantic scan", value=0.8)
         def llm_unit(producer: str, unit: str, status: str, message: str, value: float | None) -> None:
-            event("unit", status, message, tool=producer, unit=unit, value=None if value is None else 0.8 + 0.04 * value)
+            # Rounded so the last unit (0.8 + 0.04 * 1.0 = 0.8400000000000001)
+            # cannot land above the phase's own 0.84 completion value.
+            event("unit", status, message, tool=producer, unit=unit, value=None if value is None else round(0.8 + 0.04 * value, 6))
         def llm_output(producer: str, unit: str, stream: str, message: str) -> None:
             event("output", "running", message, tool=producer, unit=unit, stream=stream)
         try:
@@ -273,7 +275,9 @@ def _analyze(
             return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
 
     progress("verifying source stability")
-    event("stability", "started", "verifying source stability", value=0.8)
+    # The LLM phase ends at 0.84; a lower value here would walk progress
+    # backwards on every run that enables it.
+    event("stability", "started", "verifying source stability", value=0.84)
     try:
         after = discover(source, config, output_root, cancelled=cancellation.is_cancelled)
     except InterruptedError:
