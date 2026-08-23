@@ -18,6 +18,7 @@ from .recovery import recover_report
 from .runner import analyze
 from .serve import DEFAULT_PORT, serve
 from .tools import LLM_PRODUCERS, TOOL_NAMES
+from .validate import run_assess
 
 
 def parser() -> argparse.ArgumentParser:
@@ -56,6 +57,11 @@ def parser() -> argparse.ArgumentParser:
     live.add_argument("--analyze", type=Path, metavar="SOURCE", help="run the analysis in this process, with cancel support")
     live.add_argument("--port", type=int, default=DEFAULT_PORT)
     _add_analyze_arguments(live)
+    assess = commands.add_parser("assess", help="validate the correlated candidates of a finished run with the LLM validator")
+    assess.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    assess.add_argument("--config", type=Path)
+    assess.add_argument("--max-candidates", type=_positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
+    _add_llm_arguments(assess)
     return root
 
 
@@ -82,15 +88,10 @@ def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
     run.add_argument("--splint-jobs", type=_positive_int)
     run.add_argument("--splint-heartbeat", type=_positive_float)
     run.add_argument("--llm", action=argparse.BooleanOptionalAction, default=None, help="run the LLM scanners as a second, independent detection path")
-    run.add_argument("--llm-profile", choices=PROFILE_NAMES, help="built-in provider profile supplying endpoint, model and api_key_env defaults")
-    run.add_argument("--llm-endpoint", metavar="URL")
-    run.add_argument("--llm-model", metavar="NAME")
+    _add_llm_arguments(run)
     run.add_argument("--llm-scanner", choices=LLM_PRODUCERS, action="append")
-    run.add_argument("--llm-jobs", type=_positive_int)
-    run.add_argument("--llm-total-timeout", type=_positive_float, metavar="SECONDS")
     run.add_argument("--llm-token-budget", type=_positive_int, metavar="N", help="prompt token budget for the whole LLM phase")
     run.add_argument("--llm-risk", action="append", metavar="PATTERN=TIER")
-    run.add_argument("--llm-no-cache", action="store_true")
     run.add_argument("--termination-grace", type=_positive_float)
     run.add_argument("--events-file", type=Path, metavar="PATH", help="write the run-level event log here instead of <run_dir>/events.jsonl")
     run.add_argument("--follow-symlinks", action=argparse.BooleanOptionalAction, default=None)
@@ -98,6 +99,16 @@ def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
     run.add_argument("--shareable-export", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--review", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--fail-on", choices=("none", "medium", "high", "critical"))
+
+
+def _add_llm_arguments(run: argparse.ArgumentParser) -> None:
+    """The provider flags both the scanners and the validator take."""
+    run.add_argument("--llm-profile", choices=PROFILE_NAMES, help="built-in provider profile supplying endpoint, model and api_key_env defaults")
+    run.add_argument("--llm-endpoint", metavar="URL")
+    run.add_argument("--llm-model", metavar="NAME")
+    run.add_argument("--llm-jobs", type=_positive_int)
+    run.add_argument("--llm-total-timeout", type=_positive_float, metavar="SECONDS")
+    run.add_argument("--llm-no-cache", action="store_true")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,6 +160,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "recover-report":
             print(recover_report(args.report_directory))
             return 0
+        if args.command == "assess":
+            report_directory = args.report_directory.expanduser().resolve()
+            config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))
+            _warn_third_party(config)
+            block = run_assess(report_directory, config,
+                               progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+            print(report_directory)
+            return int(block["exit_code"])
         if args.command == "serve":
             if args.analyze is None and args.report_directory is None:
                 raise UserError("serve needs REPORT_DIR or --analyze SOURCE")
@@ -188,6 +207,45 @@ def _has_tty() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
+def _scanned_source(report_directory: Path) -> Path:
+    """The tree a run scanned, so its project config applies to assess too."""
+    try:
+        manifest = json.loads((report_directory / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UserError(f"not a run directory: {report_directory} ({exc})") from exc
+    source = Path(str((manifest or {}).get("source") or "")) if isinstance(manifest, dict) else Path("")
+    if not source.is_dir():
+        raise UserError(f"the scanned source tree is not a directory: {source}; assess needs the source")
+    return source
+
+
+def _assess_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    llm = _llm_overrides(args)
+    if llm:
+        value["llm"] = llm
+    if args.max_candidates is not None:
+        value["audit"] = {"validation_max_candidates": args.max_candidates}
+    return value
+
+
+def _llm_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    llm: dict[str, Any] = {}
+    if args.llm_profile is not None:
+        llm["profile"] = args.llm_profile
+    if args.llm_endpoint is not None:
+        llm["endpoint"] = args.llm_endpoint
+    if args.llm_model is not None:
+        llm["model"] = args.llm_model
+    if args.llm_jobs is not None:
+        llm["jobs"] = args.llm_jobs
+    if args.llm_total_timeout is not None:
+        llm["total_timeout_seconds"] = args.llm_total_timeout
+    if args.llm_no_cache:
+        llm["cache"] = False
+    return llm
+
+
 def _overrides(args: argparse.Namespace) -> dict[str, Any]:
     value: dict[str, Any] = {}
     run: dict[str, Any] = {}
@@ -195,7 +253,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
     build: dict[str, Any] = {}
     tools: dict[str, Any] = {}
     review: dict[str, Any] = {}
-    llm: dict[str, Any] = {}
+    llm = _llm_overrides(args)
     if args.output_root is not None:
         run["output_root"] = str(args.output_root.resolve())
     if args.shareable_export is not None:
@@ -241,24 +299,12 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         tools.setdefault("splint", {})["heartbeat_seconds"] = args.splint_heartbeat
     if args.llm is not None:
         llm["enabled"] = args.llm
-    if args.llm_profile is not None:
-        llm["profile"] = args.llm_profile
-    if args.llm_endpoint is not None:
-        llm["endpoint"] = args.llm_endpoint
-    if args.llm_model is not None:
-        llm["model"] = args.llm_model
     if args.llm_scanner:
         llm["scanners"] = [name for name in LLM_PRODUCERS if name in set(args.llm_scanner)]
-    if args.llm_jobs is not None:
-        llm["jobs"] = args.llm_jobs
-    if args.llm_total_timeout is not None:
-        llm["total_timeout_seconds"] = args.llm_total_timeout
     if args.llm_token_budget is not None:
         llm["total_prompt_tokens"] = args.llm_token_budget
     if args.llm_risk:
         llm["risk_overrides"] = args.llm_risk
-    if args.llm_no_cache:
-        llm["cache"] = False
     if args.review is not None:
         review["enabled"] = args.review
     if args.fail_on is not None:

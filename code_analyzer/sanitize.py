@@ -31,7 +31,8 @@ SESSION_EXCERPT_REASON = "contains source excerpts"
 # downstream reads it -- the review parser reads findings.json and coverage is
 # already in the manifest -- so it is withheld whole rather than stripped.
 SYMBOL_TABLE_REASON = "contains the analyzed source symbol table (verbatim definitions and signatures)"
-_SESSION_EXPORTED: tuple[str, ...] = ("findings.json",)
+_SESSION_EXPORTED: tuple[str, ...] = ("findings.json", "verdict.json")
+_SANDBOX_LAUNCHERS = frozenset({"llm/runtime-sandbox.sh", "llm/assess/runtime-sandbox.sh"})
 # A finding's `evidence` is the offending source, copied verbatim by the model.
 # findings.json is exported because it is the report the review is re-derived
 # from, so the excerpt is withheld inside it instead of withholding the file.
@@ -332,7 +333,7 @@ def _quotes_source(relative: Path) -> str | None:
         return SESSION_EXCERPT_REASON
     # The runtime's own JSONL session log: every tool result, so every file
     # the model read, verbatim.  The bwrap launcher script is host layout.
-    if parts[:2] == ("llm", "dsh-sessions") or relative.as_posix() == "llm/runtime-sandbox.sh":
+    if parts[:2] == ("llm", "dsh-sessions") or relative.as_posix() in _SANDBOX_LAUNCHERS:
         return SESSION_EXCERPT_REASON
     if relative.as_posix() == _SYMBOL_TABLE:
         return SYMBOL_TABLE_REASON

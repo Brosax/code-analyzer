@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .audit import assessment_summary, build_assessment
+from .audit import assessment_summary, build_assessment, carry_verdicts, load_assessment
 from .config import DEFAULTS, load_config, validate_config
 from .errors import UserError
 from .html_report import render
@@ -50,7 +50,8 @@ def recover_report(report_directory: Path) -> Path:
     max_findings = int(config["review"]["max_markdown_findings"])
     review_json = json_bytes(review)
     review_markdown = markdown_report(review, max_findings).encode("utf-8")
-    assessment = build_assessment(review)
+    # Correlation is re-derived; verdicts were bought with model time and survive.
+    assessment = carry_verdicts(build_assessment(review), load_assessment(report_directory))
     assessment_json = json_bytes(assessment)
     sarif_json = json_bytes(build_sarif(review, manifest))
     recovered = copy.deepcopy(manifest)
@@ -95,7 +96,8 @@ def recover_report(report_directory: Path) -> Path:
         artifacts = _replace_artifact(artifacts, "review/summary.md", review_markdown)
         artifacts = _replace_artifact(artifacts, "audit/assessment.json", assessment_json)
         artifacts = _replace_artifact(artifacts, "review/summary.sarif", sarif_json)
-        recovered["audit"] = {**assessment_summary(assessment), "error": None}
+        # An earlier assess left validator fields here; the counts come fresh.
+        recovered["audit"] = {**(manifest.get("audit") or {}), **assessment_summary(assessment), "error": None}
         render_manifest = copy.deepcopy(recovered)
         render_manifest["artifacts"] = [item for item in artifacts if item.get("path") != "index.html"]
         index_bytes = render(render_manifest, review, assessment).encode("utf-8")

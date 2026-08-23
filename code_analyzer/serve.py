@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from .analysis import AnalysisEvent, AnalysisRequest, CancellationToken, run_analysis
 from .errors import UserError
+from .events import RUN_DIRECTORY_PHASE
 from .persist import json_bytes
 from .status import EXIT_INTERRUPTED
 
@@ -106,6 +107,10 @@ class LiveRun:
     def record(self, event: AnalysisEvent) -> None:
         with self._lock:
             self._buffer.append(_event_dict(event))
+        # The run directory does not exist when the first events fire; the
+        # runner announces it with this event once it does.
+        if (event.phase, event.status) == RUN_DIRECTORY_PHASE and event.message:
+            self.attach(Path(event.message))
 
     def attach(self, report_directory: Path) -> None:
         with self._lock:

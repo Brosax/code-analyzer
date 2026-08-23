@@ -1,10 +1,11 @@
-"""One scanner session over one scan unit, and the evidence it leaves behind.
+"""One agent session over one subject, and the evidence it leaves behind.
 
 The evidence equivalent of a single completion is one response; the evidence
 equivalent of an agent loop is the whole event stream, so events.jsonl is
-persisted alongside the request, the response and the parsed findings.  Volatile
+persisted alongside the request, the response and the parsed result.  Volatile
 values -- durations, counters, cache state -- live in meta.json alone, so that
-findings.json stays byte-identical for identical model output.
+findings.json (a scanner over a unit) and verdict.json (the validator over a
+candidate) stay byte-identical for identical model output.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import hashlib
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +29,10 @@ from .runtime import (
     request_description,
 )
 from .schema import SCHEMA_VERSION, parse_findings, response_unparsed, schema_hash
+from .verdict import VERDICT_SCHEMA_VERSION, parse_verdict, verdict_schema_hash
 
 SESSIONS_ROOT = ("llm", "sessions")
+VERDICT_FILENAME = "verdict.json"
 
 # request.json answers one question: which of the operator's [llm] knobs
 # actually reached the scan, and through which channel.  The pinned SDK takes
@@ -91,12 +95,135 @@ def run_unit(
     Returns a unit record shaped like the ones the native adapters produce, so
     the same status algebra, coverage accounting and artifact index apply.
     """
+    return _run_session(
+        runtime,
+        directory=unit_directory(run_dir, producer, unit_id),
+        run_dir=run_dir,
+        producer=producer,
+        subject={"unit_id": unit_id},
+        prompt=prompt,
+        unit_sha256=unit_sha256,
+        skill_version=skill_version,
+        schema={"version": SCHEMA_VERSION, "sha256": schema_hash()},
+        parse=_parse_report,
+        result_file="findings.json",
+        input_files=input_files,
+        settings=settings,
+        session_id=session_id,
+        cache=cache,
+        cancelled=cancelled,
+        on_event=on_event,
+    )
+
+
+def run_candidate(
+    runtime: HarnessRuntime,
+    *,
+    run_dir: Path,
+    producer: str,
+    candidate_id: str,
+    prompt: str | list[dict[str, Any]],
+    unit_sha256: str,
+    skill_version: str,
+    input_files: list[str] | None = None,
+    settings: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    cache: dict[str, Any] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run the validator over one candidate with the same evidence discipline.
+
+    verdict.json takes the place of findings.json: it holds either the parsed
+    verdict or the reason the response was rejected, so an auditor can tell a
+    model that said nothing from one that said something unusable.
+    """
+    return _run_session(
+        runtime,
+        directory=unit_directory(run_dir, producer, candidate_id),
+        run_dir=run_dir,
+        producer=producer,
+        subject={"candidate_id": candidate_id},
+        prompt=prompt,
+        unit_sha256=unit_sha256,
+        skill_version=skill_version,
+        schema={"version": VERDICT_SCHEMA_VERSION, "sha256": verdict_schema_hash()},
+        parse=lambda text: _parse_verdict(text, candidate_id),
+        result_file=VERDICT_FILENAME,
+        input_files=input_files,
+        settings=settings,
+        session_id=session_id,
+        cache=cache,
+        cancelled=cancelled,
+        on_event=on_event,
+    )
+
+
+@dataclass(frozen=True)
+class _Parsed:
+    """What one response reduced to: the result file body and its record counts."""
+
+    valid: bool
+    reason: str | None
+    result: dict[str, Any]
+    counts: dict[str, int]
+    # Returned to the caller but never persisted twice: the result file
+    # already holds it.
+    record: dict[str, Any]
+
+
+def _parse_report(text: str | None) -> _Parsed:
+    """``None`` is a session that produced no response at all, not an empty one."""
+    findings: list[dict[str, Any]] = []
+    malformed: list[str] = []
+    valid = False
+    reason = None
+    if text is not None:
+        findings, malformed = parse_findings(text)
+        valid = not response_unparsed(malformed)
+        if not valid:
+            reason = malformed[0] if malformed else "scanner produced no parsable report"
+        elif malformed:
+            reason = f"{len(malformed)} malformed finding(s) dropped"
+    return _Parsed(
+        valid, reason, {"findings": findings, "malformed": malformed},
+        {"finding_count": len(findings), "malformed_count": len(malformed)}, {},
+    )
+
+
+def _parse_verdict(text: str | None, candidate_id: str) -> _Parsed:
+    verdict, reason = (None, None) if text is None else parse_verdict(text, candidate_id=candidate_id)
+    return _Parsed(
+        verdict is not None, reason, {"verdict": verdict, "rejected": reason},
+        {"verdict_count": int(verdict is not None)}, {"verdict": verdict},
+    )
+
+
+def _run_session(
+    runtime: HarnessRuntime,
+    *,
+    directory: Path,
+    run_dir: Path,
+    producer: str,
+    subject: dict[str, str],
+    prompt: str | list[dict[str, Any]],
+    unit_sha256: str,
+    skill_version: str,
+    schema: dict[str, Any],
+    parse: Callable[[str | None], _Parsed],
+    result_file: str,
+    input_files: list[str] | None,
+    settings: dict[str, Any] | None,
+    session_id: str | None,
+    cache: dict[str, Any] | None,
+    cancelled: Callable[[], bool] | None,
+    on_event: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
     active = settings if settings is not None else runtime.settings
-    directory = unit_directory(run_dir, producer, unit_id)
     directory.mkdir(parents=True, exist_ok=True)
     write_json(
         directory / "request.json",
-        _request(active, producer, unit_id, unit_sha256, skill_version, prompt),
+        _request(active, producer, subject, unit_sha256, skill_version, prompt, schema),
     )
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -111,23 +238,15 @@ def run_unit(
         except HarnessRunFailed as exc:
             status, reason = exc.outcome, exc.reason
 
-    findings: list[dict[str, Any]] = []
-    malformed: list[str] = []
-    valid = False
+    parsed = parse(None if outcome is None else outcome.final_response)
     if outcome is not None:
-        findings, malformed = parse_findings(outcome.final_response)
-        valid = not response_unparsed(malformed)
-        status = finish_status(outcome.finish_reason, valid)
-        if not valid:
-            reason = malformed[0] if malformed else "scanner produced no parsable report"
-        elif malformed:
-            reason = f"{len(malformed)} malformed finding(s) dropped"
+        status = finish_status(outcome.finish_reason, parsed.valid)
+        reason = parsed.reason
 
     # Everything below is persisted evidence that rebuild-dashboard and
     # recover-report re-derive the review from, so the credential is stripped
     # here rather than only on the way into a shareable archive.
-    findings = redact_credential(findings, active)
-    malformed = redact_credential(malformed, active)
+    result = redact_credential(parsed.result, active)
     reason = redact_credential(reason, active)
     write_json(
         directory / "response.json",
@@ -139,44 +258,44 @@ def run_unit(
     )
     _write_events(directory / "events.jsonl", outcome.events if outcome else [])
     write_json(
-        directory / "findings.json",
+        directory / result_file,
         {
             "producer": producer,
-            "unit_id": unit_id,
-            "schema_version": SCHEMA_VERSION,
-            "valid_report": valid,
-            "findings": findings,
-            "malformed": malformed,
+            **subject,
+            "schema_version": schema["version"],
+            "valid_report": parsed.valid,
+            **result,
         },
     )
     write_json(
         directory / "meta.json",
-        _meta(producer, unit_id, status, started_at, outcome, findings, malformed, cache),
+        _meta(producer, subject, status, started_at, outcome, parsed.counts, cache),
     )
 
-    unit: dict[str, Any] = {
-        "id": unit_id,
+    record: dict[str, Any] = {
+        "id": next(iter(subject.values())),
         "producer": producer,
         "status": status,
         "input_files": list(input_files or []),
-        "valid_report": valid,
+        "valid_report": parsed.valid,
         "reason": reason,
         "evidence_context": "source-only",
         "finish_reason": outcome.finish_reason if outcome else "",
-        "finding_count": len(findings),
-        "malformed_count": len(malformed),
+        **parsed.counts,
+        **redact_credential(parsed.record, active),
     }
-    attach_artifacts(unit, directory, run_dir)
-    return unit
+    attach_artifacts(record, directory, run_dir)
+    return record
 
 
 def _request(
     settings: dict[str, Any],
     producer: str,
-    unit_id: str,
+    subject: dict[str, str],
     unit_sha256: str,
     skill_version: str,
     prompt: str | list[dict[str, Any]],
+    schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Everything that influences the result, and no credential.
 
@@ -186,14 +305,13 @@ def _request(
     return {
         **request_description(settings),
         "producer": producer,
-        "unit_id": unit_id,
+        **subject,
         "unit_sha256": str(unit_sha256),
         "skill": producer,
         "skill_version": str(skill_version),
         "prompt_sha256": hashlib.sha256(_prompt_text(prompt).encode("utf-8")).hexdigest(),
         "output_schema": {
-            "version": SCHEMA_VERSION,
-            "sha256": schema_hash(),
+            **schema,
             # The Python SDK exposes no outputSchema channel, so this schema is
             # what the parser enforces, not something the provider was asked for.
             "enforced_by": "parser",
@@ -213,18 +331,17 @@ def _knobs(settings: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
 
 def _meta(
     producer: str,
-    unit_id: str,
+    subject: dict[str, str],
     status: str,
     started_at: str,
     outcome: RunOutcome | None,
-    findings: list[dict[str, Any]],
-    malformed: list[str],
+    counts: dict[str, int],
     cache: dict[str, Any] | None,
 ) -> dict[str, Any]:
     events = outcome.events if outcome else []
     return {
         "producer": producer,
-        "unit_id": unit_id,
+        **subject,
         "status": status,
         "started_at": started_at,
         "duration_seconds": round(outcome.duration_seconds, 3) if outcome else 0.0,
@@ -233,8 +350,7 @@ def _meta(
         "event_count": len(events),
         "tool_call_count": _tool_calls(events),
         "notification_count": len(outcome.notifications) if outcome else 0,
-        "finding_count": len(findings),
-        "malformed_count": len(malformed),
+        **counts,
         "cache": {
             "hit": bool((cache or {}).get("hit", False)),
             "key": str((cache or {}).get("key", "")),

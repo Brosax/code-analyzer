@@ -226,17 +226,31 @@ def endpoint_context_length(settings: dict[str, Any], *, timeout: float = 5.0) -
             return None
         return payload if isinstance(payload, dict) else None
 
-    loaded = fetch("/api/ps", None)
-    for item in (loaded or {}).get("models", []) or []:
-        if isinstance(item, dict) and item.get("name") == model and isinstance(item.get("context_length"), int):
-            return int(item["context_length"])
+    def loaded_window() -> int | None:
+        for item in (fetch("/api/ps", None) or {}).get("models", []) or []:
+            if isinstance(item, dict) and item.get("name") == model and isinstance(item.get("context_length"), int):
+                return int(item["context_length"])
+        return None
+
+    window = loaded_window()
+    if window is not None:
+        return window
     shown = fetch("/api/show", {"model": model})
-    for line in str((shown or {}).get("parameters", "")).splitlines():
+    if shown is None:
+        return None
+    # The served window is decided at load time from the host's
+    # OLLAMA_CONTEXT_LENGTH, which no API reports while the model is
+    # unloaded; /api/show's num_ctx is only a Modelfile pin.  Loading the
+    # model (an empty prompt, no generation) is what makes it knowable.
+    fetch("/api/generate", {"model": model, "prompt": "", "keep_alive": "10m"})
+    window = loaded_window()
+    if window is not None:
+        return window
+    for line in str(shown.get("parameters", "")).splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
             return int(parts[1])
-    # Ollama's own default when nothing pins it; only asserted for Ollama.
-    return 4096 if shown is not None else None
+    return None
 
 
 def _runtime_binary() -> Path:

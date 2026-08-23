@@ -462,8 +462,14 @@ _JS_MAIN = r"""
       candidates_omitted: "另有 {n} 个候选未嵌入本页面；完整数据见 audit/assessment.json。",
       caveat_unvalidated: "尚未运行 validator：所有候选均未核验。",
       caveat_no_validator: "尚未运行 validator：所有判定计数为零，未核验数等于候选总数。运行 `code-analyzer assess` 可添加判定。",
-      caveat_validator_sees_static: "llm_only_confirmed 将由能看到同一文件静态结果的 validator 产出；应理解为“被第二个角色佐证”，而非独立确认。",
+      caveat_validator_sees_static: "llm_only_confirmed 由能看到同一文件静态结果的 validator 产出；应理解为“被第二个角色佐证”，而非独立确认。",
+      caveat_validator_ran: "validator 已运行：{total} 个候选中 {validated} 个带有判定，{unvalidated} 个没有（其中 {unscheduled} 个未被调度：受 validation_max_candidates 上限或 token 预算限制）。validator 看得到同一文件的静态结果。",
       caveat_grouping_not_identity: "候选只是把指向相同行与类别的发现分到一组，并不断言它们描述的是同一个缺陷。",
+      card_llm_only_confirmed: "仅 LLM 发现且判定 CONFIRMED", card_validated: "已核验 / 未核验",
+      caveat_corroborated: "validator 看得到静态结果：这是第二个角色的佐证，不是独立确认。",
+      filter_verdict: "判定", opt_all_verdicts: "全部判定", opt_unvalidated: "未核验",
+      th_verdict: "判定", verdict_none: "未核验",
+      verdict_confirmed: "CONFIRMED", verdict_likely: "LIKELY", verdict_uncertain: "UNCERTAIN", verdict_false_positive: "FALSE_POSITIVE",
     },
     en: {
       report_title: "Static Analysis Evidence Report",
@@ -540,8 +546,14 @@ _JS_MAIN = r"""
       candidates_omitted: "{n} more candidate(s) are not embedded in this page; see audit/assessment.json.",
       caveat_unvalidated: "No validator has run: every candidate is unvalidated.",
       caveat_no_validator: "No validator has run: every verdict count is zero and unvalidated equals candidates_total. Run `code-analyzer assess` to add verdicts.",
-      caveat_validator_sees_static: "llm_only_confirmed will be produced by a validator that sees the static findings for the same file; read it as corroborated by a second role, not as an independent confirmation.",
+      caveat_validator_sees_static: "llm_only_confirmed is produced by a validator that sees the static findings for the same file; read it as corroborated by a second role, not as an independent confirmation.",
+      caveat_validator_ran: "A validator has run: {validated} of {total} candidates carry a verdict and {unvalidated} do not ({unscheduled} were never scheduled, by the validation_max_candidates cap or the token budget). The validator saw the static findings for the same file.",
       caveat_grouping_not_identity: "A candidate groups findings that name the same lines and category; it does not assert that they describe the same defect.",
+      card_llm_only_confirmed: "LLM-only and CONFIRMED", card_validated: "Validated / unvalidated",
+      caveat_corroborated: "The validator saw the static results: corroborated by a second role, not independently confirmed.",
+      filter_verdict: "Verdict", opt_all_verdicts: "All verdicts", opt_unvalidated: "Unvalidated",
+      th_verdict: "Verdict", verdict_none: "unvalidated",
+      verdict_confirmed: "CONFIRMED", verdict_likely: "LIKELY", verdict_uncertain: "UNCERTAIN", verdict_false_positive: "FALSE_POSITIVE",
     },
   };
   let lang = "zh";
@@ -1039,6 +1051,23 @@ _JS_MAIN = r"""
 
   /* ---------- cross-engine correlation (audit layer) ---------- */
   const originTone = o => ({ "static-only": "origin-static", "llm-only": "origin-llm", "both": "origin-both" }[o] || "");
+  const verdictOrder = ["CONFIRMED", "LIKELY", "UNCERTAIN", "FALSE_POSITIVE"];
+  const verdictTone = v => ({ CONFIRMED: "ok", LIKELY: "warn", UNCERTAIN: "muted", FALSE_POSITIVE: "bad" }[v] || "");
+  // Literal keys only: the label test scans this file for every t("...") call.
+  const verdictKey = v => ({
+    CONFIRMED: t("verdict_confirmed"), LIKELY: t("verdict_likely"),
+    UNCERTAIN: t("verdict_uncertain"), FALSE_POSITIVE: t("verdict_false_positive"),
+  }[v] || v);
+  const verdictLabel = c => c.verdict && typeof c.verdict === "object" && verdictOrder.includes(c.verdict.label) ? c.verdict.label : "";
+  const verdictBadge = c => {
+    const label = verdictLabel(c);
+    if (!label) return make("span", "muted", t("verdict_none"));
+    const badge = make("span", "badge " + verdictTone(label), verdictKey(label));
+    if (c.verdict.confidence !== undefined && c.verdict.confidence !== null) {
+      badge.title = String(c.verdict.confidence);
+    }
+    return badge;
+  };
   const renderAssessment = () => {
     const cards = id("assessment-cards");
     const body = id("candidate-body");
@@ -1047,13 +1076,14 @@ _JS_MAIN = r"""
     cards.replaceChildren(); body.replaceChildren(); notice.replaceChildren();
     count.textContent = "";
     if (!assessment) {
-      tableEmpty(body, 7, t("no_assessment"));
+      tableEmpty(body, 9, t("no_assessment"));
       id("origin-comp").replaceChildren(make("p", "empty", t("no_data")));
       return;
     }
     const metrics = assessment.metrics || {};
     const byOrigin = metrics.by_origin || {};
     const candidates = Array.isArray(assessment.candidates) ? assessment.candidates : [];
+    const validated = Number(metrics.validated || 0);
     const stat = (labelKey, node) => {
       const cell = make("article", "stat");
       cell.append(make("span", "lbl", t(labelKey)), node);
@@ -1061,11 +1091,19 @@ _JS_MAIN = r"""
     };
     stat("card_candidates", make("strong", "", number(metrics.candidates_total || 0)));
     // The headline number and its caveat are one tile: the number must never
-    // be read without the sentence that qualifies it.
+    // be read without the sentence that qualifies it (design 7.3).
     const headline = make("div");
-    headline.append(make("strong", "", number(byOrigin["llm-only"] || 0)));
-    headline.append(make("span", "muted", " " + t("caveat_unvalidated")));
-    stat("card_llm_only", headline);
+    if (validated > 0) {
+      headline.append(make("strong", "", number(metrics.llm_only_confirmed || 0)));
+      headline.append(make("span", "muted", " " + t("caveat_corroborated")));
+      stat("card_llm_only_confirmed", headline);
+      stat("card_validated", make("strong", "", number(validated) + " / " + number(metrics.unvalidated || 0)));
+      stat("card_llm_only", make("strong", "", number(byOrigin["llm-only"] || 0)));
+    } else {
+      headline.append(make("strong", "", number(byOrigin["llm-only"] || 0)));
+      headline.append(make("span", "muted", " " + t("caveat_unvalidated")));
+      stat("card_llm_only", headline);
+    }
     stat("card_both", make("strong", "", number(byOrigin["both"] || 0)));
     stat("card_static_only", make("strong", "", number(byOrigin["static-only"] || 0)));
     const unc = metrics.uncorrelated || {};
@@ -1074,9 +1112,13 @@ _JS_MAIN = r"""
     notice.append(make("p", "", t("assessment_authority")));
     const caveatIds = Array.isArray(metrics.caveat_ids) ? metrics.caveat_ids : [];
     const caveatTexts = Array.isArray(metrics.caveats) ? metrics.caveats : [];
+    const caveatParams = {
+      validated: number(validated), total: number(metrics.candidates_total || 0),
+      unvalidated: number(metrics.unvalidated || 0), unscheduled: number(metrics.validation_unscheduled || 0),
+    };
     caveatTexts.forEach((text, index) => {
       const key = "caveat_" + String(caveatIds[index] || "");
-      notice.append(make("p", "muted", caveatIds[index] && I18N[lang][key] ? t(key) : String(text)));
+      notice.append(make("p", "muted", caveatIds[index] && I18N[lang][key] ? fmt(key, caveatParams) : String(text)));
     });
     if (assessment.candidates_omitted) notice.append(make("p", "muted", fmt("candidates_omitted", { n: number(assessment.candidates_omitted) })));
 
@@ -1090,7 +1132,9 @@ _JS_MAIN = r"""
     compPanel("origin-comp", sevByOrigin, sevOrder, sevTone, originSeries);
 
     const wanted = id("origin").value;
-    const shown = candidates.filter(c => !wanted || c.origin === wanted);
+    const wantedVerdict = id("verdict-filter").value;
+    const shown = candidates.filter(c => (!wanted || c.origin === wanted)
+      && (!wantedVerdict || (wantedVerdict === "unvalidated" ? !verdictLabel(c) : verdictLabel(c) === wantedVerdict)));
     count.textContent = fmt("candidates_n", { n: number(shown.length) });
     shown.forEach(c => {
       const tr = make("tr");
@@ -1107,9 +1151,15 @@ _JS_MAIN = r"""
       origin.append(make("span", "badge " + originTone(c.origin), c.origin));
       const sev = make("td");
       sev.append(make("span", "badge sev-" + (sevOrder.includes(c.severity) ? c.severity : "unknown"), c.severity || "unknown"));
+      const verdict = make("td");
+      verdict.append(verdictBadge(c));
+      if (c.verdict && typeof c.verdict === "object" && c.verdict.rationale) {
+        verdict.append(make("div", "muted", String(c.verdict.rationale)));
+      }
       tr.append(
         make("td", "mono", c.id),
         origin,
+        verdict,
         make("td", "loc", c.canonical_path + ":" + (c.line_start === c.line_end ? c.line_start : c.line_start + "-" + c.line_end)),
         make("td", "", c.category),
         sev,
@@ -1118,7 +1168,7 @@ _JS_MAIN = r"""
         action);
       body.append(tr);
     });
-    if (!body.childNodes.length) tableEmpty(body, 8, t("no_candidates"));
+    if (!body.childNodes.length) tableEmpty(body, 9, t("no_candidates"));
   };
 
   /* ---------- diagnostics ---------- */
@@ -1260,6 +1310,7 @@ _JS_MAIN = r"""
     renderAssessment();
   };
   id("origin").onchange = () => renderAssessment();
+  id("verdict-filter").onchange = () => renderAssessment();
   id("lang-toggle").onclick = () => {
     lang = lang === "zh" ? "en" : "zh";
     try {
@@ -1437,10 +1488,19 @@ _HTML_BODY = r"""<div class="sheet">
 <option value="both" data-i18n="legend_both">共同</option>
 <option value="static-only" data-i18n="legend_static_only">仅静态</option>
 </select></label>
+<label class="control"><span data-i18n="filter_verdict">判定</span><select id="verdict-filter">
+<option value="" data-i18n="opt_all_verdicts">全部判定</option>
+<option value="CONFIRMED" data-i18n="verdict_confirmed">CONFIRMED</option>
+<option value="LIKELY" data-i18n="verdict_likely">LIKELY</option>
+<option value="UNCERTAIN" data-i18n="verdict_uncertain">UNCERTAIN</option>
+<option value="FALSE_POSITIVE" data-i18n="verdict_false_positive">FALSE_POSITIVE</option>
+<option value="unvalidated" data-i18n="opt_unvalidated">未核验</option>
+</select></label>
 </div>
 <div class="table-wrap"><table><thead><tr>
 <th data-i18n="th_candidate">候选</th>
 <th data-i18n="th_origin">来源</th>
+<th data-i18n="th_verdict">判定</th>
 <th data-i18n="th_location">位置</th>
 <th data-i18n="th_category">类别</th>
 <th data-i18n="th_severity">规范化严重度</th>

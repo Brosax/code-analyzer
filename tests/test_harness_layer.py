@@ -789,3 +789,42 @@ def test_a_keyless_profile_still_satisfies_the_adapter(sdk, settings, tmp_path: 
     request = json.loads((directory / "request.json").read_text(encoding="utf-8"))
     assert runtime.KEYLESS_PLACEHOLDER not in json.dumps(request)
     assert runtime.credential_value(settings) == ""
+
+
+def test_the_context_probe_loads_the_model_instead_of_guessing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unloaded model shows no window anywhere; the served size only
+    exists once it is loaded. Seen live: the probe guessed 4096 while the
+    host served 32768, and every unit was refused."""
+    import json as _json
+    from urllib import request as urlrequest
+
+    from code_analyzer.harness import runtime as rt
+
+    calls: list[str] = []
+    loaded = {"value": False}
+
+    class Reply:
+        def __init__(self, payload): self._body = _json.dumps(payload).encode("utf-8")
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=0):
+        path = req.full_url.split("11435", 1)[1]
+        calls.append(path)
+        if path == "/api/ps":
+            return Reply({"models": [{"name": "qwen3.8:27b", "context_length": 32768}] if loaded["value"] else []})
+        if path == "/api/show":
+            return Reply({"parameters": "top_k 20"})
+        if path == "/api/generate":
+            loaded["value"] = True
+            return Reply({"done": True})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(urlrequest, "urlopen", fake_urlopen)
+    settings = {"endpoint": "http://127.0.0.1:11435/v1", "model": "qwen3.8:27b"}
+    assert rt.endpoint_context_length(settings) == 32768
+    assert calls == ["/api/ps", "/api/show", "/api/generate", "/api/ps"]
+    # Once loaded, one call answers.
+    calls.clear()
+    assert rt.endpoint_context_length(settings) == 32768 and calls == ["/api/ps"]

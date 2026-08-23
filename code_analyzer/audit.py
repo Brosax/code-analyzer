@@ -35,6 +35,7 @@ AUTHORITY = "non-authoritative-derived-opinion"
 ASSESSMENT_PATH = ("audit", "assessment.json")
 VERDICT_LABELS: tuple[str, ...] = ("CONFIRMED", "LIKELY", "UNCERTAIN", "FALSE_POSITIVE")
 ORIGINS: tuple[str, ...] = ("static-only", "llm-only", "both")
+VALIDATOR = "llm-validator"
 
 NOTICE = (
     "Candidates are model-assisted opinion derived from review/summary.json. They never "
@@ -116,7 +117,6 @@ def build_assessment(review: dict[str, Any]) -> dict[str, Any]:
     uncorrelated: Counter[str] = Counter(
         item.get("engine", "static") for item in findings if item.get("fingerprint") not in located
     )
-    by_origin = Counter(candidate["origin"] for candidate in candidates)
     return {
         "assessment_schema_version": ASSESSMENT_SCHEMA_VERSION,
         "authority": AUTHORITY,
@@ -124,33 +124,127 @@ def build_assessment(review: dict[str, Any]) -> dict[str, Any]:
         "review_schema_version": review.get("review_schema_version"),
         "run": {"id": (review.get("run") or {}).get("id")},
         "candidates": candidates,
-        "metrics": {
-            "candidates_total": len(candidates),
-            "by_origin": {origin: by_origin.get(origin, 0) for origin in ORIGINS},
-            "by_verdict": {label: 0 for label in VERDICT_LABELS},
-            "by_origin_verdict": {
-                origin: {label: 0 for label in VERDICT_LABELS} for origin in ORIGINS
-            },
-            "llm_only_confirmed": 0,
-            "llm_only_confirmed_or_likely": 0,
-            "static_only_false_positive": 0,
-            "validated": 0,
-            "unvalidated": len(candidates),
-            "validation_unscheduled": len(candidates),
-            "uncorrelated": {"static": uncorrelated.get("static", 0), "llm": uncorrelated.get("llm", 0)},
-            # Ids let a viewer localise the sentences; the English text is the
-            # machine-readable record and what a non-localising reader sees.
-            "caveat_ids": ["no_validator", "validator_sees_static", "grouping_not_identity"],
-            "caveats": [
-                "No validator has run: every verdict count is zero and unvalidated equals "
-                "candidates_total. Run `code-analyzer assess` to add verdicts.",
-                "llm_only_confirmed will be produced by a validator that sees the static "
-                "findings for the same file; read it as corroborated by a second role, not "
-                "as an independent confirmation.",
-                "A candidate groups findings that name the same lines and category; it does "
-                "not assert that they describe the same defect.",
-            ],
+        "metrics": _metrics(
+            candidates,
+            uncorrelated={"static": uncorrelated.get("static", 0), "llm": uncorrelated.get("llm", 0)},
+            unscheduled=len(candidates),
+        ),
+    }
+
+
+def apply_verdicts(
+    assessment: dict[str, Any], verdicts: dict[str, dict[str, Any]], unscheduled: int
+) -> dict[str, Any]:
+    """Attach the validator's verdicts and recompute every metric.
+
+    ``verdicts`` maps a candidate id to the verdict block to file under it
+    (label, confidence, decisive line, rationale, provenance); ``unscheduled``
+    is how many candidates the validator never dispatched.  Candidates are
+    never removed and a candidate with no new verdict keeps whatever it had,
+    so a second ``assess`` extends the first rather than replacing it.
+    """
+    candidates = []
+    for candidate in assessment.get("candidates", []):
+        verdict = verdicts.get(candidate["id"])
+        if verdict is None:
+            candidates.append(candidate)
+            continue
+        detected_by = dict(candidate.get("detected_by") or {})
+        validators = [name for name in detected_by.get("validators", []) if name != VALIDATOR]
+        detected_by["validators"] = [*validators, VALIDATOR]
+        candidates.append({**candidate, "verdict": dict(verdict), "detected_by": detected_by})
+    previous = dict(assessment.get("metrics", {}))
+    return {
+        **assessment,
+        "candidates": candidates,
+        "metrics": _metrics(
+            candidates, uncorrelated=dict(previous.get("uncorrelated", {})), unscheduled=int(unscheduled),
+        ),
+    }
+
+
+def carry_verdicts(fresh: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    """Re-attach the verdicts of an earlier assessment to a regenerated one.
+
+    ``recover-report`` rebuilds the correlation from the review, which is
+    deterministic and cheap; the verdicts were bought with model time and
+    must survive that rebuild.  Candidates are matched on ``key``, which is
+    stable across runs, never on the ordinal id.
+    """
+    if not isinstance(previous, dict):
+        return fresh
+    by_key = {
+        candidate.get("key"): candidate["verdict"]
+        for candidate in previous.get("candidates", [])
+        if isinstance(candidate, dict) and isinstance(candidate.get("verdict"), dict)
+    }
+    verdicts = {
+        candidate["id"]: by_key[candidate["key"]]
+        for candidate in fresh.get("candidates", [])
+        if candidate.get("key") in by_key
+    }
+    if not verdicts:
+        return fresh
+    unscheduled = int((previous.get("metrics") or {}).get("validation_unscheduled", 0))
+    return apply_verdicts(fresh, verdicts, unscheduled)
+
+
+def _metrics(
+    candidates: list[dict[str, Any]], *, uncorrelated: dict[str, int], unscheduled: int
+) -> dict[str, Any]:
+    by_origin = Counter(candidate["origin"] for candidate in candidates)
+    labelled = [
+        (candidate["origin"], candidate["verdict"]["label"])
+        for candidate in candidates
+        if isinstance(candidate.get("verdict"), dict)
+    ]
+    by_verdict = Counter(label for _origin, label in labelled)
+    by_origin_verdict = Counter(labelled)
+    validated = len(labelled)
+    total = len(candidates)
+    if validated:
+        caveat_ids = ["validator_ran", "validator_sees_static", "grouping_not_identity"]
+        first = (
+            f"A validator has run: {validated} of {total} candidates carry a verdict and "
+            f"{total - validated} do not ({unscheduled} were never scheduled, by the "
+            f"validation_max_candidates cap or the token budget). The validator saw the "
+            f"static findings for the same file."
+        )
+    else:
+        caveat_ids = ["no_validator", "validator_sees_static", "grouping_not_identity"]
+        first = (
+            "No validator has run: every verdict count is zero and unvalidated equals "
+            "candidates_total. Run `code-analyzer assess` to add verdicts."
+        )
+    return {
+        "candidates_total": total,
+        "by_origin": {origin: by_origin.get(origin, 0) for origin in ORIGINS},
+        "by_verdict": {label: by_verdict.get(label, 0) for label in VERDICT_LABELS},
+        "by_origin_verdict": {
+            origin: {label: by_origin_verdict.get((origin, label), 0) for label in VERDICT_LABELS}
+            for origin in ORIGINS
         },
+        "llm_only_confirmed": by_origin_verdict.get(("llm-only", "CONFIRMED"), 0),
+        "llm_only_confirmed_or_likely": (
+            by_origin_verdict.get(("llm-only", "CONFIRMED"), 0)
+            + by_origin_verdict.get(("llm-only", "LIKELY"), 0)
+        ),
+        "static_only_false_positive": by_origin_verdict.get(("static-only", "FALSE_POSITIVE"), 0),
+        "validated": validated,
+        "unvalidated": total - validated,
+        "validation_unscheduled": unscheduled,
+        "uncorrelated": {"static": int(uncorrelated.get("static", 0)), "llm": int(uncorrelated.get("llm", 0))},
+        # Ids let a viewer localise the sentences; the English text is the
+        # machine-readable record and what a non-localising reader sees.
+        "caveat_ids": caveat_ids,
+        "caveats": [
+            first,
+            "llm_only_confirmed is produced by a validator that sees the static findings "
+            "for the same file; read it as corroborated by a second role, not as an "
+            "independent confirmation.",
+            "A candidate groups findings that name the same lines and category; it does "
+            "not assert that they describe the same defect.",
+        ],
     }
 
 

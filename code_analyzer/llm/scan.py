@@ -530,24 +530,11 @@ class _Phase:
                 else self.open_runtime(producer, unit_id, settings)
             )
             with runtime as active:
-                record = run_unit(
-                    active,
-                    run_dir=self.run_dir,
-                    producer=producer,
-                    unit_id=unit_id,
-                    prompt=prompt,
-                    unit_sha256=str(unit["unit_sha256"]),
-                    skill_version=skill.skill_version,
-                    input_files=[unit["path"]],
-                    settings=settings,
-                    cache={
-                        "hit": cached is not None,
-                        "key": key,
-                        "source_run": (cached or {}).get("source_run"),
-                    },
-                    cancelled=self.is_cancelled,
-                    on_event=self._forward(producer, unit_id),
-                )
+                record = self._session(active, task, prompt, settings, {
+                    "hit": cached is not None,
+                    "key": key,
+                    "source_run": (cached or {}).get("source_run"),
+                })
         except Exception as exc:
             record = self._unstarted(task, "failed", f"scanner failure: {type(exc).__name__}: {exc}")
         finally:
@@ -608,6 +595,31 @@ class _Phase:
 
     def is_cancelled(self) -> bool:
         return self._cancel.is_set() or (self.cancelled is not None and self.cancelled())
+
+    def _session(
+        self,
+        active: Any,
+        task: Task,
+        prompt: str,
+        settings: dict[str, Any],
+        cache: dict[str, Any],
+    ) -> dict[str, Any]:
+        """One session over one task; the validator swaps in its own subject."""
+        _index, producer, unit = task
+        return run_unit(
+            active,
+            run_dir=self.run_dir,
+            producer=producer,
+            unit_id=unit["unit_id"],
+            prompt=prompt,
+            unit_sha256=str(unit["unit_sha256"]),
+            skill_version=self.skills[producer].skill_version,
+            input_files=[unit["path"]],
+            settings=settings,
+            cache=cache,
+            cancelled=self.is_cancelled,
+            on_event=self._forward(producer, unit["unit_id"]),
+        )
 
     def _runtime(self, producer: str, unit_id: str, settings: dict[str, Any]) -> ContextManager[Any]:
         # One runtime per unit: the scanned repository is untrusted input, so
