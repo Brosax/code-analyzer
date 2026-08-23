@@ -290,7 +290,7 @@ cost = "cpu-bound"               # cpu-bound | network-bound
                             "authority": "non-authoritative-derived-opinion"
 ```
 
-用户已决定（D1）：**P2 修订 README:9-11**，措辞改为"证据层永不合并、永不判误报；
+用户已决定（D1，时点后改为 P1，**已于 P1 完成**）：修订 README:9-11，措辞改为"证据层永不合并、永不判误报；
 可选的审计层可以提出关联、置信标签与修复提示，明确非权威，不改变也不删除任何证据行，
 不影响退出码"。`recommendation` 做，但只在 candidate 上。
 

@@ -2,13 +2,21 @@
 
 `code-analyzer` is a Python 3.11+ command-line runner for evidence-first C/C++
 static analysis on WSL. One invocation discovers and hashes source files, runs
-Cppcheck, Flawfinder, and Splint, retains their native reports, writes a
-versioned JSON manifest, a non-authoritative normalized review, a complete
-offline dashboard, and a path-redacted ZIP.
+Cppcheck, Flawfinder, and Splint — and, when enabled, LLM specialist scanners
+that review the same code independently — retains their native reports,
+writes a versioned JSON manifest, a non-authoritative normalized review, a
+complete offline dashboard, and a path-redacted ZIP.
 
-It does not install tools, invoke a build, watch files, merge findings, decide
-whether a report is a false positive, or suggest fixes. Normalized severities
-are versioned derived metadata; native tool severities are retained.
+It does not install tools, invoke a build, or watch files. The evidence layer
+(`review/summary.json`) never merges findings and never decides that a report
+is a false positive: every producer's finding stays its own row with its native
+severity retained; normalized severities are versioned derived metadata.
+
+A separate, optional audit layer (`audit/assessment.json`) may group findings
+from different producers that name the same lines, attach confidence labels to
+those groups, and carry remediation hints. It is model-assisted opinion,
+explicitly non-authoritative: it never alters or removes an evidence row, is
+excluded from the quality gate, and cannot change the exit code.
 
 ## Install and check the host
 
