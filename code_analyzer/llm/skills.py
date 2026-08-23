@@ -72,13 +72,29 @@ def parse_skill(text: str, *, origin: str = "<string>") -> Skill:
     )
 
 
-def skill_names() -> tuple[str, ...]:
-    """Names of the packaged skills, in producer order."""
+SCANNER_ROLE = "scanner"
+VALIDATOR_ROLE = "validator"
+VALIDATOR_SKILL = "llm-validator"
+
+
+def skill_role(name: str) -> str:
+    """A skill's role from its frontmatter; a scanner unless it says otherwise."""
+    return str(load_skill(name).metadata.get("role") or SCANNER_ROLE)
+
+
+def skill_names(role: str = SCANNER_ROLE) -> tuple[str, ...]:
+    """Names of the packaged skills with ``role``, in producer order.
+
+    Scanners are first-layer producers and must match LLM_PRODUCERS; a
+    validator is a second-layer role that never produces a review row, so it
+    is kept out of the producer registry by default.
+    """
     found = [
         entry.name for entry in _root().iterdir()
         if entry.is_dir() and (entry / SKILL_FILENAME).is_file()
     ]
-    return tuple(sorted(found, key=lambda name: (_producer_rank(name), name)))
+    ordered = tuple(sorted(found, key=lambda name: (_producer_rank(name), name)))
+    return tuple(name for name in ordered if skill_role(name) == role)
 
 
 def load_skill(name: str) -> Skill:

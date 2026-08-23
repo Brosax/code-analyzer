@@ -189,3 +189,26 @@ def test_skills_resolve_and_materialise_from_a_zip_install(tmp_path, monkeypatch
     with skills_directory() as staged:
         assert isinstance(staged, Path)
         assert (staged / LLM_PRODUCERS[0] / SKILL_FILENAME).is_file()
+
+
+def test_the_validator_is_a_role_not_a_producer() -> None:
+    from code_analyzer.llm.skills import (
+        VALIDATOR_ROLE,
+        VALIDATOR_SKILL,
+        load_skill,
+        skill_names,
+        skill_role,
+    )
+
+    # Never offered as a first-layer scanner, never in PRODUCER_ORDER.
+    assert VALIDATOR_SKILL not in skill_names()
+    assert skill_names(VALIDATOR_ROLE) == (VALIDATOR_SKILL,)
+    assert skill_role(VALIDATOR_SKILL) == VALIDATOR_ROLE
+    skill = load_skill(VALIDATOR_SKILL)
+    assert skill.metadata["verdicts"] == ["CONFIRMED", "LIKELY", "UNCERTAIN", "FALSE_POSITIVE"]
+    # The second layer is shown the static results by design; it must still
+    # treat code and findings as data, and it must not reach a shell.
+    assert "untrusted input" in skill.body
+    assert "shell" not in " ".join(skill.metadata.get("allowed-tools", []))
+    # Disagreement or agreement between producers is not a verdict.
+    assert "not** confirmed by their" in skill.body or "not confirmed by their" in skill.body
