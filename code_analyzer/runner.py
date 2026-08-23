@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from . import __version__
 from .analysis import AnalysisEvent, CancellationToken, EventSink
+from .audit import assessment_summary, build_assessment, write_assessment
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
 from .doctor import verify_canary
@@ -157,6 +158,7 @@ def _analyze(
             "error": None,
         },
         "gate": {"policy": config["review"]["fail_on"], "triggered": False},
+        "audit": {"status": "pending" if config["review"]["enabled"] else "disabled", "path": None, "error": None},
         "artifacts": [],
     }
     _save_manifest(run_dir, manifest)
@@ -332,6 +334,17 @@ def _analyze(
                 manifest["gate"]["triggered"] = False
             _log(run_dir, f"review completed; {review_summary['total_findings']} findings")
             event("review", "finished", f"review completed; {review_summary['total_findings']} findings", value=0.92)
+            # Deterministic and zero-model, so it belongs on the spine: the
+            # static-only / llm-only / both split is available without assess.
+            try:
+                assessment = build_assessment(review_summary)
+                write_assessment(run_dir, assessment)
+            except Exception as exc:
+                manifest["audit"] = {"status": "failed", "error": str(exc), "path": None}
+                _log(run_dir, f"correlation failed: {exc}")
+            else:
+                manifest["audit"] = {**assessment_summary(assessment), "error": None}
+                _log(run_dir, f"correlation completed; {manifest['audit']['candidates']} candidates")
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     if manifest["exit_code"] == 0 and review_summary is not None and should_fail(review_summary, config["review"]["fail_on"]):

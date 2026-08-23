@@ -6,6 +6,7 @@ optional extra nor a network.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -169,7 +170,14 @@ def scan(tmp_path: Path, settings: dict[str, object], **overrides: object) -> tu
 
 
 def test_importing_the_package_does_not_import_the_sdk() -> None:
-    assert "deepseek_harness" not in sys.modules
+    # In a fresh interpreter: an in-process sys.modules check only measures
+    # which tests happened to run first.
+    probe = (
+        "import sys, code_analyzer, code_analyzer.runner, code_analyzer.harness, code_analyzer.llm.scan; "
+        "print('deepseek_harness' in sys.modules)"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "False"
 
 
 def test_missing_sdk_reports_actionable_user_error(monkeypatch: pytest.MonkeyPatch, settings) -> None:

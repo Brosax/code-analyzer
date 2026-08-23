@@ -1267,32 +1267,59 @@ def _finding_category(item: dict[str, Any]) -> str:
     return f"CWE-{cwe}" if cwe is not None else "unknown"
 
 
+def group_nearby(
+    findings: list[dict[str, Any]],
+    *,
+    key_fn: Callable[[dict[str, Any]], tuple[str, str] | None],
+    distance: int = OVERLAP_LINE_DISTANCE,
+) -> list[tuple[tuple[str, str], list[dict[str, Any]]]]:
+    """Cluster findings that share a key and sit within ``distance`` lines.
+
+    The one grouping primitive both the frozen static ``overlap_groups`` and the
+    audit layer's cross-engine correlator are built on.  ``key_fn`` returns
+    ``(canonical_path, category)`` or ``None`` to leave a finding out; a
+    category of ``unknown`` collapses the distance to zero, because findings
+    that could not be classified only coincide when they name the same line.
+    """
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for item in findings:
+        if not item.get("canonical_path") or _line_number(item.get("line")) >= 2**31 - 1:
+            continue
+        key = key_fn(item)
+        if key is not None:
+            grouped[key].append(item)
+    clusters: list[tuple[tuple[str, str], list[dict[str, Any]]]] = []
+    for key, items in sorted(grouped.items()):
+        items.sort(key=lambda item: (_line_number(item["line"]), _producer_rank(item["tool"])))
+        reach = distance if key[1] != "unknown" else 0
+        current: list[dict[str, Any]] = []
+        first_line: int | None = None
+        for item in items:
+            line = _line_number(item["line"])
+            if current and first_line is not None and line - first_line > reach:
+                clusters.append((key, current))
+                current, first_line = [], None
+            if not current:
+                first_line = line
+            current.append(item)
+        if current:
+            clusters.append((key, current))
+    return clusters
+
+
 def _build_overlap_groups(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Design 6.1 freezes this key to native tools.  Cross-engine correlation is
     # the audit layer's job and gets its own artifact; letting an LLM finding
     # join a static cluster here would silently move a frozen group's line span
     # and fingerprint list on any mixed run.
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    for item in findings:
+    def native_key(item: dict[str, Any]) -> tuple[str, str] | None:
         if item.get("tool") not in TOOL_NAMES:
-            continue
-        if item["canonical_path"] and _line_number(item.get("line")) < 2**31 - 1:
-            grouped[(item["canonical_path"], _finding_category(item))].append(item)
-    result = []
-    for (path, category), items in sorted(grouped.items()):
-        items.sort(key=lambda item: (_line_number(item["line"]), _producer_rank(item["tool"])))
-        distance = OVERLAP_LINE_DISTANCE if category != "unknown" else 0
-        current: list[dict[str, Any]] = []
-        first_line: int | None = None
-        for item in items:
-            line = _line_number(item["line"])
-            if current and first_line is not None and line - first_line > distance:
-                _emit_overlap(result, path, category, current)
-                current, first_line = [], None
-            if not current:
-                first_line = line
-            current.append(item)
-        _emit_overlap(result, path, category, current)
+            return None
+        return (item["canonical_path"], _finding_category(item))
+
+    result: list[dict[str, Any]] = []
+    for (path, category), items in group_nearby(findings, key_fn=native_key):
+        _emit_overlap(result, path, category, items)
     return result
 
 

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .audit import assessment_summary, build_assessment
 from .config import DEFAULTS, load_config, validate_config
 from .errors import UserError
 from .html_report import render
@@ -48,6 +49,8 @@ def recover_report(report_directory: Path) -> Path:
     max_findings = int(config["review"]["max_markdown_findings"])
     review_json = json_bytes(review)
     review_markdown = markdown_report(review, max_findings).encode("utf-8")
+    assessment = build_assessment(review)
+    assessment_json = json_bytes(assessment)
     recovered = copy.deepcopy(manifest)
     recovered["review"] = {
         **recovered.get("review", {}),
@@ -88,6 +91,8 @@ def recover_report(report_directory: Path) -> Path:
         artifacts = artifact_index(report_directory)
         artifacts = _replace_artifact(artifacts, "review/summary.json", review_json)
         artifacts = _replace_artifact(artifacts, "review/summary.md", review_markdown)
+        artifacts = _replace_artifact(artifacts, "audit/assessment.json", assessment_json)
+        recovered["audit"] = {**assessment_summary(assessment), "error": None}
         render_manifest = copy.deepcopy(recovered)
         render_manifest["artifacts"] = [item for item in artifacts if item.get("path") != "index.html"]
         index_bytes = render(render_manifest, review).encode("utf-8")
@@ -96,7 +101,7 @@ def recover_report(report_directory: Path) -> Path:
         recovered["recovery"]["derived_artifacts"] = [
             item for item in artifacts
             if item.get("path") in {
-                "review/summary.json", "review/summary.md", "index.html",
+                "review/summary.json", "review/summary.md", "audit/assessment.json", "index.html",
                 archive.relative_to(report_directory).as_posix(),
             }
         ]
@@ -104,6 +109,7 @@ def recover_report(report_directory: Path) -> Path:
         _replace_transaction(report_directory, {
             report_directory / "review" / "summary.json": review_json,
             report_directory / "review" / "summary.md": review_markdown,
+            report_directory / "audit" / "assessment.json": assessment_json,
             report_directory / "index.html": index_bytes,
             manifest_path: manifest_bytes,
         })
