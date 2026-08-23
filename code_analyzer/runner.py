@@ -14,7 +14,12 @@ from typing import Any, Callable
 
 from . import __version__
 from .analysis import AnalysisEvent, CancellationToken, EventSink
-from .audit import assessment_summary, build_assessment, write_assessment
+from .audit import (
+    assessment_summary,
+    build_assessment,
+    load_assessment,
+    write_assessment,
+)
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
 from .doctor import verify_canary
@@ -386,7 +391,7 @@ def _analyze(
         manifest["export"].update({"status": "failed", "archive": None, "error": "run interrupted"})
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
-    (run_dir / "index.html").write_text(render(manifest, review_summary), encoding="utf-8")
+    (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
     manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     _save_manifest(run_dir, manifest)
     try:
@@ -397,7 +402,7 @@ def _analyze(
             manifest["status"], manifest["exit_code"] = "partial", 10
             manifest["gate"]["triggered"] = False
         manifest["publication_error"] = str(exc)
-        (run_dir / "index.html").write_text(render(manifest, review_summary), encoding="utf-8")
+        (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
         manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
         _save_manifest(run_dir, manifest)
         progress("latest.json publication failed; unique run evidence was retained")

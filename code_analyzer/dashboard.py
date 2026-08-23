@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .audit import load_assessment
 from .errors import UserError
 from .html_report import render
 from .persist import json_bytes, manifest_structure_problem
@@ -46,7 +47,7 @@ def rebuild_dashboard(report_directory: Path) -> Path:
         render_manifest["artifacts"] = [
             item for item in artifacts if item.get("path") != "index.html"
         ]
-        index_bytes = render(render_manifest, review).encode("utf-8")
+        index_bytes = render(render_manifest, review, load_assessment(report_directory)).encode("utf-8")
         updated_manifest = dict(manifest)
         updated_manifest["artifacts"] = _updated_artifacts(artifacts, index_bytes)
         manifest_bytes = json_bytes(updated_manifest)

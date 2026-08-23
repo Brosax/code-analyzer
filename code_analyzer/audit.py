@@ -13,6 +13,7 @@ model and lives behind the separate ``assess`` command.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from pathlib import Path
@@ -137,6 +138,9 @@ def build_assessment(review: dict[str, Any]) -> dict[str, Any]:
             "unvalidated": len(candidates),
             "validation_unscheduled": len(candidates),
             "uncorrelated": {"static": uncorrelated.get("static", 0), "llm": uncorrelated.get("llm", 0)},
+            # Ids let a viewer localise the sentences; the English text is the
+            # machine-readable record and what a non-localising reader sees.
+            "caveat_ids": ["no_validator", "validator_sees_static", "grouping_not_identity"],
             "caveats": [
                 "No validator has run: every verdict count is zero and unvalidated equals "
                 "candidates_total. Run `code-analyzer assess` to add verdicts.",
@@ -155,6 +159,24 @@ def write_assessment(run_dir: Path, assessment: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, assessment)
     return path
+
+
+def load_assessment(run_dir: Path) -> dict[str, Any] | None:
+    """The assessment beside a run, or ``None`` when absent or unreadable.
+
+    Opinion is optional: a dashboard must render without it, so a missing or
+    corrupt file is not an error here.
+    """
+    path = Path(run_dir).joinpath(*ASSESSMENT_PATH)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or document.get("assessment_schema_version") != ASSESSMENT_SCHEMA_VERSION:
+        return None
+    if not isinstance(document.get("candidates"), list) or not isinstance(document.get("metrics"), dict):
+        return None
+    return document
 
 
 def assessment_summary(assessment: dict[str, Any]) -> dict[str, Any]:

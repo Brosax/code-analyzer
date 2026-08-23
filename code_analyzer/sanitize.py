@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable
 
+from .audit import load_assessment
 from .config import effective_toml
 from .html_report import render
 from .persist import manifest_structure_problem, write_json
@@ -228,7 +229,10 @@ def export_shareable(
                 markdown_report(safe_review, int(config["review"]["max_markdown_findings"])), encoding="utf-8"
             )
         # Core HTML is regenerated exclusively from validated structured data.
-        (staging / "index.html").write_text(render(safe_manifest, safe_review), encoding="utf-8")
+        safe_assessment = load_assessment(run_dir)
+        if safe_assessment is not None:
+            safe_assessment = redactor.json_value(safe_assessment)
+        (staging / "index.html").write_text(render(safe_manifest, safe_review, safe_assessment), encoding="utf-8")
         safe_config = redactor.json_value(config)
         target_config = staging / "inputs" / "effective-config.toml"
         target_config.parent.mkdir(parents=True, exist_ok=True)

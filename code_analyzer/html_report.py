@@ -69,7 +69,11 @@ def embedded_findings(findings: list[Any], cap: int) -> list[Any]:
     return kept
 
 
-def render(manifest: dict[str, Any], review: dict[str, Any] | None = None) -> str:
+def render(
+    manifest: dict[str, Any],
+    review: dict[str, Any] | None = None,
+    assessment: dict[str, Any] | None = None,
+) -> str:
     data = dict(review or {
         "review_schema_version": 3, "findings": [], "diagnostics": [],
         "tools": manifest.get("tools", {}),
@@ -84,8 +88,28 @@ def render(manifest: dict[str, Any], review: dict[str, Any] | None = None) -> st
     if isinstance(findings, list) and len(findings) > MAX_EMBED_FINDINGS:
         data["findings"] = embedded_findings(findings, MAX_EMBED_FINDINGS)
         data["findings_omitted"] = len(findings) - len(data["findings"])
+    if isinstance(assessment, dict):
+        candidates = assessment.get("candidates")
+        embedded = dict(assessment)
+        if isinstance(candidates, list) and len(candidates) > MAX_EMBED_FINDINGS:
+            embedded["candidates"] = embedded_candidates(candidates, MAX_EMBED_FINDINGS)
+            embedded["candidates_omitted"] = len(candidates) - len(embedded["candidates"])
+        data["assessment"] = embedded
     data["execution_manifest"] = manifest
     return _TEMPLATE.replace("__CODE_ANALYZER_DATA__", _json_for_html(data))
+
+
+def embedded_candidates(candidates: list[Any], cap: int) -> list[Any]:
+    """Take at most ``cap`` candidates, keeping the cross-engine ones first.
+
+    The static-only majority is what a cap would otherwise be spent on, and
+    the llm-only / both candidates are the reason the section exists.
+    """
+    if cap <= 0 or len(candidates) <= cap:
+        return list(candidates[: max(0, cap)])
+    priority = [item for item in candidates if isinstance(item, dict) and item.get("origin") != "static-only"]
+    rest = [item for item in candidates if item not in priority]
+    return (priority + rest)[:cap]
 
 
 # Palette note: the severity and review-level hues below were validated for
@@ -255,6 +279,15 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.02rem;margin:0 0 .6rem}
 .badge.ok{color:var(--ok);border-color:var(--ok)}
 .badge.warn{color:var(--warn);border-color:var(--warn)}
 .badge.bad{color:var(--bad);border-color:var(--bad)}
+.badge.sev-critical{color:var(--sev-critical);border-color:var(--sev-critical)}
+.badge.sev-high{color:var(--sev-high);border-color:var(--sev-high)}
+.badge.sev-medium{color:var(--sev-medium);border-color:var(--sev-medium)}
+.badge.sev-low{color:var(--sev-low);border-color:var(--sev-low)}
+.badge.sev-info{color:var(--sev-info);border-color:var(--sev-info)}
+.badge.sev-unknown{color:var(--sev-unknown);border-color:var(--sev-unknown)}
+.badge.origin-static{color:var(--muted);border-color:var(--line)}
+.badge.origin-llm{color:var(--bar-build);border-color:var(--bar-build)}
+.badge.origin-both{color:var(--ok);border-color:var(--ok)}
 .tool-values{display:grid;grid-template-columns:auto 1fr;gap:.15rem .8rem;margin:.7rem 0 0}
 .tool-values dt{color:var(--muted);font-size:.88rem}
 .tool-values dd{margin:0;font-family:var(--mono);font-size:.9rem}
@@ -415,6 +448,22 @@ _JS_MAIN = r"""
       page_status: "{results} 条结果 · 第 {page}/{pages} 页",
       context_notice: "默认展示构建感知证据。另有 {n} 条仅源码发现可通过上下文筛选查看。",
       unknown_source: "未知源",
+      sec_assessment: "跨引擎关联（非权威）",
+      assessment_authority: "本节为模型辅助的派生意见：候选只按指纹引用证据行，不改变也不删除任何发现，不影响退出码。",
+      card_candidates: "候选", card_llm_only: "仅 LLM 发现", card_both: "静态 + LLM 共同发现",
+      card_static_only: "仅静态发现", card_uncorrelated: "未关联（无行号）· 静态 / LLM",
+      chart_origin_comp: "各来源的严重度构成",
+      legend_static_only: "仅静态", legend_llm_only: "仅 LLM", legend_both: "共同",
+      filter_origin: "来源", opt_all_origins: "全部来源",
+      th_candidate: "候选", th_origin: "来源", th_sources: "来源 producer", th_members: "成员",
+      candidate_view: "查看成员", candidates_n: "{n} 个候选",
+      no_assessment: "本次运行没有生成关联结果（review 未启用，或 audit/assessment.json 缺失）。",
+      no_candidates: "没有可关联的发现。",
+      candidates_omitted: "另有 {n} 个候选未嵌入本页面；完整数据见 audit/assessment.json。",
+      caveat_unvalidated: "尚未运行 validator：所有候选均未核验。",
+      caveat_no_validator: "尚未运行 validator：所有判定计数为零，未核验数等于候选总数。运行 `code-analyzer assess` 可添加判定。",
+      caveat_validator_sees_static: "llm_only_confirmed 将由能看到同一文件静态结果的 validator 产出；应理解为“被第二个角色佐证”，而非独立确认。",
+      caveat_grouping_not_identity: "候选只是把指向相同行与类别的发现分到一组，并不断言它们描述的是同一个缺陷。",
     },
     en: {
       report_title: "Static Analysis Evidence Report",
@@ -477,6 +526,22 @@ _JS_MAIN = r"""
       page_status: "{results} results · page {page}/{pages}",
       context_notice: "Showing build-aware evidence by default. {n} source-only finding(s) remain available in the Context filter.",
       unknown_source: "Unknown source",
+      sec_assessment: "Cross-engine correlation (non-authoritative)",
+      assessment_authority: "Model-assisted derived opinion: candidates reference evidence rows by fingerprint and never alter, remove, or gate any finding.",
+      card_candidates: "Candidates", card_llm_only: "LLM-only", card_both: "Static + LLM",
+      card_static_only: "Static-only", card_uncorrelated: "Uncorrelated (no line) · static / LLM",
+      chart_origin_comp: "Severity composition by origin",
+      legend_static_only: "Static-only", legend_llm_only: "LLM-only", legend_both: "Both",
+      filter_origin: "Origin", opt_all_origins: "All origins",
+      th_candidate: "Candidate", th_origin: "Origin", th_sources: "Producers", th_members: "Members",
+      candidate_view: "View members", candidates_n: "{n} candidate(s)",
+      no_assessment: "No correlation was produced for this run (review disabled, or audit/assessment.json missing).",
+      no_candidates: "No findings could be correlated.",
+      candidates_omitted: "{n} more candidate(s) are not embedded in this page; see audit/assessment.json.",
+      caveat_unvalidated: "No validator has run: every candidate is unvalidated.",
+      caveat_no_validator: "No validator has run: every verdict count is zero and unvalidated equals candidates_total. Run `code-analyzer assess` to add verdicts.",
+      caveat_validator_sees_static: "llm_only_confirmed will be produced by a validator that sees the static findings for the same file; read it as corroborated by a second role, not as an independent confirmation.",
+      caveat_grouping_not_identity: "A candidate groups findings that name the same lines and category; it does not assert that they describe the same defect.",
     },
   };
   let lang = "zh";
@@ -563,6 +628,8 @@ _JS_MAIN = r"""
   }
   const contextSeries = [["build-aware", "legend_build"], ["source-only", "legend_source"]];
   const engineSeries = [["static", "legend_static"], ["llm", "legend_llm"]];
+  const originSeries = [["static-only", "legend_static_only"], ["llm-only", "legend_llm_only"], ["both", "legend_both"]];
+  const assessment = review.assessment && typeof review.assessment === "object" ? review.assessment : null;
   const byEngine = key => ({
     static: countBy(findings.filter(x => x.engine === "static"), key),
     llm: countBy(findings.filter(x => x.engine === "llm"), key),
@@ -970,6 +1037,90 @@ _JS_MAIN = r"""
     if (!body.childNodes.length) tableEmpty(body, 5, t("no_overlap"));
   };
 
+  /* ---------- cross-engine correlation (audit layer) ---------- */
+  const originTone = o => ({ "static-only": "origin-static", "llm-only": "origin-llm", "both": "origin-both" }[o] || "");
+  const renderAssessment = () => {
+    const cards = id("assessment-cards");
+    const body = id("candidate-body");
+    const count = id("candidate-count");
+    const notice = id("assessment-notice");
+    cards.replaceChildren(); body.replaceChildren(); notice.replaceChildren();
+    count.textContent = "";
+    if (!assessment) {
+      tableEmpty(body, 7, t("no_assessment"));
+      id("origin-comp").replaceChildren(make("p", "empty", t("no_data")));
+      return;
+    }
+    const metrics = assessment.metrics || {};
+    const byOrigin = metrics.by_origin || {};
+    const candidates = Array.isArray(assessment.candidates) ? assessment.candidates : [];
+    const stat = (labelKey, node) => {
+      const cell = make("article", "stat");
+      cell.append(make("span", "lbl", t(labelKey)), node);
+      cards.append(cell);
+    };
+    stat("card_candidates", make("strong", "", number(metrics.candidates_total || 0)));
+    // The headline number and its caveat are one tile: the number must never
+    // be read without the sentence that qualifies it.
+    const headline = make("div");
+    headline.append(make("strong", "", number(byOrigin["llm-only"] || 0)));
+    headline.append(make("span", "muted", " " + t("caveat_unvalidated")));
+    stat("card_llm_only", headline);
+    stat("card_both", make("strong", "", number(byOrigin["both"] || 0)));
+    stat("card_static_only", make("strong", "", number(byOrigin["static-only"] || 0)));
+    const unc = metrics.uncorrelated || {};
+    stat("card_uncorrelated", make("strong", "", number(unc.static || 0) + " / " + number(unc.llm || 0)));
+
+    notice.append(make("p", "", t("assessment_authority")));
+    const caveatIds = Array.isArray(metrics.caveat_ids) ? metrics.caveat_ids : [];
+    const caveatTexts = Array.isArray(metrics.caveats) ? metrics.caveats : [];
+    caveatTexts.forEach((text, index) => {
+      const key = "caveat_" + String(caveatIds[index] || "");
+      notice.append(make("p", "muted", caveatIds[index] && I18N[lang][key] ? t(key) : String(text)));
+    });
+    if (assessment.candidates_omitted) notice.append(make("p", "muted", fmt("candidates_omitted", { n: number(assessment.candidates_omitted) })));
+
+    const sevByOrigin = {};
+    originSeries.forEach(([key]) => { sevByOrigin[key] = {}; });
+    candidates.forEach(c => {
+      const bucket = sevByOrigin[c.origin] || (sevByOrigin[c.origin] = {});
+      const sev = sevOrder.includes(c.severity) ? c.severity : "unknown";
+      bucket[sev] = (bucket[sev] || 0) + 1;
+    });
+    compPanel("origin-comp", sevByOrigin, sevOrder, sevTone, originSeries);
+
+    const wanted = id("origin").value;
+    const shown = candidates.filter(c => !wanted || c.origin === wanted);
+    count.textContent = fmt("candidates_n", { n: number(shown.length) });
+    shown.forEach(c => {
+      const tr = make("tr");
+      const action = make("td");
+      const button = make("button", "", t("candidate_view"));
+      button.onclick = () => {
+        state.fingerprints = new Set(c.member_fingerprints || []);
+        state.page = 1;
+        renderFindings();
+        window.location.hash = "findings";
+      };
+      action.append(button);
+      const origin = make("td");
+      origin.append(make("span", "badge " + originTone(c.origin), c.origin));
+      const sev = make("td");
+      sev.append(make("span", "badge sev-" + (sevOrder.includes(c.severity) ? c.severity : "unknown"), c.severity || "unknown"));
+      tr.append(
+        make("td", "mono", c.id),
+        origin,
+        make("td", "loc", c.canonical_path + ":" + (c.line_start === c.line_end ? c.line_start : c.line_start + "-" + c.line_end)),
+        make("td", "", c.category),
+        sev,
+        make("td", "", (c.sources || []).join(", ")),
+        make("td", "", number((c.member_fingerprints || []).length)),
+        action);
+      body.append(tr);
+    });
+    if (!body.childNodes.length) tableEmpty(body, 8, t("no_candidates"));
+  };
+
   /* ---------- diagnostics ---------- */
   const renderDiagnostics = () => {
     id("diagnostic-count").textContent = fmt("diag_n", { n: number((review.diagnostics || []).length) });
@@ -1106,7 +1257,9 @@ _JS_MAIN = r"""
     renderDiagnostics();
     renderContextNotice();
     renderFindings();
+    renderAssessment();
   };
+  id("origin").onchange = () => renderAssessment();
   id("lang-toggle").onclick = () => {
     lang = lang === "zh" ? "en" : "zh";
     try {
@@ -1146,6 +1299,7 @@ _HTML_BODY = r"""<div class="sheet">
 <a href="#overlap"><span class="sec-no">5</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></a>
 <a href="#diagnostics"><span class="sec-no">6</span><span data-i18n="sec_diagnostics">工具诊断</span></a>
 <a href="#findings"><span class="sec-no">7</span><span data-i18n="sec_findings">发现明细</span></a>
+<a href="#assessment"><span class="sec-no">8</span><span data-i18n="sec_assessment">跨引擎关联（非权威）</span></a>
 </nav>
 <main>
 <p class="notice" data-i18n="disclaimer">派生的 findings 不具权威性。请对照其链接的原生工具报告与实际的构建配置逐条确认。</p>
@@ -1267,6 +1421,33 @@ _HTML_BODY = r"""<div class="sheet">
 <button id="next" data-i18n="next">下一页</button>
 </span>
 </div>
+</section>
+<section id="assessment">
+<div class="section-head">
+<h2><span class="sec-no">§ 8</span><span data-i18n="sec_assessment">跨引擎关联（非权威）</span></h2>
+<span class="muted" id="candidate-count"></span>
+</div>
+<div class="notice" id="assessment-notice"></div>
+<div class="stats" id="assessment-cards"></div>
+<article class="chart"><h4 class="comp-cap" data-i18n="chart_origin_comp">各来源的严重度构成</h4><div id="origin-comp"></div></article>
+<div class="controls">
+<label class="control"><span data-i18n="filter_origin">来源</span><select id="origin">
+<option value="" data-i18n="opt_all_origins">全部来源</option>
+<option value="llm-only" data-i18n="legend_llm_only">仅 LLM</option>
+<option value="both" data-i18n="legend_both">共同</option>
+<option value="static-only" data-i18n="legend_static_only">仅静态</option>
+</select></label>
+</div>
+<div class="table-wrap"><table><thead><tr>
+<th data-i18n="th_candidate">候选</th>
+<th data-i18n="th_origin">来源</th>
+<th data-i18n="th_location">位置</th>
+<th data-i18n="th_category">类别</th>
+<th data-i18n="th_severity">规范化严重度</th>
+<th data-i18n="th_sources">来源 producer</th>
+<th data-i18n="th_members">成员</th>
+<th></th>
+</tr></thead><tbody id="candidate-body"></tbody></table></div>
 </section>
 </main>
 <noscript><p class="notice">需要启用 JavaScript;完整数据仍在 <a href="review/summary.json">review/summary.json</a> 中。JavaScript is required; the complete data remains in review/summary.json.</p></noscript>

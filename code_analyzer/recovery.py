@@ -95,7 +95,7 @@ def recover_report(report_directory: Path) -> Path:
         recovered["audit"] = {**assessment_summary(assessment), "error": None}
         render_manifest = copy.deepcopy(recovered)
         render_manifest["artifacts"] = [item for item in artifacts if item.get("path") != "index.html"]
-        index_bytes = render(render_manifest, review).encode("utf-8")
+        index_bytes = render(render_manifest, review, assessment).encode("utf-8")
         artifacts = _replace_artifact(artifacts, "index.html", index_bytes)
         recovered["artifacts"] = artifacts
         recovered["recovery"]["derived_artifacts"] = [
