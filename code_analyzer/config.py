@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
         "profile": "exhaustive",
         "shareable_export": True,
         "termination_grace_seconds": 5.0,
+        "events_file": "",
     },
     "source": {
         "include": ["**/*"],
@@ -81,8 +82,8 @@ DEFAULTS: dict[str, Any] = {
         "validation_max_candidates": 200,
     },
     "tools": {
-        "cppcheck": {"enabled": True, "executable": "cppcheck", "timeout_seconds": 7200.0},
-        "flawfinder": {"enabled": True, "executable": "flawfinder", "timeout_seconds": 1800.0},
+        "cppcheck": {"enabled": True, "executable": "cppcheck", "timeout_seconds": 7200.0, "heartbeat_seconds": 10.0},
+        "flawfinder": {"enabled": True, "executable": "flawfinder", "timeout_seconds": 1800.0, "heartbeat_seconds": 10.0},
         "splint": {
             "enabled": True,
             "executable": "splint",
@@ -119,6 +120,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("run.profile", "string", "运行配置", "固定为 exhaustive。", choices=("exhaustive",), readonly=True),
     FieldSpec("run.shareable_export", "bool", "生成可分享导出", "创建脱敏 ZIP 导出。"),
     FieldSpec("run.termination_grace_seconds", "float", "终止宽限（秒）", "发送 TERM 后等待 KILL 的时间。", minimum=0.001, advanced=True),
+    FieldSpec("run.events_file", "path", "事件日志文件", "运行级 events.jsonl 的位置；留空则写入 <运行目录>/events.jsonl。", advanced=True),
     FieldSpec("source.include", "list", "包含规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.exclude", "list", "排除规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.follow_symlinks", "bool", "跟随符号链接", "扫描符号链接指向的文件。", advanced=True),
@@ -167,9 +169,11 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("tools.cppcheck.enabled", "bool", "启用 Cppcheck", "运行 Cppcheck。"),
     FieldSpec("tools.cppcheck.executable", "string", "Cppcheck 可执行文件", "命令名或绝对路径。", advanced=True),
     FieldSpec("tools.cppcheck.timeout_seconds", "float", "Cppcheck 超时", "总超时秒数。", minimum=0.001, advanced=True),
+    FieldSpec("tools.cppcheck.heartbeat_seconds", "float", "Cppcheck 心跳", "长任务状态刷新间隔。", minimum=0.001, advanced=True),
     FieldSpec("tools.flawfinder.enabled", "bool", "启用 Flawfinder", "运行 Flawfinder。"),
     FieldSpec("tools.flawfinder.executable", "string", "Flawfinder 可执行文件", "命令名或绝对路径。", advanced=True),
     FieldSpec("tools.flawfinder.timeout_seconds", "float", "Flawfinder 超时", "总超时秒数。", minimum=0.001, advanced=True),
+    FieldSpec("tools.flawfinder.heartbeat_seconds", "float", "Flawfinder 心跳", "长任务状态刷新间隔。", minimum=0.001, advanced=True),
     FieldSpec("tools.splint.enabled", "bool", "启用 Splint", "运行 Splint。"),
     FieldSpec("tools.splint.executable", "string", "Splint 可执行文件", "命令名或绝对路径。", advanced=True),
     FieldSpec("tools.splint.tu_timeout_seconds", "float", "Splint 单元超时", "每个翻译单元的超时秒数。", minimum=0.001, advanced=True),
@@ -256,6 +260,8 @@ def _resolve_file_paths(data: dict[str, Any], base: Path) -> None:
     run = data.get("run", {})
     if "output_root" in run:
         run["output_root"] = str(_absolute(run["output_root"], base))
+    if run.get("events_file"):
+        run["events_file"] = str(_absolute(run["events_file"], base))
     build = data.get("build", {})
     if build.get("compile_database"):
         build["compile_database"] = str(_absolute(build["compile_database"], base))
@@ -314,6 +320,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     _expect(run["profile"], str, "run.profile")
     _expect(run["shareable_export"], bool, "run.shareable_export")
     _number(run["termination_grace_seconds"], "run.termination_grace_seconds")
+    _expect(run["events_file"], str, "run.events_file")
     for key in ("include", "exclude"):
         _string_list(src[key], f"source.{key}")
     _expect(src["follow_symlinks"], bool, "source.follow_symlinks")
@@ -340,17 +347,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise UserError("build.compile_database_mode must be auto, explicit, or disabled")
     if build["compile_database_mode"] == "explicit" and not build.get("compile_database"):
         raise UserError("explicit compile database mode requires build.compile_database")
-    for section in tools.values():
+    for name, section in tools.items():
         if not isinstance(section["enabled"], bool) or not isinstance(section["executable"], str):
             raise UserError("tool enabled and executable values have invalid types")
         for key, value in section.items():
-            if key.endswith("timeout_seconds"):
-                _number(value, key)
+            if key.endswith(("timeout_seconds", "heartbeat_seconds")):
+                _number(value, f"tools.{name}.{key}")
     splint = tools["splint"]
     if splint["scope"] not in {"auto", "build", "inventory"}:
         raise UserError("tools.splint.scope must be auto, build, or inventory")
     _positive_int(splint["jobs"], "tools.splint.jobs")
     run["output_root"] = str(_absolute(run["output_root"], Path.cwd()))
+    if run["events_file"]:
+        run["events_file"] = str(_absolute(run["events_file"], Path.cwd()))
     if build.get("compile_database"):
         build["compile_database"] = str(_absolute(build["compile_database"], Path.cwd()))
     build["include"] = [str(_absolute(p, Path.cwd())) for p in build["include"]]
@@ -494,6 +503,7 @@ def persistent_config(config: dict[str, Any], base: Path | None = None) -> dict[
     base = base.expanduser().resolve()
     path_fields = (
         "run.output_root",
+        "run.events_file",
         "build.compile_database",
     )
     list_fields = ("build.include", "build.system_include")

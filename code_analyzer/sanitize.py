@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from .audit import load_assessment
 from .config import effective_toml
+from .events import EVENTS_FILE
 from .html_report import render
 from .persist import manifest_structure_problem, write_json
 from .review import markdown_report
@@ -37,6 +38,10 @@ _SESSION_EXPORTED: tuple[str, ...] = ("findings.json",)
 EXCERPT_FIELDS: tuple[str, ...] = ("evidence",)
 EXCERPT_WITHHELD = "withheld: contains source excerpts; set [llm] export_sessions = true to include"
 _SYMBOL_TABLE = "llm/index.json"
+# The run-level event log is progress, not evidence: it carries host paths
+# and raw analyzer output lines, and is still being appended to after the
+# archive is sealed.  The manifest and native reports are the record.
+EVENT_LOG_REASON = "progress log, not evidence: contains host paths and analyzer output lines"
 
 # A credential is redacted as a literal value, not by pattern: the harness
 # formats arbitrary SDK exception text into unit reasons, and a pydantic
@@ -368,6 +373,9 @@ def _export_files(run_dir: Path, *, export_sessions: bool = False):
         if relative.parts[0] == "exports" or relative.as_posix() == "inputs/sanitizer-map.private.json":
             continue
         if "build" in relative.parts or "tmp" in relative.parts:
+            continue
+        if relative.as_posix() == EVENTS_FILE:
+            yield path, EVENT_LOG_REASON
             continue
         reason = None if export_sessions else _quotes_source(relative)
         if reason is not None:

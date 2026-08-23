@@ -847,3 +847,31 @@ def test_progress_stays_monotone_when_the_llm_phase_runs(
     # lower stability value; make sure both events are present in the sample.
     phases = [event.phase for event in config["_events"] if event.progress is not None]
     assert "llm" in phases and "stability" in phases
+
+
+def test_the_llm_phase_publishes_a_running_placeholder_that_never_survives_the_run(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str
+) -> None:
+    """manifest["llm"] flips from not_requested to a transient `running` record
+    before the phase starts, and is a final record by the time the run ends."""
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding())))
+    config = _config(tmp_path, closed_endpoint, cppcheck=_cppcheck(tmp_path))
+    snapshots: dict[str, dict[str, Any]] = {}
+    run_dir: list[Path] = []
+
+    def sink(event: Any) -> None:
+        if (event.phase, event.status) == ("run", "created"):
+            run_dir.append(Path(event.message))
+        if event.phase == "llm" and event.status in {"started", "completed"}:
+            manifest = json.loads((run_dir[0] / "manifest.json").read_text(encoding="utf-8"))
+            snapshots[event.status] = manifest["llm"]
+
+    result = run_analysis(AnalysisRequest(source, config), events=sink)
+
+    assert result.exit_code == 0 and result.manifest is not None
+    started = snapshots["started"]
+    assert started["status"] == "running" and started["requested"] is True and started["enabled"] is True
+    assert started["endpoint"] == closed_endpoint and started["planned_units"] == 0
+    assert result.manifest["llm"]["status"] == "completed"
+    assert "running" not in json.dumps(result.manifest["llm"])

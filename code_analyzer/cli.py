@@ -12,6 +12,7 @@ from .config import load_config
 from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
+from .events import JsonlEventSink, events_file
 from .llm.profiles import PROFILE_NAMES, third_party_warning
 from .recovery import recover_report
 from .runner import analyze
@@ -80,6 +81,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--llm-risk", action="append", metavar="PATTERN=TIER")
     run.add_argument("--llm-no-cache", action="store_true")
     run.add_argument("--termination-grace", type=_positive_float)
+    run.add_argument("--events-file", type=Path, metavar="PATH", help="write the run-level event log here instead of <run_dir>/events.jsonl")
     run.add_argument("--follow-symlinks", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--respect-gitignore", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--shareable-export", action=argparse.BooleanOptionalAction, default=None)
@@ -142,7 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(source, args.config, overrides)
         if config["llm"]["enabled"]:
             _warn_third_party(config)
-        exit_code, run_dir = analyze(source, config)
+        with JsonlEventSink(events_file(config)) as sink:
+            exit_code, run_dir = analyze(source, config, event_sink=sink)
         print(run_dir)
         return exit_code
     except UserError as exc:
@@ -177,6 +180,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         run["shareable_export"] = args.shareable_export
     if args.termination_grace is not None:
         run["termination_grace_seconds"] = args.termination_grace
+    if args.events_file is not None:
+        run["events_file"] = str(args.events_file.resolve())
     if args.exclude is not None:
         source["exclude"] = args.exclude
     if args.follow_symlinks is not None:

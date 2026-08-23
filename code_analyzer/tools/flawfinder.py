@@ -59,6 +59,7 @@ def run(
     shards = shard_files(compatible)
     units: list[dict[str, Any]] = []
     deadline = time.monotonic() + float(config["tools"]["flawfinder"]["timeout_seconds"])
+    heartbeat_seconds = float(config["tools"]["flawfinder"]["heartbeat_seconds"])
     grace = float(config["run"]["termination_grace_seconds"])
     for index, paths in enumerate(shards, 1):
         name = f"shard-{index:04d}"
@@ -78,9 +79,19 @@ def run(
         unit_event(name, "started", f"scanning {len(paths)} files", (index - 1) / max(1, len(shards)))
         unit_event(name, "info", "机器输出已隐藏并保存至 report.sarif", None)
         argv = [executable, "--sarif", "--minlevel=0", "--neverignore", "--columns", "--omittime", "--quiet", "--", *paths]
+        unit_timeout = max(0.001, deadline - time.monotonic())
+
+        def beat(
+            elapsed: float, unit: str = name, timeout: float = unit_timeout,
+            prefix: str = f"unit {index}/{len(shards)} {name}",
+        ) -> None:
+            message = f"heartbeat; elapsed {elapsed:.1f}s; unit timeout {timeout:.1f}s"
+            progress(f"{prefix}: {message}")
+            unit_event(unit, "heartbeat", message, None)
+
         process = run_process(
-            argv, source, stdout, stderr, max(0.001, deadline - time.monotonic()), grace,
-            cancelled=cancelled,
+            argv, source, stdout, stderr, unit_timeout, grace,
+            heartbeat=beat, heartbeat_seconds=heartbeat_seconds, cancelled=cancelled,
             output=(
                 (lambda stream, line, unit=name: output_event(unit, stream, line))
                 if output_event is not None else None

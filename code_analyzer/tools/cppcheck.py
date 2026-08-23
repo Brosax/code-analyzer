@@ -29,6 +29,7 @@ def run(
     unit_event = unit_event or (lambda _unit, _status, _message, _progress: None)
     tool_dir = run_dir / "tools" / "cppcheck"
     timeout = float(config["tools"]["cppcheck"]["timeout_seconds"])
+    heartbeat_seconds = float(config["tools"]["cppcheck"]["heartbeat_seconds"])
     grace = float(config["run"]["termination_grace_seconds"])
     jobs = min(4, os.cpu_count() or 1)
     passes: list[tuple[str, list[str], list[str]]] = []
@@ -86,9 +87,19 @@ def run(
             file_list = run_dir / "inputs" / "cppcheck-fallback-files.txt"
             file_list.write_text("".join(path + "\n" for path in files), encoding="utf-8")
             argv.append(f"--file-list={file_list}")
+        unit_timeout = max(0.001, deadline - time.monotonic())
+
+        def beat(
+            elapsed: float, unit: str = name, timeout: float = unit_timeout,
+            prefix: str = f"unit {index}/{len(passes)} {name}",
+        ) -> None:
+            message = f"heartbeat; elapsed {elapsed:.1f}s; unit timeout {timeout:.1f}s"
+            progress(f"{prefix}: {message}")
+            unit_event(unit, "heartbeat", message, None)
+
         process = run_process(
-            argv, source, stdout, stderr, max(0.001, deadline - time.monotonic()), grace,
-            cancelled=cancelled,
+            argv, source, stdout, stderr, unit_timeout, grace,
+            heartbeat=beat, heartbeat_seconds=heartbeat_seconds, cancelled=cancelled,
             output=(
                 (lambda stream, line, unit=name: output_event(unit, stream, line))
                 if output_event is not None else None

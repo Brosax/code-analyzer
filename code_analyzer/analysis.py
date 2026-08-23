@@ -64,36 +64,42 @@ def run_analysis(
     events: EventSink | None = None,
     cancellation: CancellationToken | None = None,
 ) -> AnalysisResult:
-    """Run analysis without terminal output, reporting structured events."""
+    """Run analysis without terminal output, reporting structured events.
+
+    Every event also lands in the run-level events.jsonl (see events.py);
+    ``[run] events_file`` relocates it.
+    """
+    from .events import JsonlEventSink, events_file, fan_out
     from .runner import AnalysisCancelled, _analyze
 
     token = cancellation or CancellationToken()
-    sink = events or (lambda _event: None)
-    sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0))
-    if token.cancelled:
-        sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before start", progress=1.0))
-        return AnalysisResult(130, None, None)
+    with JsonlEventSink(events_file(request.config)) as log:
+        sink = fan_out(log, events)
+        sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0))
+        if token.cancelled:
+            sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before start", progress=1.0))
+            return AnalysisResult(130, None, None)
 
-    def progress(message: str) -> None:
-        sink(AnalysisEvent("progress", "running", message))
+        def progress(message: str) -> None:
+            sink(AnalysisEvent("progress", "running", message))
 
-    try:
-        exit_code, report_directory = _analyze(
-            request.source,
-            request.config,
-            progress,
-            cancellation=token,
-            event_sink=sink,
-        )
-    except AnalysisCancelled:
-        sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before report creation", progress=1.0))
-        return AnalysisResult(130, None, None)
-    manifest = None
-    manifest_path = report_directory / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        pass
-    status = "interrupted" if exit_code == 130 else "finished"
-    sink(AnalysisEvent("analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0))
-    return AnalysisResult(exit_code, report_directory, manifest)
+        try:
+            exit_code, report_directory = _analyze(
+                request.source,
+                request.config,
+                progress,
+                cancellation=token,
+                event_sink=sink,
+            )
+        except AnalysisCancelled:
+            sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before report creation", progress=1.0))
+            return AnalysisResult(130, None, None)
+        manifest = None
+        manifest_path = report_directory / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        status = "interrupted" if exit_code == 130 else "finished"
+        sink(AnalysisEvent("analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0))
+        return AnalysisResult(exit_code, report_directory, manifest)

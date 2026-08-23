@@ -168,6 +168,17 @@ def not_requested() -> dict[str, Any]:
     return _phase_record(requested=False, enabled=False, status="not_requested")
 
 
+def running(settings: dict[str, Any]) -> dict[str, Any]:
+    """The transient record published while the phase runs; never final.
+
+    It is replaced by run()'s record (or failed()'s) before the manifest is
+    finalised, and _finish_interrupted rewrites it on cancellation.
+    """
+    return redact_credential(_phase_record(
+        status="running", model=str(settings.get("model", "")), endpoint=endpoint_url(settings),
+    ), settings)
+
+
 def failed(settings: dict[str, Any], reason: str) -> dict[str, Any]:
     """A phase that never dispatched anything, and why.
 

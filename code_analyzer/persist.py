@@ -19,6 +19,11 @@ def write_json(path: Path, value: Any) -> None:
     path.write_bytes(json_bytes(value))
 
 
+def jsonl_bytes(value: Any) -> bytes:
+    """One JSON Lines record: compact, key-sorted, newline-terminated."""
+    return (json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 def manifest_structure_problem(manifest: Any) -> str | None:
     """Return why a parsed manifest is structurally unusable, or None."""
     if not isinstance(manifest, dict) or manifest.get("manifest_schema_version") != 2:

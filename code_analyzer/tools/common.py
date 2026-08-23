@@ -5,6 +5,8 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from ..events import EVENTS_FILE
+
 
 def utf8_validation(path: Path, chunk_size: int = 1024 * 1024) -> tuple[bool, dict[str, Any] | None]:
     """Validate UTF-8 without loading a potentially large source file in memory."""
@@ -68,10 +70,12 @@ def artifact_index(
     """Index evidence files under a report directory.
 
     Skips the manifest and writer temporaries (both the runner's and the
-    recovery command's) and the per-unit analyzer scratch directories
-    (cppcheck ``build/``, splint ``tmp/``), which are caches, not evidence.
-    The optional cache avoids re-hashing files whose size and mtime are
-    unchanged between successive index rebuilds within one run.
+    recovery command's), the run-level event log (still being appended to
+    after the final index is taken, so its hash could never be verified) and
+    the per-unit analyzer scratch directories (cppcheck ``build/``, splint
+    ``tmp/``), which are caches, not evidence.  The optional cache avoids
+    re-hashing files whose size and mtime are unchanged between successive
+    index rebuilds within one run.
     """
     result = []
     for path in sorted(run_dir.rglob("*")):
@@ -80,6 +84,8 @@ def artifact_index(
         if path.name in {"manifest.json", ".manifest.json.tmp"} or path.name.startswith(".recover-"):
             continue
         relative = path.relative_to(run_dir)
+        if relative.as_posix() == EVENTS_FILE:
+            continue
         parts = relative.parts
         if len(parts) >= 5 and parts[0] == "tools" and parts[3] in {"build", "tmp"}:
             continue

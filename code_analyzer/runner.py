@@ -41,9 +41,17 @@ class AnalysisCancelled(Exception):
     """Cancellation observed before a report directory exists."""
 
 
-def analyze(source: Path, config: dict[str, Any]) -> tuple[int, Path]:
+def analyze(
+    source: Path, config: dict[str, Any], *, event_sink: EventSink | None = None
+) -> tuple[int, Path]:
+    """Terminal entry point: progress strings to stderr, structured events to the sink."""
+    sink = event_sink or (lambda _event: None)
+    sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0))
     with ProgressDisplay(sys.stderr) as display:
-        return _analyze(source, config, display.emit)
+        exit_code, run_dir = _analyze(source, config, display.emit, event_sink=event_sink)
+    status = "interrupted" if exit_code == 130 else "finished"
+    sink(AnalysisEvent("analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0))
+    return exit_code, run_dir
 
 
 def _analyze(
@@ -123,6 +131,9 @@ def _analyze(
         (run_dir / "tools").mkdir()
     except OSError as exc:
         raise UserError(f"cannot create run directory {run_dir}: {exc}") from exc
+    # The message is the path itself: the event log sink opens
+    # <run_dir>/events.jsonl on this event and flushes what came before.
+    event("run", "created", str(run_dir))
 
     config_path_values: list[Path] = [Path(value) for value in config.get("_config_paths", [])]
     config_path_values.extend(Path(item["path"]) for item in compile_discovery["candidates"])
@@ -206,6 +217,11 @@ def _analyze(
             continue
         _log(run_dir, f"{name}: starting {resolved}")
         progress(f"{tool_prefix}: starting")
+        version = _version(name, resolved)
+        # Persisted before the event so that whoever reacts to `tool started`
+        # already finds the placeholder on disk.
+        manifest["tools"][name] = _running_state(inventory, name, resolved, version)
+        _save_manifest(run_dir, manifest)
         event("tool", "started", f"{name} starting", tool=name, value=tool_start_progress)
         def unit_progress(message: str, prefix: str = tool_prefix, tool_name: str = name) -> None:
             progress(f"{prefix}: {message}")
@@ -239,7 +255,7 @@ def _analyze(
         except Exception as exc:
             result = _preflight_state("failed", inventory, name, f"adapter failure: {exc}")
         result["executable"] = resolved
-        result["version"] = _version(name, resolved)
+        result["version"] = version
         manifest["tools"][name] = result
         interrupted = result["status"] == "interrupted"
         _log(run_dir, f"{name}: {result['status']}")
@@ -255,6 +271,8 @@ def _analyze(
 
     if config["llm"]["enabled"]:
         progress("llm: starting semantic scan")
+        manifest["llm"] = llm_scan.running(config["llm"])
+        _save_manifest(run_dir, manifest)
         event("llm", "started", "starting LLM semantic scan", value=0.8)
         def llm_unit(producer: str, unit: str, status: str, message: str, value: float | None) -> None:
             # Rounded so the last unit (0.8 + 0.04 * 1.0 = 0.8400000000000001)
@@ -421,10 +439,13 @@ def _finish_interrupted(
     """Publish inspectable partial evidence after cooperative cancellation."""
     for name in requested_names:
         current = manifest["tools"][name]
-        if current.get("status") == "not_requested":
-            manifest["tools"][name] = _preflight_state(
-                "interrupted", inventory, name, "run interrupted before tool start"
-            )
+        if current.get("status") in {"not_requested", "running"}:
+            manifest["tools"][name] = {
+                **_preflight_state("interrupted", inventory, name, "run interrupted before tool start"),
+                "executable": current.get("executable"), "version": current.get("version"),
+            }
+    if manifest["llm"].get("status") == "running":
+        manifest["llm"].update({"status": "interrupted", "reason": "run interrupted"})
     manifest["status"] = "interrupted"
     manifest["exit_code"] = 130
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -461,6 +482,13 @@ def _not_requested(inventory: list[dict[str, Any]], name: str) -> dict[str, Any]
 def _preflight_state(state: str, inventory: list[dict[str, Any]], name: str, reason: str) -> dict[str, Any]:
     value = _not_requested(inventory, name)
     value.update({"requested": True, "status": state, "reason": reason})
+    return value
+
+
+def _running_state(inventory: list[dict[str, Any]], name: str, executable: str, version: str | None) -> dict[str, Any]:
+    """Transient placeholder published while a tool runs; never a final record."""
+    value = _not_requested(inventory, name)
+    value.update({"requested": True, "status": "running", "executable": executable, "version": version})
     return value
 
 
