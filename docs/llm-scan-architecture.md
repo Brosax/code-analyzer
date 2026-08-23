@@ -1033,7 +1033,7 @@ schema 叶子。任意命名的嵌套表会同时破坏这两者——与 §5.5 
 # code_analyzer/llm/profiles.py
 PROFILES = {
     "gpu-host":   {"endpoint": "http://127.0.0.1:11435/v1",   # Ollama，经 SSH 隧道
-                   "model": "qwen3.6:27b",
+                   "model": "qwen3.8:27b",
                    "api_key_env": ""},                         # Ollama 无需凭据
     "openrouter": {"endpoint": "https://openrouter.ai/api/v1",
                    "model": "stealth/ox-alpha",

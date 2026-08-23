@@ -7,19 +7,28 @@ runtime binary is absent.
 """
 from __future__ import annotations
 
-import json
 import math
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from ..errors import UserError
-from .cordis import confined, endpoint_url, write_cordis_config
+from .cordis import (
+    BWRAP_CONFINED,
+    FILESYSTEM_KEY,
+    PROVIDER_ID,
+    confined,
+    endpoint_url,
+    read_cordis_document,
+    write_cordis_config,
+)
 
 SDK_MODULE = "deepseek_harness"
-DEFAULT_PROVIDER = "deepseek-official"
+# The initialize call names the cordis route the scan declared.
+DEFAULT_PROVIDER = PROVIDER_ID
 INSTALL_HINT = (
     "install the agent runtime with `pip install deepseek-harness-sdk`, or set [llm] enabled = false "
     "to scan with the native analyzers only"
@@ -118,6 +127,10 @@ def api_key(settings: dict[str, Any]) -> str | None:
 # The literal the export sanitizer also writes, so a value reads the same
 # whether it was redacted here or on the way into a shareable archive.
 SECRET_TOKEN = "<SECRET>"
+# The stock adapter refuses to send a request with no DEEPSEEK_API_KEY at all
+# (MISSING_CREDENTIAL), while a keyless endpoint such as Ollama ignores the
+# header.  This stands in for a key on such profiles; it is not a secret.
+KEYLESS_PLACEHOLDER = "keyless"
 # Below this length a value is not a credential, and replacing it would
 # corrupt unrelated text.
 _MIN_SECRET_CHARS = 8
@@ -182,6 +195,62 @@ def finish_status(finish_reason: str, valid_report: bool) -> str:
     return state
 
 
+def endpoint_context_length(settings: dict[str, Any], *, timeout: float = 5.0) -> int | None:
+    """The context window the endpoint will really serve ``model`` with, if knowable.
+
+    Ollama sizes a model's context when it loads it and its OpenAI-compatible
+    ``/v1`` cannot ask for more: a prompt beyond that window is truncated
+    silently, so a scanner would review a chopped unit without any error.
+    The native ``/api/ps`` reports the loaded size and ``/api/show`` a pinned
+    ``num_ctx``; any other server, or any failure, yields ``None`` and the scan
+    proceeds on the configured ``context_window``.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base = endpoint_url(settings).rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    if not base:
+        return None
+    model = str(settings.get("model", "") or "")
+
+    def fetch(path: str, body: dict[str, Any] | None) -> dict[str, Any] | None:
+        data = _json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = _json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    loaded = fetch("/api/ps", None)
+    for item in (loaded or {}).get("models", []) or []:
+        if isinstance(item, dict) and item.get("name") == model and isinstance(item.get("context_length"), int):
+            return int(item["context_length"])
+    shown = fetch("/api/show", {"model": model})
+    for line in str((shown or {}).get("parameters", "")).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+            return int(parts[1])
+    # Ollama's own default when nothing pins it; only asserted for Ollama.
+    return 4096 if shown is not None else None
+
+
+def _runtime_binary() -> Path:
+    """The bundled runtime binary, resolved exactly as the SDK resolves it."""
+    try:
+        from deepseek_harness_runtime import resolve_bundled_launch_args
+    except ImportError as exc:
+        raise HarnessUnavailable(f"the deepseek-harness runtime binary is missing; {INSTALL_HINT}") from exc
+    arguments = resolve_bundled_launch_args()
+    if not arguments:
+        raise HarnessUnavailable(f"the deepseek-harness runtime binary is missing; {INSTALL_HINT}")
+    return Path(arguments[0]).resolve()
+
+
 class HarnessRuntime:
     """One agent runtime, owned for the duration of an LLM scan phase."""
 
@@ -200,6 +269,7 @@ class HarnessRuntime:
         self.cordis_path = Path(cordis_path) if cordis_path is not None else None
         self.cancelled = cancelled
         self._harness: Any = None
+        self._launcher: Path | None = None
 
     def __enter__(self) -> HarnessRuntime:
         try:
@@ -253,7 +323,7 @@ class HarnessRuntime:
             # by the cordis filesystem scope confine() insists on (design 11.4).
             "cwd": str(self.cwd),
             "runtime_cwd": str(self.cwd),
-            "api_key": api_key(settings),
+            "api_key": api_key(settings) or KEYLESS_PLACEHOLDER,
         }
         endpoint = endpoint_url(settings)
         if endpoint:
@@ -268,6 +338,8 @@ class HarnessRuntime:
             arguments["session_root"] = str(self.session_root)
         if self.cordis_path is not None:
             arguments["cordis"] = str(self.cordis_path)
+        if self._launcher is not None:
+            arguments["runtime_bin"] = str(self._launcher)
         return arguments
 
     def confine(self) -> None:
@@ -287,23 +359,61 @@ class HarnessRuntime:
                 "be launched (design 11.4)"
             )
         try:
-            document = json.loads(self.cordis_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise HarnessUnavailable(
-                f"the cordis document {self.cordis_path} cannot be read ({exc}), so the scanner's "
-                f"filesystem scope cannot be declared"
-            ) from exc
-        if not isinstance(document, dict):
-            raise HarnessUnavailable(
-                f"the cordis document {self.cordis_path} is not a JSON object, so the scanner's "
-                f"filesystem scope cannot be declared"
-            )
-        try:
+            document = read_cordis_document(self.cordis_path)
             complete = confined(document, self.cwd)
         except UserError as exc:
             raise HarnessUnavailable(str(exc)) from exc
+        complete = self._confine_process(complete)
         if complete != document:
             write_cordis_config(self.cordis_path.parent, complete, self.cordis_path.name)
+
+    def _confine_process(self, document: dict[str, Any]) -> dict[str, Any]:
+        """Bound the runtime PROCESS to the scanned tree when the host allows it.
+
+        No pinned upstream package confines reads (cordis.py), so the boundary
+        is applied one level down with bubblewrap: the process sees the scanned
+        tree and the runtime read-only, its session root read-write, loopback
+        for the tunnel, and nothing else -- not the run directory, not the
+        operator's home.  Without bwrap the evidence says so rather than
+        claiming a control nobody applies.
+        """
+        scope = dict(document.get(FILESYSTEM_KEY) or {})
+        enforcement = dict(scope.get("enforcement") or {})
+        bwrap = shutil.which("bwrap")
+        if bwrap is None or os.name != "posix" or self.session_root is None:
+            enforcement["confinement"] = enforcement.get("confinement", "unenforced-upstream")
+            enforcement["launcher"] = None
+            self._launcher = None
+        else:
+            self._launcher = self._write_launcher(bwrap, document)
+            enforcement["confinement"] = BWRAP_CONFINED
+            enforcement["launcher"] = str(self._launcher)
+        return {**document, FILESYSTEM_KEY: {**scope, "enforcement": enforcement}}
+
+    def _write_launcher(self, bwrap: str, document: dict[str, Any]) -> Path:
+        from shlex import quote
+
+        binary = _runtime_binary()
+        skill_dirs = [str(item) for item in document.get("skills", {}).get("customSkillDirs", [])]
+        assert self.session_root is not None and self.cordis_path is not None
+        self.session_root.mkdir(parents=True, exist_ok=True)
+        read_only = [str(self.cwd), str(binary.parent), str(self.cordis_path.parent), *skill_dirs]
+        lines = [
+            "#!/bin/sh",
+            "# Generated per run: confines the scanner runtime to the scanned tree (design 11.4).",
+            f"exec {quote(bwrap)} \\",
+            "  --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin \\",
+            "  --proc /proc --dev /dev --tmpfs /tmp \\",
+            *[f"  --ro-bind {quote(path)} {quote(path)} \\" for path in dict.fromkeys(read_only)],
+            f"  --bind {quote(str(self.session_root))} {quote(str(self.session_root))} \\",
+            "  --share-net --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session \\",
+            f"  -- {quote(str(binary))} \"$@\"",
+            "",
+        ]
+        path = self.cordis_path.parent / "runtime-sandbox.sh"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        path.chmod(0o700)
+        return path
 
     def run(
         self,

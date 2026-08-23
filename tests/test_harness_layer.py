@@ -131,15 +131,18 @@ def scanned_tree(tmp_path: Path) -> Path:
 def cordis_file(tmp_path: Path, settings: dict[str, object]) -> Path:
     """The document a scan phase drafts, before any tree is known."""
     return cordis.write_cordis_config(
-        tmp_path / "run" / "llm", cordis.cordis_document(settings, skill_dir=tmp_path / "skills")
+        tmp_path / "run" / "llm", cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions")
     )
 
 
 def launched_document() -> dict:
-    """The cordis document the SDK was actually pointed at."""
-    return json.loads(
-        Path(FakeHarness.instances[0].config.arguments["cordis"]).read_text(encoding="utf-8")
-    )
+    """The evidence document beside the tree the SDK was actually pointed at."""
+    return cordis.read_cordis_document(Path(FakeHarness.instances[0].config.arguments["cordis"]))
+
+
+def launched_tree() -> list:
+    """The plugin array the runtime itself loads."""
+    return json.loads(Path(FakeHarness.instances[0].config.arguments["cordis"]).read_text(encoding="utf-8"))
 
 
 def scan(tmp_path: Path, settings: dict[str, object], **overrides: object) -> tuple[dict, Path]:
@@ -386,7 +389,7 @@ def test_a_document_bound_to_another_tree_is_refused(sdk, settings, tmp_path: Pa
     elsewhere.mkdir()
     path = cordis.write_cordis_config(
         tmp_path / "run" / "llm",
-        cordis.cordis_document(settings, skill_dir=tmp_path / "skills", source_root=elsewhere),
+        cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions", source_root=elsewhere),
     )
     with pytest.raises(runtime.HarnessUnavailable) as error:
         runtime.HarnessRuntime(settings, cwd=scanned_tree(tmp_path), cordis_path=path).start()
@@ -626,27 +629,33 @@ def test_schema_hash_is_stable_and_declares_the_shared_vocabulary() -> None:
 
 
 def test_allowlist_excludes_shell(tmp_path: Path, settings) -> None:
-    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills")
-    assert document["tools"]["allow"] == ["fs", "lsp"]
+    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions")
+    assert document["tools"]["allow"] == ["read", "skill"]
     assert "shell" not in document["tools"]["allow"]
-    assert "deny" not in document["tools"]
+    # The tree is the real allow-list: none of the packages that would hand
+    # the model command execution is mounted, and the guard refuses one.
+    names = {entry["name"] for entry in document["packages"]}
+    assert not names & cordis.SHELL_PACKAGES
+    assert document["tools"]["shell_packages_excluded"] == sorted(cordis.SHELL_PACKAGES)
+    with pytest.raises(UserError, match="command execution"):
+        cordis.runtime_tree({**document, "packages": [*document["packages"], {"id": "bash", "name": "@deepseek-ai/dsh-tool-bash"}]})
 
 
 def test_granting_a_shell_is_refused(tmp_path: Path, settings) -> None:
     for tool in ("shell", "bash", "SHELL"):
         with pytest.raises(UserError) as error:
-            cordis.cordis_document(settings, skill_dir=tmp_path, tools=("fs", tool))
+            cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions", tools=("fs", tool))
         assert "untrusted" in str(error.value)
 
 
 def test_empty_allowlist_is_refused(tmp_path: Path, settings) -> None:
     with pytest.raises(UserError):
-        cordis.cordis_document(settings, skill_dir=tmp_path, tools=())
+        cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions", tools=())
 
 
 def test_packaged_skills_are_injected_and_project_roots_disabled(tmp_path: Path, settings) -> None:
     skills = tmp_path / "skills"
-    document = cordis.cordis_document(settings, skill_dir=skills)
+    document = cordis.cordis_document(settings, skill_dir=skills, session_root=tmp_path / "sessions")
     assert document["skills"]["customSkillDirs"] == [str(skills)]
     assert document["skills"]["projectSkillsEnabled"] is False
     assert document["skills"]["userSkillsEnabled"] is False
@@ -657,7 +666,7 @@ def test_scanned_repository_skill_roots_are_never_granted(tmp_path: Path, settin
     # Project roots outrank the injected custom root, so listing the packaged
     # directory proves nothing on its own: the default roots must be off.
     skills = tmp_path / "skills"
-    document = cordis.cordis_document(settings, skill_dir=skills)
+    document = cordis.cordis_document(settings, skill_dir=skills, session_root=tmp_path / "sessions")
     entry = _package(document, cordis.SKILL_FILESYSTEM_PACKAGE)
     assert entry["config"]["includeDefaultRoots"] is False
     assert entry["config"]["customSkillDirs"] == [str(skills)]
@@ -671,26 +680,62 @@ def _package(document: dict, name: str) -> dict:
     return matches[0]
 
 
-def test_provider_routing_records_only_the_variable_name(tmp_path: Path, settings) -> None:
-    document = cordis.cordis_document(settings, skill_dir=tmp_path, provider_routing=True)
-    provider = _package(document, cordis.PROVIDER_PACKAGE)["config"]["providers"][cordis.PROVIDER_ID]
-    assert provider["apiKeyEnv"] == "CODE_ANALYZER_TEST_LLM_KEY"
-    assert provider["baseURL"] == "https://gpu-host.internal:8000/v1"
-    assert provider["models"] == [{"id": "qwen3.6-27b", "contextWindow": 32768, "maxTokens": 800}]
-    assert "sk-super-secret-value" not in json.dumps(document)
+def test_the_tree_never_carries_a_credential(tmp_path: Path, settings) -> None:
+    document = cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions")
+    text = json.dumps(document)
+    assert "sk-super-secret-value" not in text
+    # The route names the endpoint (host only) and the environment variable
+    # the SDK populates; the operator's own variable name and the key itself
+    # travel as environment into the runtime and never into this file.
+    route = _package(document, cordis.LLM_PACKAGE)["config"]["providers"][cordis.PROVIDER_ID]
+    assert route["baseURL"] == "https://gpu-host.internal:8000/v1"
+    assert route["apiKeyEnv"] == cordis.PROVIDER_KEY_ENV
+    assert "CODE_ANALYZER_TEST_LLM_KEY" not in text
 
 
-def test_provider_routing_is_off_by_default(tmp_path: Path, settings) -> None:
-    document = cordis.cordis_document(settings, skill_dir=tmp_path)
-    assert [entry["name"] for entry in document["packages"]] == [cordis.SKILL_FILESYSTEM_PACKAGE]
+def test_the_tree_is_the_verified_spine_in_boot_order(tmp_path: Path, settings) -> None:
+    """Every entry and its position was established by booting the real runtime.
+
+    A dependency that loads after its consumer does not fail: it hangs.
+    """
+    document = cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions")
+    names = [entry["name"] for entry in document["packages"]]
+    assert names == [
+        cordis.SDK_SERVER_PACKAGE, cordis.LLM_PACKAGE, cordis.AGENT_SPINE_PACKAGE,
+        cordis.SESSIONS_PACKAGE, cordis.CHECKPOINTS_PACKAGE,
+        cordis.FS_OBSERVATION_PACKAGE, cordis.TOOL_FS_PACKAGE,
+        cordis.SKILL_FILESYSTEM_PACKAGE, cordis.TOOL_SKILL_PACKAGE, cordis.TOKEN_METER_PACKAGE,
+    ]
+    confined = cordis.confined(document, tmp_path)
+    names = [entry["name"] for entry in confined["packages"]]
+    # Policy and backend land before the tool that uses them, never after.
+    assert names.index(cordis.SANDBOX_POLICY_PACKAGE) < names.index(cordis.FS_SANDBOX_PACKAGE) < names.index(cordis.TOOL_FS_PACKAGE)
+    assert names.index(cordis.FS_OBSERVATION_PACKAGE) < names.index(cordis.TOOL_FS_PACKAGE)
+    route = _package(document, cordis.LLM_PACKAGE)["config"]["providers"][cordis.PROVIDER_ID]
+    assert route["api"] == "openai-completions" and route["reasoning"] == "off"
+    [model] = route["models"]
+    assert model["id"] == "qwen3.6-27b" and model["contextWindow"] == 32768 and model["maxTokens"] == 800
+    # "off" carrying "none" is what Ollama's /v1 honours; the other levels are
+    # declared so pi-ai does not pin them to unsupported.
+    assert model["reasoningEfforts"]["off"] == "none"
+    assert set(model["reasoningEfforts"]) == {"off", "minimal", "low", "medium", "high"}
+    spine = _package(document, cordis.AGENT_SPINE_PACKAGE)["config"]
+    # Verified to hang dsh-tool-skill; the explicit catalog confines discovery.
+    assert "skills" not in spine and spine["workspaceContext"] is False
+    assert _package(document, cordis.SESSIONS_PACKAGE)["config"]["root"] == str((tmp_path / "sessions").resolve())
 
 
-def test_written_config_is_byte_stable(tmp_path: Path, settings) -> None:
-    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills", provider_routing=True)
+def test_written_config_is_byte_stable_and_the_runtime_file_is_an_array(tmp_path: Path, settings) -> None:
+    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions")
     first = cordis.write_cordis_config(tmp_path / "one", document)
     second = cordis.write_cordis_config(tmp_path / "two", document)
     assert first.read_bytes() == second.read_bytes()
-    assert json.loads(first.read_text(encoding="utf-8")) == document
+    # The runtime rejects an object at the top level ("config file must be a
+    # top-level array"); the evidence object lives beside it.
+    tree = json.loads(first.read_text(encoding="utf-8"))
+    assert isinstance(tree, list) and tree == document["packages"]
+    assert cordis.read_cordis_document(first) == document
+    assert (tmp_path / "one" / cordis.CORDIS_META_FILENAME).is_file()
 
 
 def test_skill_directory_either_resolves_or_explains_itself() -> None:
@@ -702,24 +747,34 @@ def test_skill_directory_either_resolves_or_explains_itself() -> None:
         assert path.is_dir() and path.name == "skills"
 
 
-def test_the_cordis_provider_route_strips_endpoint_userinfo(tmp_path: Path) -> None:
-    """llm/cordis.json ships in the archive, so it redacts at the point of write.
-
-    _validate_endpoint rejects userinfo long before this code runs, which makes
-    the leak unreachable today -- but that puts the whole defence one validator
-    away, while every other persistence site redacts itself. This pins the
-    second layer independently of the first.
-    """
+def test_the_tree_strips_endpoint_userinfo_wherever_an_endpoint_appears(tmp_path: Path) -> None:
+    """llm/cordis.json ships in the archive, so it redacts at the point of write."""
     settings = {
         **DEFAULTS["llm"],
         "endpoint": "https://svc:sk-live-SUPERSECRET@gpu-host.internal:8000/v1",
         "model": "test-model",
         "api_key_env": "CODE_ANALYZER_LLM_API_KEY",
     }
-    document = cordis.cordis_document(
-        settings, skill_dir=tmp_path / "skills", provider_routing=True
-    )
+    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions")
     text = json.dumps(document)
     assert "sk-live-SUPERSECRET" not in text
     assert "svc:" not in text
-    assert "https://gpu-host.internal:8000/v1" in text
+    assert cordis.endpoint_url(settings) == "https://gpu-host.internal:8000/v1"
+
+
+
+
+def test_a_keyless_profile_still_satisfies_the_adapter(sdk, settings, tmp_path: Path) -> None:
+    """The stock adapter refuses any request without DEEPSEEK_API_KEY.
+
+    Seen live against Ollama over the SSH tunnel: every unit came back
+    MISSING_CREDENTIAL in 50 ms. The placeholder is not a secret and is not
+    recorded as one.
+    """
+    settings = {**settings, "api_key_env": ""}
+    _unit, directory = scan(tmp_path, settings)
+    sent = FakeHarness.instances[0].config.arguments
+    assert sent["api_key"] == runtime.KEYLESS_PLACEHOLDER
+    request = json.loads((directory / "request.json").read_text(encoding="utf-8"))
+    assert runtime.KEYLESS_PLACEHOLDER not in json.dumps(request)
+    assert runtime.credential_value(settings) == ""

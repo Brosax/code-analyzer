@@ -30,6 +30,7 @@ from ..harness.cordis import cordis_document, write_cordis_config
 from ..harness.runtime import (
     HarnessRuntime,
     RunOutcome,
+    endpoint_context_length,
     endpoint_url,
     harness_available,
     redact_credential,
@@ -51,6 +52,10 @@ CACHE_SCHEMA_VERSION = 1
 # reserved at the per-unit ceiling: the harness reports no usage counters, and
 # an invented measurement would be worse than a declared estimate.
 CHARS_PER_TOKEN = 4
+# Measured against the real runtime with the skill inlined in the prompt: the
+# harness's own system prompt, the skill catalogue reminder and the tool
+# schemas add roughly this much on top of the rendered unit.
+PROMPT_OVERHEAD_TOKENS = 1900
 TOKEN_ACCOUNTING = "estimated: prompt characters / 4, completion reserved at max_completion_tokens"
 
 Task = tuple[int, str, dict[str, Any]]
@@ -98,8 +103,13 @@ def run(
     progress(f"llm: planned {len(units)} scan units for {len(scanners)} scanner(s)")
 
     with skills_directory() as skill_dir:
+        # The runtime's own session log.  Left to its default it would be
+        # ./.sessions inside the scanned tree; it also has to be writable
+        # under the process confinement, so it gets a private root of its own.
+        session_root = run_dir / "llm" / "dsh-sessions"
+        session_root.mkdir(parents=True, exist_ok=True)
         cordis_path = write_cordis_config(
-            run_dir / "llm", cordis_document(settings, skill_dir=skill_dir, provider_routing=True)
+            run_dir / "llm", cordis_document(settings, skill_dir=skill_dir, session_root=session_root)
         )
         state = _Phase(
             source=source,
@@ -107,6 +117,7 @@ def run(
             settings=settings,
             grace=float(config["run"]["termination_grace_seconds"]),
             cordis_path=cordis_path,
+            session_root=session_root,
             skills=skills,
             prompts=prompts,
             cache=_Cache(config, run_dir),
@@ -389,6 +400,7 @@ class _Phase:
         settings: dict[str, Any],
         grace: float,
         cordis_path: Path,
+        session_root: Path,
         skills: dict[str, Skill],
         prompts: dict[str, list[dict[str, Any]]],
         cache: _Cache,
@@ -403,6 +415,7 @@ class _Phase:
         self.settings = settings
         self.grace = grace
         self.cordis_path = cordis_path
+        self.session_root = session_root
         self.skills = skills
         self.prompts = prompts
         self.cache = cache
@@ -415,6 +428,7 @@ class _Phase:
         self.heartbeat_seconds = float(settings["heartbeat_seconds"])
         self.deadline = time.monotonic() + float(settings["total_timeout_seconds"])
         self.prompt_budget = int(settings["total_prompt_tokens"])
+        self.effective_context = None if open_runtime is not None else endpoint_context_length(settings)
         self.completion_budget = int(settings["total_completion_tokens"])
         self.prompt_spent = 0
         self.completion_reserved = 0
@@ -549,6 +563,16 @@ class _Phase:
     def _reserve(self, prompt: str) -> tuple[bool, str]:
         estimate = max(1, math.ceil(len(prompt) / CHARS_PER_TOKEN))
         reservation = int(self.settings["max_completion_tokens"])
+        # A unit the endpoint would truncate is refused, not trimmed: a scanner
+        # reviewing a chopped unit reports on code it never saw.  The estimate
+        # is widened because the harness adds its own system prompt, the
+        # skill text and the tool catalogue on top of the unit.
+        window = self.effective_context
+        if window is not None and estimate + PROMPT_OVERHEAD_TOKENS + reservation > window:
+            return False, (
+                f"unit would exceed the endpoint's {window}-token context window "
+                f"(Ollama: set OLLAMA_CONTEXT_LENGTH on the host or pin num_ctx in a Modelfile)"
+            )
         with self._ledger:
             if self.prompt_spent + estimate > self.prompt_budget:
                 return False, "prompt token budget exhausted"
@@ -564,6 +588,7 @@ class _Phase:
             "total_timeout_seconds": float(self.settings["total_timeout_seconds"]),
             "total_prompt_tokens": self.prompt_budget,
             "prompt_tokens_spent": self.prompt_spent,
+            "endpoint_context_length": self.effective_context,
             "total_completion_tokens": self.completion_budget,
             "completion_tokens_reserved": self.completion_reserved,
         }
@@ -579,11 +604,17 @@ class _Phase:
         return HarnessRuntime(
             settings,
             cwd=self.source,
+            session_root=self.session_root,
             cordis_path=self.cordis_path,
             cancelled=self.is_cancelled,
         )
 
     def _directive(self, producer: str, unit: dict[str, Any]) -> dict[str, Any]:
+        # The skill text travels inside the prompt rather than being fetched by
+        # the model: a scanner that has to call the skill tool first spends a
+        # step on it, sometimes calls it three times over, and a long tool
+        # chain is exactly what Ollama's chat template answers with a 500
+        # (seen live).  One step, one answer.
         skill = self.skills[producer]
         return {"type": "text", "text": "\n".join([
             "# Scanner",
@@ -591,8 +622,19 @@ class _Phase:
             f"skill: {skill.name} (version {skill.skill_version})",
             f"scope: {skill.description}",
             "",
+            "The full skill follows. It is already loaded: do not call the skill tool.",
+            "",
+            "<skill_content>",
+            skill.body.strip(),
+            "</skill_content>",
+            "",
             f"Apply the {skill.name} skill to the scan unit below and report only defects",
             "inside that skill's scope. Return only the JSON object the skill defines.",
+            # With reasoning switched off the model reasons in its answer
+            # instead, and a budget spent on prose leaves no room for the
+            # object; the first character of the reply has to be the brace.
+            "Your reply must begin with `{` -- no analysis, heading or fence before it.",
+            "Put any rationale inside each finding's description field, not outside the object.",
         ])}
 
     def _forward(self, producer: str, unit_id: str) -> Callable[[dict[str, Any]], None] | None:

@@ -20,7 +20,7 @@ PROFILES: dict[str, dict[str, str]] = {
     # CPU instance instead.  Ollama's /v1 needs no credential.
     "gpu-host": {
         "endpoint": "http://127.0.0.1:11435/v1",
-        "model": "qwen3.6:27b",
+        "model": "qwen3.8:27b",
         "api_key_env": "",
     },
     "openrouter": {

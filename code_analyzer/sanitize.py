@@ -314,6 +314,10 @@ def _quotes_source(relative: Path) -> str | None:
         return SESSION_EXCERPT_REASON if excerpt else None
     if parts[:2] == ("llm", "units"):
         return SESSION_EXCERPT_REASON
+    # The runtime's own JSONL session log: every tool result, so every file
+    # the model read, verbatim.  The bwrap launcher script is host layout.
+    if parts[:2] == ("llm", "dsh-sessions") or relative.as_posix() == "llm/runtime-sandbox.sh":
+        return SESSION_EXCERPT_REASON
     if relative.as_posix() == _SYMBOL_TABLE:
         return SYMBOL_TABLE_REASON
     return None
