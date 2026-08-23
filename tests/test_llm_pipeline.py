@@ -749,6 +749,7 @@ def test_llm_configuration_round_trips_and_is_validated(tmp_path: Path) -> None:
         ("llm", "scanners", ["llm-nope"], "llm.scanners"),
         ("llm", "risk_overrides", ["src/led.c=nope"], "risk override"),
         ("audit", "validation_max_candidates", 0, "validation_max_candidates"),
+        ("audit", "validation_max_steps", 0, "validation_max_steps"),
     ):
         broken = copy.deepcopy(DEFAULTS)
         broken[section][key] = value

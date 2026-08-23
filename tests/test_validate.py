@@ -267,6 +267,11 @@ def test_the_validation_model_overrides_the_scanner_model(
     assert all(c["verdict"]["model"] == "judge-7b" for c in after.values())
     request = json.loads((run_dir / "llm" / "sessions" / VALIDATOR / next(iter(after)) / "request.json").read_text(encoding="utf-8"))
     assert request["model"] == "judge-7b" and request["skill"] == VALIDATOR
+    # The validator traces callers with the file tool, so it runs under its
+    # own step ceiling rather than the scanner's four.
+    local = request["parameters"]["enforced_locally"]
+    assert local["max_steps"] == config["audit"]["validation_max_steps"] > config["llm"]["max_steps"]
+    assert local["max_turns"] >= local["max_steps"] + 1
     assert request["output_schema"]["version"] == 1 and request["output_schema"]["enforced_by"] == "parser"
     assert len(request["prompt_sha256"]) == 64
 

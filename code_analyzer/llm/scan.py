@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager
 
 from ..errors import UserError
-from ..harness.cordis import cordis_document, write_cordis_config
+from ..harness.cordis import cordis_document, tool_allowlist, write_cordis_config
 from ..harness.runtime import (
     HarnessRuntime,
     RunOutcome,
@@ -109,7 +109,11 @@ def run(
         session_root = run_dir / "llm" / "dsh-sessions"
         session_root.mkdir(parents=True, exist_ok=True)
         cordis_path = write_cordis_config(
-            run_dir / "llm", cordis_document(settings, skill_dir=skill_dir, session_root=session_root)
+            run_dir / "llm",
+            cordis_document(
+                settings, skill_dir=skill_dir, session_root=session_root,
+                tools=tool_allowlist(skills[name] for name in scanners),
+            ),
         )
         state = _Phase(
             source=source,

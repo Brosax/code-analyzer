@@ -152,6 +152,7 @@ a:hover{color:var(--muted)}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .mono{font-family:var(--mono);font-size:.92em}
 .muted{color:var(--muted)}
+td details{max-width:28rem;font-size:.85em}td details summary{cursor:pointer;list-style:none}td details summary::before{content:"▸ "}td details[open] summary::before{content:"▾ "}td details[open] summary{display:none}td details>div{margin-top:.25rem}
 button,input,select{font:inherit;border:1px solid var(--line);border-radius:3px;
   background:var(--surface);color:var(--ink);padding:.45rem .6rem}
 button{cursor:pointer}
@@ -463,6 +464,8 @@ _JS_MAIN = r"""
       caveat_unvalidated: "尚未运行 validator：所有候选均未核验。",
       caveat_no_validator: "尚未运行 validator：所有判定计数为零，未核验数等于候选总数。运行 `code-analyzer assess` 可添加判定。",
       caveat_validator_sees_static: "llm_only_confirmed 由能看到同一文件静态结果的 validator 产出；应理解为“被第二个角色佐证”，而非独立确认。",
+      verdict_decisive_line: "决定性行：",
+      verdict_remediation: "建议修复（非权威）：",
       caveat_validator_ran: "validator 已运行：{total} 个候选中 {validated} 个带有判定，{unvalidated} 个没有（其中 {unscheduled} 个未被调度：受 validation_max_candidates 上限或 token 预算限制）。validator 看得到同一文件的静态结果。",
       caveat_grouping_not_identity: "候选只是把指向相同行与类别的发现分到一组，并不断言它们描述的是同一个缺陷。",
       card_llm_only_confirmed: "仅 LLM 发现且判定 CONFIRMED", card_validated: "已核验 / 未核验",
@@ -547,6 +550,8 @@ _JS_MAIN = r"""
       caveat_unvalidated: "No validator has run: every candidate is unvalidated.",
       caveat_no_validator: "No validator has run: every verdict count is zero and unvalidated equals candidates_total. Run `code-analyzer assess` to add verdicts.",
       caveat_validator_sees_static: "llm_only_confirmed is produced by a validator that sees the static findings for the same file; read it as corroborated by a second role, not as an independent confirmation.",
+      verdict_decisive_line: "Decisive line:",
+      verdict_remediation: "Remediation (non-authoritative):",
       caveat_validator_ran: "A validator has run: {validated} of {total} candidates carry a verdict and {unvalidated} do not ({unscheduled} were never scheduled, by the validation_max_candidates cap or the token budget). The validator saw the static findings for the same file.",
       caveat_grouping_not_identity: "A candidate groups findings that name the same lines and category; it does not assert that they describe the same defect.",
       card_llm_only_confirmed: "LLM-only and CONFIRMED", card_validated: "Validated / unvalidated",
@@ -1154,7 +1159,16 @@ _JS_MAIN = r"""
       const verdict = make("td");
       verdict.append(verdictBadge(c));
       if (c.verdict && typeof c.verdict === "object" && c.verdict.rationale) {
-        verdict.append(make("div", "muted", String(c.verdict.rationale)));
+        const rationale = String(c.verdict.rationale);
+        const decisive = c.verdict.decisive_line && typeof c.verdict.decisive_line === "object"
+          ? String(c.verdict.decisive_line.file || "") + ":" + String(c.verdict.decisive_line.line || "") : "";
+        const details = make("details", "muted");
+        const summary = make("summary", "", rationale.length > 140 ? rationale.slice(0, 140) + "…" : rationale);
+        details.append(summary);
+        if (rationale.length > 140) details.append(make("div", "", rationale));
+        if (decisive) details.append(make("div", "mono", t("verdict_decisive_line") + " " + decisive));
+        if (c.verdict.remediation) details.append(make("div", "", t("verdict_remediation") + " " + String(c.verdict.remediation)));
+        verdict.append(details);
       }
       tr.append(
         make("td", "mono", c.id),

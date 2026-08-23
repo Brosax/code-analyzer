@@ -14,6 +14,7 @@ from .cordis import (
     SCANNER_TOOL_ALLOWLIST,
     cordis_document,
     skill_directory,
+    tool_allowlist,
     write_cordis_config,
 )
 from .runtime import (
@@ -45,6 +46,7 @@ __all__ = [
     "RunOutcome",
     "SCANNER_OUTPUT_SCHEMA",
     "SCANNER_TOOL_ALLOWLIST",
+    "tool_allowlist",
     "SCHEMA_VERSION",
     "SEVERITIES",
     "cordis_document",

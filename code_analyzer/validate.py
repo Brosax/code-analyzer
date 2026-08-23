@@ -29,7 +29,7 @@ from .audit import (
 )
 from .dashboard import rebuild_dashboard
 from .errors import UserError
-from .harness.cordis import cordis_document, write_cordis_config
+from .harness.cordis import cordis_document, tool_allowlist, write_cordis_config
 from .harness.runtime import harness_available, redact_credential
 from .harness.session import SESSIONS_ROOT, run_candidate
 from .llm.context import build_unit_prompt
@@ -126,7 +126,7 @@ def run_assess(
             session_root.mkdir(parents=True, exist_ok=True)
             cordis_path = write_cordis_config(
                 run_dir.joinpath(*ASSESS_DIRECTORY),
-                cordis_document(settings, skill_dir=skill_dir, session_root=session_root),
+                cordis_document(settings, skill_dir=skill_dir, session_root=session_root, tools=tool_allowlist([skill])),
             )
             phase = _Validation(
                 source=source,
@@ -288,7 +288,15 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
     model = str(config["audit"].get("validation_model") or "").strip() or str(config["llm"].get("model") or "").strip()
     if not model:
         raise UserError("set [audit] validation_model or [llm] model before running assess")
-    return {**config["llm"], "model": model}
+    steps = int(config["audit"]["validation_max_steps"])
+    return {
+        **config["llm"],
+        "model": model,
+        "max_steps": steps,
+        # One model reply per step plus the final answer; never below the
+        # scanner's own turn ceiling.
+        "max_turns": max(int(config["llm"]["max_turns"]), steps + 1),
+    }
 
 
 def _priority(candidate: dict[str, Any]) -> tuple[int, int, str, int, str]:

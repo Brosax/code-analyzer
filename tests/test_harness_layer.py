@@ -828,3 +828,27 @@ def test_the_context_probe_loads_the_model_instead_of_guessing(monkeypatch: pyte
     # Once loaded, one call answers.
     calls.clear()
     assert rt.endpoint_context_length(settings) == 32768 and calls == ["/api/ps"]
+
+
+def test_the_allowlist_is_the_union_of_the_enabled_skills_and_records_what_the_tree_cannot_grant(
+    tmp_path: Path, settings
+) -> None:
+    from code_analyzer.llm.skills import load_skill, skill_names
+
+    skills = [load_skill(name) for name in skill_names()]
+    union = cordis.tool_allowlist(skills)
+    assert union[0] == "skill"
+    assert set(union) >= {"fs", "skill"}
+    document = cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions", tools=union)
+    assert document["tools"]["allow"] == list(union)
+    assert document["tools"]["granted_by"]["fs"] == cordis.TOOL_FS_PACKAGE
+    assert document["tools"]["granted_by"]["skill"] == cordis.TOOL_SKILL_PACKAGE
+    # A wish with no verified package is recorded, never silently granted and
+    # never allowed to change the tree that was verified as a whole.
+    assert "lsp" in union and "lsp" in document["tools"]["requested_unavailable"]
+    names = {entry["name"] for entry in document["packages"]}
+    assert names == {entry["name"] for entry in cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "s")["packages"]}
+    # The union never admits a shell, whatever a skill file asks for.
+    shelly = type("S", (), {"metadata": {"allowed-tools": ["fs", "shell"]}})()
+    with pytest.raises(UserError, match="untrusted"):
+        cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions", tools=cordis.tool_allowlist([shelly]))

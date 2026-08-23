@@ -80,6 +80,9 @@ DEFAULTS: dict[str, Any] = {
         "enabled": False,
         "validation_model": "",
         "validation_max_candidates": 200,
+        # The validator traces values through callers with the file tool, so
+        # it gets its own step ceiling instead of the scanner's.
+        "validation_max_steps": 12,
     },
     "tools": {
         "cppcheck": {"enabled": True, "executable": "cppcheck", "timeout_seconds": 7200.0, "heartbeat_seconds": 10.0},
@@ -166,6 +169,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("audit.enabled", "bool", "启用 Audit 层", "关联与验证，产出非权威的 audit/assessment.json。"),
     FieldSpec("audit.validation_model", "string", "验证模型", "留空则沿用 [llm] model。", advanced=True),
     FieldSpec("audit.validation_max_candidates", "int", "最大验证 candidate 数", "按风险排序优先验证。", minimum=1, advanced=True),
+    FieldSpec("audit.validation_max_steps", "int", "验证 agent 步数上限", "validator 每个 candidate 可执行的工具步数（读文件、追调用者）。", minimum=1, advanced=True),
     FieldSpec("tools.cppcheck.enabled", "bool", "启用 Cppcheck", "运行 Cppcheck。"),
     FieldSpec("tools.cppcheck.executable", "string", "Cppcheck 可执行文件", "命令名或绝对路径。", advanced=True),
     FieldSpec("tools.cppcheck.timeout_seconds", "float", "Cppcheck 超时", "总超时秒数。", minimum=0.001, advanced=True),
@@ -404,6 +408,7 @@ def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
     _expect(audit["enabled"], bool, "audit.enabled")
     _expect(audit["validation_model"], str, "audit.validation_model")
     _positive_int(audit["validation_max_candidates"], "audit.validation_max_candidates")
+    _positive_int(audit["validation_max_steps"], "audit.validation_max_steps")
 
 
 def _validate_endpoint(endpoint: str) -> None:

@@ -55,7 +55,7 @@ import os
 import threading
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 from ..errors import UserError
@@ -134,6 +134,14 @@ BWRAP_CONFINED = "bwrap"
 # evidence records; the tree above is what actually grants them.
 SCANNER_TOOL_ALLOWLIST: tuple[str, ...] = ("read", "skill")
 FORBIDDEN_TOOLS: frozenset[str] = frozenset({"shell", "bash", "exec", "process", "terminal", "command"})
+# What a skill may ask for in ``allowed-tools`` and the verified package that
+# grants it.  A name outside this table is not an error: the skill's wish is
+# recorded as unavailable, and the tree -- verified as a whole -- is unchanged.
+GRANTABLE_TOOLS: dict[str, str] = {
+    "fs": TOOL_FS_PACKAGE,
+    "read": TOOL_FS_PACKAGE,
+    "skill": TOOL_SKILL_PACKAGE,
+}
 
 # Skill roots the scanned repository controls.  Disabled for the whole scan so
 # that audited code cannot override the scanner instructions examining it.
@@ -186,11 +194,12 @@ def cordis_document(
     allowed = tuple(dict.fromkeys(str(name).strip() for name in tools if str(name).strip()))
     if not allowed:
         raise UserError("scanner tool allow-list must not be empty")
-    granted = sorted(name for name in allowed if name.lower() in FORBIDDEN_TOOLS)
-    if granted:
+    forbidden = sorted(name for name in allowed if name.lower() in FORBIDDEN_TOOLS)
+    if forbidden:
         raise UserError(
-            f"scanner tool allow-list must not grant {', '.join(granted)}: the scanned source is untrusted input"
+            f"scanner tool allow-list must not grant {', '.join(forbidden)}: the scanned source is untrusted input"
         )
+    unavailable = [name for name in allowed if name not in GRANTABLE_TOOLS]
     document: dict[str, Any] = {
         "runtime": {"verified_against": VERIFIED_RUNTIME},
         "skills": {
@@ -199,12 +208,33 @@ def cordis_document(
             "userSkillsEnabled": False,
             "disabledSkillRoots": list(PROJECT_SKILL_ROOTS),
         },
-        "tools": {"allow": list(allowed), "shell_packages_excluded": sorted(SHELL_PACKAGES)},
+        "tools": {
+            "allow": list(allowed),
+            "granted_by": {name: GRANTABLE_TOOLS[name] for name in allowed if name in GRANTABLE_TOOLS},
+            "requested_unavailable": unavailable,
+            "shell_packages_excluded": sorted(SHELL_PACKAGES),
+        },
         "packages": _spine(settings, session_root) + _scanner_packages(skill_dir),
     }
     if source_root is not None:
         document = confined(document, source_root)
     return document
+
+
+def tool_allowlist(skills: Iterable[Any]) -> tuple[str, ...]:
+    """The union of the enabled skills' ``allowed-tools``, in declaration order.
+
+    One cordis document serves every session of a run, so the allow-list is
+    the union, never one skill's list; ``skill`` is always present because the
+    runtime loads the skill text through it.
+    """
+    names: list[str] = ["skill"]
+    for skill in skills:
+        requested = (getattr(skill, "metadata", None) or {}).get("allowed-tools") or []
+        if isinstance(requested, str):
+            requested = [requested]
+        names.extend(str(name).strip() for name in requested if str(name).strip())
+    return tuple(dict.fromkeys(names))
 
 
 def filesystem_scope(root: Path) -> dict[str, Any]:
