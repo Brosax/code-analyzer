@@ -32,6 +32,7 @@ from .persist import write_json as _write_json
 from .progress import ProgressDisplay
 from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_review
 from .sanitize import ExportError, export_shareable
+from .sarif import build_sarif, write_sarif
 from .status import overall
 from .tools import TOOL_NAMES, cppcheck, flawfinder, splint
 from .tools.common import artifact_index
@@ -359,6 +360,10 @@ def _analyze(
             event("review", "finished", f"review completed; {review_summary['total_findings']} findings", value=0.92)
             # Deterministic and zero-model, so it belongs on the spine: the
             # static-only / llm-only / both split is available without assess.
+            try:
+                write_sarif(run_dir, build_sarif(review_summary, manifest))
+            except Exception as exc:
+                _log(run_dir, f"SARIF export failed: {exc}")
             try:
                 assessment = build_assessment(review_summary)
                 write_assessment(run_dir, assessment)

@@ -16,6 +16,7 @@ from .html_report import render
 from .persist import json_bytes, manifest_structure_problem
 from .review import REVIEW_SCHEMA_VERSION, build_review, markdown_report
 from .sanitize import ExportError, export_shareable
+from .sarif import build_sarif
 from .tools.common import artifact_index
 
 
@@ -51,6 +52,7 @@ def recover_report(report_directory: Path) -> Path:
     review_markdown = markdown_report(review, max_findings).encode("utf-8")
     assessment = build_assessment(review)
     assessment_json = json_bytes(assessment)
+    sarif_json = json_bytes(build_sarif(review, manifest))
     recovered = copy.deepcopy(manifest)
     recovered["review"] = {
         **recovered.get("review", {}),
@@ -92,6 +94,7 @@ def recover_report(report_directory: Path) -> Path:
         artifacts = _replace_artifact(artifacts, "review/summary.json", review_json)
         artifacts = _replace_artifact(artifacts, "review/summary.md", review_markdown)
         artifacts = _replace_artifact(artifacts, "audit/assessment.json", assessment_json)
+        artifacts = _replace_artifact(artifacts, "review/summary.sarif", sarif_json)
         recovered["audit"] = {**assessment_summary(assessment), "error": None}
         render_manifest = copy.deepcopy(recovered)
         render_manifest["artifacts"] = [item for item in artifacts if item.get("path") != "index.html"]
@@ -101,7 +104,7 @@ def recover_report(report_directory: Path) -> Path:
         recovered["recovery"]["derived_artifacts"] = [
             item for item in artifacts
             if item.get("path") in {
-                "review/summary.json", "review/summary.md", "audit/assessment.json", "index.html",
+                "review/summary.json", "review/summary.md", "review/summary.sarif", "audit/assessment.json", "index.html",
                 archive.relative_to(report_directory).as_posix(),
             }
         ]
@@ -110,6 +113,7 @@ def recover_report(report_directory: Path) -> Path:
             report_directory / "review" / "summary.json": review_json,
             report_directory / "review" / "summary.md": review_markdown,
             report_directory / "audit" / "assessment.json": assessment_json,
+            report_directory / "review" / "summary.sarif": sarif_json,
             report_directory / "index.html": index_bytes,
             manifest_path: manifest_bytes,
         })

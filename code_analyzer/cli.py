@@ -16,6 +16,7 @@ from .events import JsonlEventSink, events_file
 from .llm.profiles import PROFILE_NAMES, third_party_warning
 from .recovery import recover_report
 from .runner import analyze
+from .serve import DEFAULT_PORT, serve
 from .tools import LLM_PRODUCERS, TOOL_NAMES
 
 
@@ -49,6 +50,16 @@ def parser() -> argparse.ArgumentParser:
     recover.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     run = commands.add_parser("analyze", help="analyze a C/C++ source tree")
     run.add_argument("source", type=Path)
+    _add_analyze_arguments(run)
+    live = commands.add_parser("serve", help="serve a live view of a run over HTTP (127.0.0.1 only)")
+    live.add_argument("report_directory", type=Path, nargs="?", metavar="REPORT_DIR", help="a run directory to watch, read-only")
+    live.add_argument("--analyze", type=Path, metavar="SOURCE", help="run the analysis in this process, with cancel support")
+    live.add_argument("--port", type=int, default=DEFAULT_PORT)
+    _add_analyze_arguments(live)
+    return root
+
+
+def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
     run.add_argument("--config", type=Path)
     run.add_argument("--output-root", type=Path)
     compile_group = run.add_mutually_exclusive_group()
@@ -87,7 +98,6 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--shareable-export", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--review", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--fail-on", choices=("none", "medium", "high", "critical"))
-    return root
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,6 +149,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "recover-report":
             print(recover_report(args.report_directory))
             return 0
+        if args.command == "serve":
+            if args.analyze is None and args.report_directory is None:
+                raise UserError("serve needs REPORT_DIR or --analyze SOURCE")
+            if args.analyze is not None:
+                source = args.analyze.expanduser().resolve()
+                config = load_config(source, args.config, _overrides(args))
+                if config["llm"]["enabled"]:
+                    _warn_third_party(config)
+                return serve(None, analyze=(source, config), port=args.port,
+                             announce=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+            return serve(args.report_directory.expanduser().resolve(), port=args.port,
+                         announce=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
         source = args.source.expanduser().resolve()
         overrides = _overrides(args)
         config = load_config(source, args.config, overrides)

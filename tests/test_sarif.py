@@ -5,7 +5,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+from fake_harness import FakeHarness, response
+from test_llm_pipeline import (  # noqa: F401  (fixtures)
+    _analyze,
+    _config,
+    _cppcheck,
+    _finding,
+    _report,
+    _tree,
+    closed_endpoint,
+    fake,
+)
+
 from code_analyzer.persist import json_bytes
+from code_analyzer.recovery import recover_report
 from code_analyzer.sarif import LEVELS, URI_BASE_ID, build_sarif, write_sarif
 
 
@@ -86,3 +99,23 @@ def test_byte_stable_and_validates_as_sarif(tmp_path: Path) -> None:
         for result in run["results"]:
             assert {"ruleId", "level", "message", "locations"} <= set(result)
             assert result["level"] in {"error", "warning", "note", "none"}
+
+
+def test_analyze_writes_sarif_and_recover_report_regenerates_it_byte_identically(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str  # noqa: F811  (pytest fixtures by name)
+) -> None:
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding())))
+    _code, run_dir, manifest = _analyze(source, _config(tmp_path, closed_endpoint, cppcheck=_cppcheck(tmp_path)))
+    path = run_dir / "review" / "summary.sarif"
+    assert path.is_file()
+    document = json.loads(path.read_text(encoding="utf-8"))
+    names = [run["tool"]["driver"]["name"] for run in document["runs"]]
+    assert "cppcheck" in names and "llm-memory-safety" in names
+    assert any(item["path"] == "review/summary.sarif" for item in manifest["artifacts"])
+    before = path.read_bytes()
+    path.unlink()
+    recover_report(run_dir)
+    assert path.read_bytes() == before
+    recovered = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "review/summary.sarif" in {item["path"] for item in recovered["recovery"]["derived_artifacts"]}
