@@ -281,7 +281,10 @@ def test_the_api_key_value_never_survives_into_the_archive(
 ) -> None:
     run_dir, manifest, _review_document = _run_directory(tmp_path)
     config = _config(export_sessions=False)
-    monkeypatch.setenv(config["llm"]["api_key_env"], API_KEY)
+    # The default profile is a keyless Ollama tunnel; this test is about
+    # redaction, so it names its own variable rather than relying on one.
+    config["llm"]["api_key_env"] = "CODE_ANALYZER_TEST_API_KEY"
+    monkeypatch.setenv("CODE_ANALYZER_TEST_API_KEY", API_KEY)
     # The harness formats raw SDK exception text into a unit reason, and a
     # pydantic ValidationError echoes the input value it rejected.
     manifest["llm"]["scanners"] = {

@@ -725,7 +725,12 @@ def test_the_fake_is_driven_through_the_real_scheduling_seam(
 def test_llm_configuration_round_trips_and_is_validated(tmp_path: Path) -> None:
     config = validate_config(copy.deepcopy(DEFAULTS))
     assert config["llm"]["enabled"] is False
-    assert config["llm"]["api_key_env"] == "CODE_ANALYZER_LLM_API_KEY"
+    # The default profile is Ollama over an SSH tunnel: keyless and local.
+    assert config["llm"]["profile"] == "gpu-host"
+    assert config["llm"]["api_key_env"] == ""
+    assert config["llm"]["endpoint"].startswith("http://127.0.0.1:")
+    from code_analyzer.harness.runtime import api_key
+    assert api_key(config["llm"]) is None
 
     text = effective_toml(config)
     assert "[llm]" in text and "[audit]" in text
