@@ -344,6 +344,10 @@ def _spine(settings: dict[str, Any], session_root: Path) -> list[dict[str, Any]]
                 "api": "openai-completions",
                 "baseURL": endpoint,
                 "reasoning": "off",
+                # pi-ai sends the newer max_completion_tokens unless told
+                # otherwise; Ollama honours only max_tokens and otherwise
+                # generates unbounded (verified: 2495 tokens past a 1200 cap).
+                "compat": {"maxTokensField": "max_tokens"},
                 "models": [entry],
             }}},
         },

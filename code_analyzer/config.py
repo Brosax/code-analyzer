@@ -58,7 +58,7 @@ DEFAULTS: dict[str, Any] = {
         "scanners": list(LLM_PRODUCERS),
         "temperature": 0.0,
         "seed": 0,
-        "max_completion_tokens": 1200,
+        "max_completion_tokens": 2000,
         "max_steps": 4,
         "max_turns": 8,
         "request_timeout_seconds": 600.0,
