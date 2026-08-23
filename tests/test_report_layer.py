@@ -20,6 +20,7 @@ import pytest
 from code_analyzer.config import DEFAULTS, validate_config
 from code_analyzer.html_report import MAX_EMBED_FINDINGS, embedded_findings, render
 from code_analyzer.sanitize import (
+    EXCERPT_WITHHELD,
     SESSION_EXCERPT_REASON,
     SYMBOL_TABLE_REASON,
     export_shareable,
@@ -327,3 +328,44 @@ def test_export_sessions_ships_the_whole_session_when_asked(tmp_path: Path) -> N
     assert "llm/index.json" in names
     assert EXCERPT.encode() in payload and DEFINITION.encode() in payload
     assert manifest["export"]["omitted_artifacts"] == []
+
+
+def test_a_findings_evidence_excerpt_is_withheld_from_the_archive(tmp_path: Path) -> None:
+    """findings.json ships, but the verbatim source inside it must not.
+
+    Seen live: the model copies the offending line into `evidence`, findings.json
+    is the one session file the archive keeps, and so the audited firmware's
+    source left in a file labelled shareable.
+    """
+    run_dir, manifest, review_document = _run_directory(tmp_path)
+    findings_path = run_dir / "llm" / "sessions" / "llm-memory-safety" / "unit-1" / "findings.json"
+    planted = "memcpy(vault->proprietary_iv, packet, packet_len);  /* PROPRIETARY */"
+    findings_path.write_text(json.dumps({"findings": [
+        {"rule_id": "MEM-014", "message": "dst dereferenced", "evidence": planted},
+    ]}), encoding="utf-8")
+    review_document["findings"][0]["evidence"] = planted
+    (run_dir / "review" / "summary.json").write_text(json.dumps(review_document), encoding="utf-8")
+
+    archive = export_shareable(run_dir, manifest, _config(export_sessions=False), [])
+    with zipfile.ZipFile(archive) as bundle:
+        exported = json.loads(bundle.read("llm/sessions/llm-memory-safety/unit-1/findings.json"))
+        review = json.loads(bundle.read("review/summary.json"))
+        payload = b"\n".join(bundle.read(name) for name in bundle.namelist())
+    assert planted.encode() not in payload
+    assert exported["findings"][0]["evidence"] == EXCERPT_WITHHELD
+    assert exported["findings"][0]["message"] == "dst dereferenced"
+    assert review["findings"][0]["evidence"] == EXCERPT_WITHHELD
+
+    # The private run directory is untouched: recover-report still sees it.
+    assert planted in findings_path.read_text(encoding="utf-8")
+
+    # Opting in ships the excerpt, as documented.
+    run_dir, manifest, _review = _run_directory(tmp_path / "opt-in")
+    (run_dir / "llm" / "sessions" / "llm-memory-safety" / "unit-1" / "findings.json").write_text(
+        json.dumps({"findings": [{"rule_id": "MEM-014", "message": "dst dereferenced", "evidence": planted}]}),
+        encoding="utf-8",
+    )
+    archive = export_shareable(run_dir, manifest, _config(export_sessions=True), [])
+    with zipfile.ZipFile(archive) as bundle:
+        exported = json.loads(bundle.read("llm/sessions/llm-memory-safety/unit-1/findings.json"))
+    assert exported["findings"][0]["evidence"] == planted

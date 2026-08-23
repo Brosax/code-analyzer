@@ -30,6 +30,11 @@ SESSION_EXCERPT_REASON = "contains source excerpts"
 # already in the manifest -- so it is withheld whole rather than stripped.
 SYMBOL_TABLE_REASON = "contains the analyzed source symbol table (verbatim definitions and signatures)"
 _SESSION_EXPORTED: tuple[str, ...] = ("findings.json",)
+# A finding's `evidence` is the offending source, copied verbatim by the model.
+# findings.json is exported because it is the report the review is re-derived
+# from, so the excerpt is withheld inside it instead of withholding the file.
+EXCERPT_FIELDS: tuple[str, ...] = ("evidence",)
+EXCERPT_WITHHELD = "withheld: contains source excerpts; set [llm] export_sessions = true to include"
 _SYMBOL_TABLE = "llm/index.json"
 
 # A credential is redacted as a literal value, not by pattern: the harness
@@ -165,10 +170,12 @@ def export_shareable(
                 raise ExportError(f"invalid core review summary: {exc}") from exc
         if safe_review is None and manifest.get("review", {}).get("enabled"):
             raise ExportError("missing core review summary")
+        export_sessions = bool(config.get("llm", {}).get("export_sessions", False))
         if safe_review is not None:
             _validate_core_review(safe_review)
             safe_review = redactor.json_value(safe_review)
-        export_sessions = bool(config.get("llm", {}).get("export_sessions", False))
+            if not export_sessions:
+                safe_review = withhold_excerpts(safe_review)
         for source, omission in _export_files(run_dir, export_sessions=export_sessions):
             _check_cancelled(cancelled)
             relative = source.relative_to(run_dir)
@@ -192,7 +199,7 @@ def export_shareable(
                     raise ExportError("unsafe archive entry name")
                 target = staging / safe_name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                kind = _sanitize_file(source, target, redactor)
+                kind = _sanitize_file(source, target, redactor, relative=relative, export_sessions=export_sessions)
             except (ExportError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
                 if target is not None:
                     target.unlink(missing_ok=True)
@@ -323,6 +330,26 @@ def _quotes_source(relative: Path) -> str | None:
     return None
 
 
+def withhold_excerpts(value: Any) -> Any:
+    """Replace source excerpts in every finding of a findings/review document."""
+    if not isinstance(value, dict):
+        return value
+    findings = value.get("findings")
+    if not isinstance(findings, list):
+        return value
+    stripped = []
+    for item in findings:
+        if isinstance(item, dict) and any(item.get(field) for field in EXCERPT_FIELDS):
+            item = {**item, **{field: EXCERPT_WITHHELD for field in EXCERPT_FIELDS if item.get(field)}}
+        stripped.append(item)
+    return {**value, "findings": stripped}
+
+
+def _is_session_findings(relative: Path) -> bool:
+    parts = relative.parts
+    return parts[:2] == ("llm", "sessions") and parts[-1] in _SESSION_EXPORTED
+
+
 def _export_files(run_dir: Path, *, export_sessions: bool = False):
     """Yield every archive candidate as ``(path, omission reason or None)``.
 
@@ -357,7 +384,9 @@ def _excluded_entry(source: Path, entry: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _sanitize_file(source: Path, target: Path, redactor: Redactor) -> str:
+def _sanitize_file(
+    source: Path, target: Path, redactor: Redactor, *, relative: Path | None = None, export_sessions: bool = True
+) -> str:
     suffix = source.suffix.lower()
     if suffix == ".xml":
         try:
@@ -378,6 +407,8 @@ def _sanitize_file(source: Path, target: Path, redactor: Redactor) -> str:
         try:
             value = json.loads(source.read_text(encoding="utf-8"))
             value = redactor.json_value(value)
+            if relative is not None and not export_sessions and _is_session_findings(relative):
+                value = withhold_excerpts(value)
             _write_json(target, value)
             checked = json.loads(target.read_text(encoding="utf-8"))
             if suffix == ".sarif" and (not isinstance(checked, dict) or checked.get("version") != "2.1.0"):
