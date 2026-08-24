@@ -466,7 +466,7 @@ spawn（`runtime.py:323`），本项目只透传 `request_timeout_seconds` / `sh
 
 ---
 
-## 9. 动态规划与重规划 — NEW，有界 ⬜ 未交付（P4；`max_replan_rounds` 仍为设计，默认 0 即当前行为）
+## 9. 动态规划与重规划 — NEW，有界 ✅ 已交付（P4）
 
 ### 9.1 冲突
 
@@ -532,6 +532,17 @@ rounds 循环    scan.py:119 已是 "records = state.execute_all(_tasks(units, s
 LLM-only 指标只数第 0 轮。
 
 用户已决定（D2）：默认全确定性，`max_replan_rounds = 0`。
+
+**已交付（`code_analyzer/llm/replan.py` + `llm/scan.py` 的 rounds 循环）**，与上面的设计
+一致，另有两处实现层面的收紧：
+
+1. **观察只能看到计数。** unit record 里本来就没有 finding 文本，只有 `finding_count`；
+   为了让规则表能按类别/严重度决策，`_parse_report` 增加 `finding_mix`（两张计数表）。
+   这是刻意的边界：finding 的 message 是模型对不可信源码的输出，把它喂回规划提示词就是
+   本项目在别处都关掉的那条注入路径。
+2. **确定性规则表只有三条**，每条都写明它凭什么触发：低 tier 文件出了 high/critical →
+   `escalate_tier`（每个文件只升一次）；预算恢复后补扫 `unscheduled`；某 producer 全部
+   失败 → `stop_producer`。都不触发就记一条 `stop` 并结束。
 
 ---
 
@@ -894,7 +905,7 @@ MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还�
 | **P1 可观察 + 已关联（MVP）** | §17 的 1–6 + **README:9-11 章程修订**（评审订正：`audit/` 在 P1 落地，章程必须同期改，不能让一个版本与 README 自相矛盾） | origin 指标、实时视图、CI 接入 | 无 | ✅ 已交付 |
 | **P2 已验证** | Validator `_Phase` 消费者 + `VERDICT_SCHEMA` + `assess` 子命令 + dashboard verdict 区（caveat 紧挨数字）；`Adapter`/`RunContext` 协议重构（消除 4 个崩溃点，字节钉死）；「声明 == 磁盘发现」测试已在；`allowed-tools` 并集接入 `cordis.py`；`recommendation` 上 candidate | **`llm_only_confirmed`**——LLM 层存在的理由 | P1 | ✅ 已交付（§4.2 的元数据表格部分除外） |
 | **P3 更快 + 更宽** | 进度模型改为工作量比例后做静态 ∥ LLM（锁、共享 cancel）；输出字节上限；`llm-doctor` 与 `llm-resume`（既有设计 Phase 2 的交付物，尚未存在于 `cli.py`）；验证上游 notification 是否携带 token usage；**三个新 scanner**：Resource/Error（枚举加 token + `_LLM_KEYWORD_CATEGORIES` 一行 + memory-safety 的"错误路径未释放"条款迁入）、UB（与 memory-safety **同一 commit** 按 空间/时间 vs 算术/语义 重切，两份 `skill_version` 同升，跨运行缓存失效）、Logic（**只接受闭合 token 集**：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch`；拒绝"找一切逻辑问题"）；`total_*_tokens` 随启用 scanner 数线性缩放（**规则**：仅当用户未显式设置、值仍为 `DEFAULTS` 时，默认值 = 基数 × 启用 scanner 数；显式设置则不缩放；`inputs/effective-config.toml` 记录解析后的数值，`reload` 一致性校验因此不受影响）；include 图 + 头文件配对；`splint.jobs` 默认提高 | 壁钟 ≈ max(静态, LLM)；6 个 scanner；更准的上下文 | P1 | ✅ 已交付 |
-| **P4 自适应** | 有界重规划（§9，含按轮次分目录的证据路径）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF）；TUI 的 `[llm]` 字段、可选 LLM 门禁、`docs/usage.md` 新章节（既有设计 Phase 4 的交付物） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 | ◐ 部分：`@media print`、TUI `[llm]` 字段、可选 LLM 门禁（`[review] gate_includes_llm`）、`docs/usage.md` 第 12 章已交付；有界重规划（§9）与 NL 前端未交付 |
+| **P4 自适应** | 有界重规划（§9，含按轮次分目录的证据路径）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF）；TUI 的 `[llm]` 字段、可选 LLM 门禁、`docs/usage.md` 新章节（既有设计 Phase 4 的交付物） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 | ✅ 已交付（NL → config-patch 前端除外，规范中即标为可选）：有界重规划（§9，`llm/plan.json` + 轮次目录 + 闭合动作词汇表）、`@media print`、TUI `[llm]` 字段、可选 LLM 门禁（`[review] gate_includes_llm`）、`docs/usage.md` 第 12 章 |
 
 每期独立可 ship、测试全绿、不改前一期的契约。
 
