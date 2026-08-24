@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from .errors import UserError
 from .llm.profiles import DEFAULT_PROFILE, PROFILE_NAMES, PROFILES, apply_profile
+from .llm.replan import REPLAN_DECIDERS
 from .llm.risk import RISK_PROFILES, RISK_TIERS, parse_overrides
 from .tools import LLM_PRODUCERS, TOOL_NAMES
 
@@ -79,6 +80,11 @@ DEFAULTS: dict[str, Any] = {
         "min_tier": "low",
         "export_sessions": False,
         "lsp": False,
+        # Bounded re-planning.  0 means round 0 only -- the deterministic plan,
+        # exactly as it has always been -- and is the default: an adaptive scan
+        # is an operator's explicit choice, never a surprise.
+        "max_replan_rounds": 0,
+        "replan_decider": "deterministic",
     },
     "audit": {
         "enabled": False,
@@ -175,6 +181,8 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.min_tier", "choice", "最低档位", "档位下限，保证没有代码被排除在计划外。", choices=RISK_TIERS, advanced=True),
     FieldSpec("llm.export_sessions", "bool", "导出 Session 证据", "含源码片段的会话日志默认不进入可分享导出。", advanced=True),
     FieldSpec("llm.lsp", "bool", "启用 LSP 导航", "为 agent 提供编译器级符号导航。", advanced=True),
+    FieldSpec("llm.max_replan_rounds", "int", "重规划轮数上限", "0 表示只跑确定性的第 0 轮；每多一轮都在同一预算内。", minimum=0, advanced=True),
+    FieldSpec("llm.replan_decider", "choice", "重规划决策者", "deterministic 为规则表；model 显式启用模型决策。", choices=("deterministic", "model"), advanced=True),
     FieldSpec("review.gate_includes_llm", "bool", "门禁纳入 LLM 发现", "默认关闭：LLM 发现不影响退出码。开启后 LLM 发现与静态发现一同参与 fail_on 判定。", advanced=True),
     FieldSpec("audit.enabled", "bool", "启用 Audit 层", "关联与验证，产出非权威的 audit/assessment.json。"),
     FieldSpec("audit.validation_model", "string", "验证模型", "留空则沿用 [llm] model。", advanced=True),
@@ -303,7 +311,10 @@ SCANNER_SCALED_KEYS: tuple[str, ...] = ("total_prompt_tokens", "total_completion
 def scale_scanner_budgets(llm: dict[str, Any], sources: dict[str, str]) -> None:
     """Scale the still-default token budgets by the number of enabled scanners."""
     scanners = llm.get("scanners")
-    count = len(scanners) if isinstance(scanners, list) else 0
+    # The roster that spends the budget is the one the scan phase resolves:
+    # duplicates run once, so a list naming one scanner three times must not
+    # buy three scanners' worth of tokens.
+    count = len({name for name in scanners if name in LLM_PRODUCERS}) if isinstance(scanners, list) else 0
     if count <= 1:
         return
     for key in SCANNER_SCALED_KEYS:
@@ -443,6 +454,10 @@ def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
         raise UserError("llm.temperature must be a number greater than or equal to zero")
     if isinstance(llm["seed"], bool) or not isinstance(llm["seed"], int) or llm["seed"] < 0:
         raise UserError("llm.seed must be an integer greater than or equal to zero")
+    if isinstance(llm["max_replan_rounds"], bool) or not isinstance(llm["max_replan_rounds"], int) or llm["max_replan_rounds"] < 0:
+        raise UserError("llm.max_replan_rounds must be an integer greater than or equal to zero")
+    if llm["replan_decider"] not in REPLAN_DECIDERS:
+        raise UserError("llm.replan_decider must be " + " or ".join(REPLAN_DECIDERS))
     _expect(audit["enabled"], bool, "audit.enabled")
     _expect(audit["validation_model"], str, "audit.validation_model")
     _positive_int(audit["validation_max_candidates"], "audit.validation_max_candidates")

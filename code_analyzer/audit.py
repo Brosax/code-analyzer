@@ -67,6 +67,7 @@ _ID_PREFIXES: dict[str, str] = {
     "firmware-update": "SEC", "debug-backdoor": "SEC", "race": "FW", "isr-safety": "FW",
     "volatile-misuse": "FW", "atomicity": "FW", "rtos-sync": "FW", "watchdog": "FW",
     "mmio": "FW", "dma": "FW", "timeout": "FW", "reset-behavior": "FW",
+    "hardware-state": "FW", "isr-race": "FW", "register-access": "FW",
 }
 
 

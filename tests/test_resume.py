@@ -111,6 +111,20 @@ def test_resume_replays_the_stored_prompt_instead_of_re_planning(
     assert json.loads(stored[0].read_text(encoding="utf-8"))["prompt"] == json.loads(original)
     sent = "\n".join(str(call) for call in fake.calls)
     assert "replaced" not in sent, "resume must not send code the plan never described"
+    # Replaying the old prompt is right; pretending the tree is unchanged is
+    # not.  The scanner's own file tool reads today's bytes, so a resumed run
+    # can hold two vintages of the same code and has to say so.
+    assert _manifest(run_dir)["llm"]["resume"]["source_drift"] == ["parser.c"]
+
+
+def test_an_unchanged_tree_reports_no_drift(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str  # noqa: F811
+) -> None:
+    run_dir, config = _starved(tmp_path, fake, closed_endpoint)
+
+    _resume(run_dir, config, fake)
+
+    assert _manifest(run_dir)["llm"]["resume"]["source_drift"] == []
 
 
 def test_resume_reports_a_scanner_that_changed_under_the_run(

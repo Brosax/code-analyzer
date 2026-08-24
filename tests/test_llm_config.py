@@ -251,3 +251,19 @@ def test_the_token_budgets_scale_with_the_scanner_roster_but_never_over_a_choice
     reloaded = load_config_with_sources(source, written)
     for key in SCANNER_SCALED_KEYS:
         assert reloaded.config["llm"][key] == loaded.config["llm"][key]
+
+
+def test_a_repeated_scanner_name_does_not_multiply_the_budget(tmp_path: Path) -> None:
+    """The roster that spends the budget is the one that runs.
+
+    validate_config permits duplicates and the scan phase dedupes them, so
+    scaling on the raw list would buy three scanners' worth of tokens for one
+    scanner and record that inflated number in effective-config.toml.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+
+    loaded = load_config_with_sources(source, None, {"llm": {"scanners": ["llm-logic"] * 3}})
+
+    assert loaded.config["llm"]["total_prompt_tokens"] == DEFAULTS["llm"]["total_prompt_tokens"]
+    assert loaded.sources["llm.total_prompt_tokens"] == "default"

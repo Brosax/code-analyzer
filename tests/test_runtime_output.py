@@ -12,7 +12,7 @@ from textual.widgets import RichLog
 
 from code_analyzer.analysis import AnalysisEvent, AnalysisRequest, run_analysis
 from code_analyzer.config import load_config
-from code_analyzer.process import run_process
+from code_analyzer.process import MAX_LIVE_LINE_CHARS, run_process
 from code_analyzer.tools import cppcheck, flawfinder, splint
 from code_analyzer.tui import AnalyzerApp
 
@@ -274,3 +274,46 @@ def test_output_below_the_ceiling_is_stored_whole_and_reports_no_truncation(tmp_
 
     assert stdout.read_bytes() == b"ok\n"
     assert result.truncated_bytes == {"stdout": 0, "stderr": 0}
+
+
+def test_a_stream_without_line_breaks_does_not_stall_the_reader(tmp_path: Path) -> None:
+    """Live forwarding must stay linear, or it invents a timeout.
+
+    The forwarder used to re-scan its whole pending buffer on every 64 KiB
+    read, so a tool that wrote megabytes without a newline made the reader
+    quadratic: reads stopped, the child blocked on a full pipe, and the run
+    recorded a timeout the tool never caused — losing its native report.
+    """
+    script = tmp_path / "flood.py"
+    script.write_text("import os\nos.write(1, b'x' * (8 * 1024 * 1024))\n", encoding="utf-8")
+    stdout, stderr = tmp_path / "stdout.raw", tmp_path / "stderr.raw"
+    forwarded: list[int] = []
+
+    started = time.monotonic()
+    result = run_process(
+        [sys.executable, str(script)], tmp_path, stdout, stderr, timeout=30.0, grace=1.0,
+        output=lambda _stream, line: forwarded.append(len(line)),
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code == 0 and result.timed_out is False
+    # The evidence on disk is whole whatever the display did with it.
+    assert stdout.stat().st_size == 8 * 1024 * 1024
+    # Generous: the old implementation took ~25s for this input, the new one
+    # ~0.1s.  The assertion is about the complexity class, not the machine.
+    assert elapsed < 5.0, f"forwarding 8 MiB took {elapsed:.1f}s"
+    # Forwarded in bounded pieces rather than one unbounded line.
+    assert forwarded and max(forwarded) <= MAX_LIVE_LINE_CHARS
+
+
+def test_a_bounded_line_still_reaches_the_display_whole(tmp_path: Path) -> None:
+    script = tmp_path / "lines.py"
+    script.write_text("import os\nos.write(1, b'alpha\\r\\nbeta\\rgamma\\n')\n", encoding="utf-8")
+    seen: list[str] = []
+
+    run_process(
+        [sys.executable, str(script)], tmp_path, tmp_path / "o.raw", tmp_path / "e.raw",
+        timeout=30.0, grace=1.0, output=lambda _stream, line: seen.append(line),
+    )
+
+    assert seen == ["alpha", "beta", "gamma"]

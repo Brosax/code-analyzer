@@ -49,9 +49,17 @@ UNAPPLIED_KEYS: tuple[str, ...] = ("temperature", "top_p", "seed")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def unit_directory(run_dir: Path, producer: str, unit_id: str) -> Path:
-    """Evidence directory for one (producer, unit) pair."""
-    return Path(run_dir).joinpath(*SESSIONS_ROOT, _safe(producer, "producer"), _safe(unit_id, "unit id"))
+def unit_directory(run_dir: Path, producer: str, unit_id: str, round_index: int = 0) -> Path:
+    """Evidence directory for one (producer, unit) pair in one round.
+
+    Round 0 keeps the historical path exactly.  ``unit_id`` deliberately carries
+    no risk tier, so a later round re-scanning the same unit with the same
+    producer would otherwise overwrite the blind first-pass evidence that the
+    llm-only metrics are counted from -- the second pass is a different
+    observation and gets its own directory.
+    """
+    base = Path(run_dir).joinpath(*SESSIONS_ROOT, _safe(producer, "producer"), _safe(unit_id, "unit id"))
+    return base if round_index <= 0 else base / f"r{int(round_index)}"
 
 
 def resync_meta_status(directory: Path, status: str, reason: str) -> None:
@@ -90,6 +98,7 @@ def run_unit(
     cache: dict[str, Any] | None = None,
     cancelled: Callable[[], bool] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    round_index: int = 0,
 ) -> dict[str, Any]:
     """Run one scanner over one unit and persist its four evidence files.
 
@@ -98,7 +107,7 @@ def run_unit(
     """
     return _run_session(
         runtime,
-        directory=unit_directory(run_dir, producer, unit_id),
+        directory=unit_directory(run_dir, producer, unit_id, round_index),
         run_dir=run_dir,
         producer=producer,
         subject={"unit_id": unit_id},
@@ -188,8 +197,22 @@ def _parse_report(text: str | None) -> _Parsed:
             reason = f"{len(malformed)} malformed finding(s) dropped"
     return _Parsed(
         valid, reason, {"findings": findings, "malformed": malformed},
-        {"finding_count": len(findings), "malformed_count": len(malformed)}, {},
+        {"finding_count": len(findings), "malformed_count": len(malformed)},
+        # Tallies, not text.  A re-planning round is allowed to see how a unit
+        # came out but never what a finding said about untrusted source, and
+        # the mix per unit is worth having in the manifest anyway.
+        {"finding_mix": _mix(findings)},
     )
+
+
+def _mix(findings: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    categories: dict[str, int] = {}
+    severities: dict[str, int] = {}
+    for item in findings:
+        for table, key in ((categories, "category"), (severities, "severity")):
+            name = str(item.get(key) or "unknown")
+            table[name] = table.get(name, 0) + 1
+    return {"categories": dict(sorted(categories.items())), "severities": dict(sorted(severities.items()))}
 
 
 def _parse_verdict(text: str | None, candidate_id: str) -> _Parsed:
@@ -231,6 +254,10 @@ def _run_session(
     outcome: RunOutcome | None = None
     status = "failed"
     reason: str | None = None
+    # What the runtime reported before it stopped, when it stopped early.  The
+    # session that hit a ceiling is the one that spent the most tokens; its
+    # stream is worth persisting and measuring precisely because it failed.
+    partial: list[dict[str, Any]] = []
     if cancelled is not None and cancelled():
         status, reason = "interrupted", "run interrupted"
     else:
@@ -238,6 +265,7 @@ def _run_session(
             outcome = runtime.run(prompt, session_id=session_id, on_event=on_event)
         except HarnessRunFailed as exc:
             status, reason = exc.outcome, exc.reason
+            partial = list(exc.events)
 
     parsed = parse(None if outcome is None else outcome.final_response)
     if outcome is not None:
@@ -257,7 +285,10 @@ def _run_session(
             "notifications": outcome.notifications if outcome else [],
         }, active),
     )
-    _write_events(directory / "events.jsonl", outcome.events if outcome else [])
+    # Redacted like every other write in this block.  A provider that answers
+    # 401 with the request headers echoed puts the key in an event, and the
+    # cross-run cache copies this file outside the run directory entirely.
+    _write_events(directory / "events.jsonl", redact_credential(outcome.events if outcome else partial, active))
     write_json(
         directory / result_file,
         {
@@ -270,7 +301,7 @@ def _run_session(
     )
     write_json(
         directory / "meta.json",
-        _meta(producer, subject, status, started_at, outcome, parsed.counts, cache),
+        _meta(producer, subject, status, started_at, outcome, parsed.counts, cache, partial),
     )
 
     record: dict[str, Any] = {
@@ -282,7 +313,7 @@ def _run_session(
         "reason": reason,
         "evidence_context": "source-only",
         "finish_reason": outcome.finish_reason if outcome else "",
-        "usage_measured": measured_usage(outcome.events if outcome else []),
+        "usage_measured": measured_usage(outcome.events if outcome else partial),
         **parsed.counts,
         **redact_credential(parsed.record, active),
     }
@@ -339,8 +370,9 @@ def _meta(
     outcome: RunOutcome | None,
     counts: dict[str, int],
     cache: dict[str, Any] | None,
+    partial: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    events = outcome.events if outcome else []
+    events = outcome.events if outcome else list(partial or [])
     return {
         "producer": producer,
         **subject,

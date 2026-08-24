@@ -349,7 +349,13 @@ def _covering_unit(
             continue
         if int(unit.get("line_start", 0)) <= line <= int(unit.get("line_end", 0)):
             persisted = _read_optional(run_dir / "llm" / "units" / f"{unit['unit_id']}.json")
-            text = persisted.get("source") if isinstance(persisted.get("source"), str) else None
+            stored = persisted.get("source")
+            # An empty stored source means the scan could not read the file
+            # (scan.py records ""), not that the unit is empty.  Judging a
+            # candidate against a blank listing produces a confident verdict
+            # about nothing, so fall through to the file, which may be readable
+            # now.
+            text = stored if isinstance(stored, str) and stored.strip() else None
             return unit, text if text is not None else unit_source(source, unit)
     text = decode_source((source / path).read_bytes())
     lines = max(text.count("\n") + (not text.endswith("\n")), 1)

@@ -71,12 +71,20 @@ class HarnessUnavailable(UserError):
 
 
 class HarnessRunFailed(Exception):
-    """One invocation failed; ``outcome`` is a per-unit status word."""
+    """One invocation failed; ``outcome`` is a per-unit status word.
 
-    def __init__(self, outcome: str, reason: str) -> None:
+    ``events`` carries what the runtime had already reported when it stopped.
+    A session cut off by a step ceiling, a timeout or a cancellation is exactly
+    the one that spent the most tokens, so throwing its stream away would make
+    the measured ledger under-report where it matters most -- and would leave
+    an auditor with an empty events.jsonl for the sessions worth auditing.
+    """
+
+    def __init__(self, outcome: str, reason: str, events: list[dict[str, Any]] | None = None) -> None:
         super().__init__(reason)
         self.outcome = outcome
         self.reason = reason
+        self.events = list(events or [])
 
 
 class _Cancelled(Exception):
@@ -134,7 +142,7 @@ def _count(usage: dict[str, Any], *keys: str) -> int:
             continue
         if isinstance(value, int) and value >= 0:
             return value
-        if isinstance(value, float) and value >= 0:
+        if isinstance(value, float) and math.isfinite(value) and value >= 0:
             return int(value)
     return 0
 
@@ -216,12 +224,31 @@ def redact_credential(value: Any, settings: dict[str, Any]) -> Any:
 
 
 def _replace_secret(value: Any, secret: str) -> Any:
+    """Walk every container a provider payload can arrive in.
+
+    Not only the JSON three: an SDK is free to hand back a tuple of argv, a
+    set of headers, an exception object whose text carries the header, or raw
+    bytes -- and a dict *key* is as good a hiding place as a value.  Whatever
+    is left is stringified only if it turns out to contain the secret, so
+    ordinary values keep their type.
+    """
     if isinstance(value, str):
         return value.replace(secret, SECRET_TOKEN)
+    if isinstance(value, bytes):
+        try:
+            return value.replace(secret.encode("utf-8"), SECRET_TOKEN.encode("utf-8"))
+        except (UnicodeError, ValueError):
+            return value
     if isinstance(value, dict):
-        return {key: _replace_secret(item, secret) for key, item in value.items()}
+        return {_replace_secret(key, secret): _replace_secret(item, secret) for key, item in value.items()}
     if isinstance(value, list):
         return [_replace_secret(item, secret) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_secret(item, secret) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return {_replace_secret(item, secret) for item in value}
+    if isinstance(value, BaseException) or (not isinstance(value, (int, float, bool, type(None))) and secret in str(value)):
+        return _replace_secret(str(value), secret)
     return value
 
 
@@ -497,22 +524,25 @@ class HarnessRuntime:
         ceiling = _Ceiling(
             _positive_int(self.settings, "max_steps"), _positive_int(self.settings, "max_turns")
         )
+        # Kept outside the try so a failure can still hand back what happened
+        # before it: the SDK's own result is gone once it raises.
+        seen: list[dict[str, Any]] = []
         try:
             result = self._harness.run(
-                prompt, session_id=session_id, on_notification=self._notifier(on_event, ceiling)
+                prompt, session_id=session_id, on_notification=self._notifier(on_event, ceiling, seen)
             )
         except _Cancelled as exc:
-            raise HarnessRunFailed("interrupted", "run interrupted") from exc
+            raise HarnessRunFailed("interrupted", "run interrupted", seen) from exc
         except _CeilingReached as exc:
             # "failed", not "partial": the ladder reserves partial for a report
             # that arrived and was cut short (see finish_status), and a unit
             # stopped at a ceiling has produced no report at all.  It also keeps
             # a truncated unit out of the cross-run cache.
-            raise HarnessRunFailed("failed", str(exc)) from exc
+            raise HarnessRunFailed("failed", str(exc), seen) from exc
         except Exception as exc:
             if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
-                raise HarnessRunFailed("timed_out", f"agent runtime timed out: {exc}") from exc
-            raise HarnessRunFailed("failed", f"agent runtime error: {type(exc).__name__}: {exc}") from exc
+                raise HarnessRunFailed("timed_out", f"agent runtime timed out: {exc}", seen) from exc
+            raise HarnessRunFailed("failed", f"agent runtime error: {type(exc).__name__}: {exc}", seen) from exc
         duration = time.monotonic() - started
         self.check_cancelled()
         return RunOutcome(
@@ -534,7 +564,8 @@ class HarnessRuntime:
             raise HarnessRunFailed("interrupted", "run interrupted")
 
     def _notifier(
-        self, on_event: Callable[[dict[str, Any]], None] | None, ceiling: _Ceiling
+        self, on_event: Callable[[dict[str, Any]], None] | None, ceiling: _Ceiling,
+        seen: list[dict[str, Any]] | None = None,
     ) -> Callable[[Any], None]:
         def notify(notification: Any) -> None:
             if self.cancelled is not None and self.cancelled():
@@ -543,6 +574,8 @@ class HarnessRuntime:
                 # reclaims the child whether or not the SDK re-raises this.
                 raise _Cancelled
             plain = as_json_object(notification)
+            if seen is not None:
+                seen.append(plain)
             exceeded = ceiling.observe(_event_type(plain))
             if on_event is not None:
                 try:

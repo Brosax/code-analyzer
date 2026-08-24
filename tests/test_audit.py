@@ -250,3 +250,22 @@ def test_analyze_writes_the_assessment_and_recover_report_regenerates_it_offline
     recovered = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert recovered["audit"]["candidates"] == manifest["audit"]["candidates"]
     assert "audit/assessment.json" in {item["path"] for item in recovered["recovery"]["derived_artifacts"]}
+
+
+def test_every_category_a_skill_declares_has_an_id_family() -> None:
+    """A candidate's id prefix is how a reader triages it at a glance.
+
+    A declared category with no entry falls into the GEN family, which reads
+    as "uncategorised" for a finding whose category is perfectly well known.
+    """
+    from code_analyzer.audit import _ID_PREFIXES
+    from code_analyzer.llm.skills import load_skills
+    from code_analyzer.review import _CATEGORY_ALIASES
+
+    declared = {category for skill in load_skills() for category in skill.metadata.get("categories", [])}
+    assert declared, "the skills must declare categories at all"
+    # A declared category is resolved through the alias table before it ever
+    # reaches the prefix table, so only what survives that needs a family.
+    resolved = {_CATEGORY_ALIASES.get(category, category) for category in declared}
+    missing = sorted(category for category in resolved if category not in _ID_PREFIXES)
+    assert missing == [], f"no candidate id family for: {missing}"

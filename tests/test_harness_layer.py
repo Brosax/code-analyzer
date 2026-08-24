@@ -316,11 +316,21 @@ def test_truncated_response_is_partial_evidence(sdk, settings, tmp_path: Path) -
 
 
 def test_sdk_failure_maps_onto_the_unit_status_ladder(sdk, settings, tmp_path: Path) -> None:
+    """A failure is still a session, and what it did before failing is evidence.
+
+    The session cut off by a timeout or a step ceiling is the one that spent
+    the most tokens; discarding its stream would leave an auditor with an empty
+    log for exactly the sessions worth auditing, and would make the measured
+    token ledger under-report where it matters most.
+    """
     FakeHarness.failure = TimeoutError("no response")
     unit, directory = scan(tmp_path, settings)
     assert unit["status"] == "timed_out"
     assert "timed out" in unit["reason"]
-    assert (directory / "events.jsonl").read_bytes() == b""
+    delivered = [json.loads(line) for line in (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert delivered == FakeHarness.notifications
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    assert meta["event_count"] == len(delivered)
 
 
 def test_cancellation_interrupts_the_unit(sdk, settings, tmp_path: Path) -> None:
@@ -902,3 +912,74 @@ def test_measured_usage_sums_every_request_and_never_raises_on_junk() -> None:
     # The other spelling providers use for the same two numbers.
     snake = [{"data": {"chunk": {"type": "usage", "usage": {"prompt_tokens": 10, "completion_tokens": 4}}}}]
     assert measured_usage(snake) == {"prompt_tokens": 10, "completion_tokens": 4, "requests": 1}
+
+
+def test_the_credential_is_stripped_from_every_persisted_session_file(
+    sdk, settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """events.jsonl was the one write in that block that skipped redaction.
+
+    It matters more than the others, not less: the cross-run cache copies it
+    outside the run directory entirely, so a key that reaches it outlives the
+    run somewhere the shareable-export sanitiser never walks.
+    """
+    secret = "sk-live-CREDENTIAL-abcdef123456"
+    monkeypatch.setenv("CODE_ANALYZER_TEST_KEY", secret)
+    active = {**settings, "api_key_env": "CODE_ANALYZER_TEST_KEY"}
+    # The provider echoes the request headers back in an error event, then the
+    # call fails -- which is both how a key reaches a log in practice and the
+    # path whose events are only persisted because the failure carries them.
+    monkeypatch.setattr(FakeHarness, "notifications", [
+        {"type": "error", "message": f"401 from provider; sent Authorization: Bearer {secret}"},
+    ])
+    monkeypatch.setattr(FakeHarness, "failure", TimeoutError("no response"))
+
+    unit, directory = scan(tmp_path, active)
+
+    assert unit["status"] == "timed_out"
+    persisted = (directory / "events.jsonl").read_text(encoding="utf-8")
+    assert "401 from provider" in persisted, "the failure's own stream is the evidence"
+    for name in ("events.jsonl", "response.json", "findings.json", "meta.json", "request.json"):
+        body = (directory / name).read_text(encoding="utf-8")
+        assert secret not in body, name
+    assert runtime.SECRET_TOKEN in persisted
+
+
+def test_the_redactor_walks_containers_a_provider_can_really_return() -> None:
+    """JSON is not the only shape an SDK hands back.
+
+    A tuple of argv, a set of headers, an exception carrying the request, raw
+    bytes, or the secret used as a dict *key* are all ways a credential has
+    reached a log in practice.
+    """
+    secret = "sk-live-CREDENTIAL-abcdef123456"
+    settings = {"api_key_env": "CODE_ANALYZER_TEST_KEY"}
+    import os
+
+    os.environ["CODE_ANALYZER_TEST_KEY"] = secret
+    try:
+        for value in (
+            {"args": (f"--key={secret}",)},
+            {secret: "value"},
+            {"headers": {secret}},
+            {"exc": ValueError(f"bad key {secret}")},
+            {"body": f"Bearer {secret}".encode()},
+            [f"Authorization: Bearer {secret}"],
+        ):
+            redacted = runtime.redact_credential(value, settings)
+            assert secret not in repr(redacted), value
+            assert runtime.SECRET_TOKEN in repr(redacted), value
+        # Ordinary values keep their type and their content.
+        assert runtime.redact_credential({"n": 5, "f": 1.5, "b": True, "z": None}, settings) == {
+            "n": 5, "f": 1.5, "b": True, "z": None,
+        }
+    finally:
+        del os.environ["CODE_ANALYZER_TEST_KEY"]
+
+
+def test_a_non_finite_usage_number_is_measured_as_zero_not_raised() -> None:
+    """A cache file is JSON, and JSON accepts Infinity."""
+    from code_analyzer.harness.runtime import measured_usage
+
+    events = [{"data": {"chunk": {"type": "usage", "usage": {"inputTokens": float("inf"), "outputTokens": 3}}}}]
+    assert measured_usage(events) == {"prompt_tokens": 0, "completion_tokens": 3, "requests": 1}

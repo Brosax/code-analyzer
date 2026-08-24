@@ -61,7 +61,7 @@ def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: fl
         "endpoint": base,
         "model": model,
         "profile": settings.get("profile"),
-        "runtime": {"available": harness_available(), "sdk_version": sdk_version()},
+        "runtime": {"available": harness_available(), "sdk_version": _sdk_version()},
         "third_party_warning": third_party_warning(settings),
         "scanners": list(settings.get("scanners") or []),
     }
@@ -88,6 +88,18 @@ def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: fl
         and result["context_window"]["ok"]
     )
     return result
+
+
+def _sdk_version() -> str | None:
+    """The runtime version, or None when there is no runtime.
+
+    A missing SDK is precisely one of the things this command reports, so
+    asking for its version must not be what stops the command from running.
+    """
+    try:
+        return sdk_version()
+    except UserError:
+        return None
 
 
 def _models(base: str, key: str | None, model: str, *, timeout: float) -> dict[str, Any]:

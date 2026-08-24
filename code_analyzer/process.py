@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -35,21 +36,33 @@ class _LineForwarder:
         self._drain(final=True)
 
     def _drain(self, *, final: bool) -> None:
+        """Emit whole lines; keep at most one partial line pending.
+
+        Searched rather than walked character by character, and the pending
+        buffer is capped.  A tool that writes megabytes without a newline would
+        otherwise make every 64 KiB read re-scan everything read so far: the
+        reader stops draining, the child blocks on a full pipe, and the run
+        records a timeout that the tool never caused.
+        """
         start = 0
-        index = 0
-        length = len(self.pending)
-        while index < length:
-            character = self.pending[index]
-            if character not in "\r\n":
-                index += 1
-                continue
-            if character == "\r" and index + 1 == length and not final:
+        while True:
+            match = _LINE_BREAK.search(self.pending, start)
+            if match is None:
                 break
-            self._emit(self.pending[start:index])
-            index += 2 if character == "\r" and index + 1 < length and self.pending[index + 1] == "\n" else 1
-            start = index
+            # A trailing lone CR may be the first half of a CRLF still in the
+            # pipe, so it only ends a line once nothing more is coming.
+            if match.group() == "\r" and match.end() == len(self.pending) and not final:
+                break
+            self._emit(self.pending[start:match.start()])
+            start = match.end()
         self.pending = self.pending[start:]
         if final and self.pending:
+            self._emit(self.pending)
+            self.pending = ""
+        elif len(self.pending) >= MAX_LIVE_LINE_CHARS:
+            # No line break in sight: forward what there is rather than hold a
+            # buffer that grows without bound.  Live display is a courtesy;
+            # the raw file on disk is the evidence and is unaffected.
             self._emit(self.pending)
             self.pending = ""
 
@@ -70,6 +83,12 @@ class _LineForwarder:
 # Generous on purpose -- flawfinder's native report *is* its stdout, so the cap
 # has to sit far above any real report and act only against a runaway.
 MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+
+
+# One line the live display will forward without waiting for a break.  Only
+# the forwarded copy is bounded; the raw stream reaches disk whole.
+MAX_LIVE_LINE_CHARS = 64 * 1024
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 @dataclass

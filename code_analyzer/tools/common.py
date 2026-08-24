@@ -42,12 +42,30 @@ def unit_outcome(
 ) -> tuple[str, str | None]:
     """Shared per-unit status ladder for every analyzer adapter."""
     if process.interrupted:
-        return "interrupted", reason
+        return "interrupted", _with_truncation(reason, process)
     if process.timed_out:
-        return ("partial" if valid else "timed_out"), reason
+        return ("partial" if valid else "timed_out"), _with_truncation(reason, process)
     if succeeded:
-        return "completed", reason
-    return ("partial" if valid else "failed"), (reason or failure_reason)
+        return "completed", _with_truncation(reason, process)
+    return ("partial" if valid else "failed"), _with_truncation(reason or failure_reason, process)
+
+
+def _with_truncation(reason: str | None, process: Any) -> str | None:
+    """Name the output ceiling when it is why a report will not parse.
+
+    flawfinder's native report *is* its stdout, so a tool that ran past the
+    ceiling produces a JSON parse error whose real cause is invisible.  The
+    number is already in ``ProcessResult``; without this it has no reader, and
+    the unit's reason says "invalid report" rather than what happened.
+    """
+    dropped = {
+        stream: count for stream, count in (getattr(process, "truncated_bytes", None) or {}).items()
+        if isinstance(count, int) and count > 0
+    }
+    if not dropped:
+        return reason
+    detail = "; ".join(f"{count} byte(s) of {stream} dropped at the output ceiling" for stream, count in sorted(dropped.items()))
+    return f"{reason}; {detail}" if reason else detail
 
 
 def artifact(path: Path, run_dir: Path, chunk_size: int = 1024 * 1024) -> dict:

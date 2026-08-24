@@ -22,6 +22,7 @@ Two things it refuses to do quietly:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -113,6 +114,13 @@ def run_resume(
         f"resume: {len(pending)} unit(s) left {' or '.join(RESUMABLE)}; "
         f"{len(tasks)} replayable, {len(unreadable)} without a stored prompt"
     )
+    drift = _source_drift(run_dir, source)
+    if drift:
+        progress(
+            f"resume: {len(drift)} file(s) changed since the run: {', '.join(drift[:5])}"
+            + (" ..." if len(drift) > 5 else "")
+            + "; the replayed prompts are the original bytes, but the agent's file tool reads today's tree"
+        )
     for name, block in blocks.items():
         declared = str(block.get("skill_version") or "")
         if name in skills and declared and declared != skills[name].skill_version:
@@ -180,6 +188,11 @@ def run_resume(
     # The original budget was spent by the original run; this one has its own.
     phase["resume"] = {
         "runs": int((phase.get("resume") or {}).get("runs", 0)) + 1,
+        # Recorded, never silently tolerated: a resumed unit replays the
+        # original prompt, but the scanner's own file tool navigates the tree
+        # as it is now, so a changed file means two vintages of the same code
+        # are in one run's evidence.
+        "source_drift": drift,
         "resumed": len(records),
         "resolved": resolved,
         "unreadable": sorted(f"{name}/{unit_id}" for name, unit_id in unreadable),
@@ -216,6 +229,32 @@ def _rederive(run_dir: Path, manifest: dict[str, Any], config: dict[str, Any], p
     progress(f"resume: review re-derived; {review['total_findings']} findings")
 
 
+def _source_drift(run_dir: Path, source: Path) -> list[str]:
+    """Files whose bytes no longer match what the run inventoried.
+
+    ``analyze`` re-hashes the tree after scanning and records the result;
+    resume runs later still, so it has to ask the same question.  Missing or
+    unreadable inventory is not drift -- it is an unknown, and inventing one
+    would be worse than reporting none.
+    """
+    inventory = (_read_optional(run_dir / "inputs" / "source-inventory.json") or {}).get("files")
+    if not isinstance(inventory, list) or not source.is_dir():
+        return []
+    changed: list[str] = []
+    for record in inventory:
+        if not isinstance(record, dict) or not record.get("sha256"):
+            continue
+        path = source / str(record.get("path") or "")
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            changed.append(str(record.get("path")))
+            continue
+        if digest != str(record["sha256"]):
+            changed.append(str(record.get("path")))
+    return sorted(changed)
+
+
 def _honest_skill_version(
     rebuilt: dict[str, Any], original: dict[str, Any], units: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -227,10 +266,14 @@ def _honest_skill_version(
     own records.  When the block spans more than one, it says so instead of
     picking a winner.
     """
+    # Only units a scanner actually ran state a provenance.  An unscheduled or
+    # interrupted unit is stamped with the version that would have scanned it
+    # and no digest at all; counting that as a second scanner would make every
+    # ordinary partial resume claim two.
     versions = sorted({
         (str(unit.get("skill_version") or ""), str(unit.get("skill_sha256") or ""))
         for unit in units
-        if unit.get("skill_version")
+        if unit.get("skill_version") and unit.get("skill_sha256")
     })
     if len(versions) <= 1:
         return rebuilt

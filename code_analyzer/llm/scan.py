@@ -40,6 +40,7 @@ from ..harness.session import resync_meta_status, run_unit, unit_directory
 from ..persist import json_bytes, write_json
 from ..status import aggregate_units, counts
 from ..tools import LLM_PRODUCERS
+from . import replan
 from .context import build_unit_prompt, render_blocks
 from .risk import tier_rank
 from .skills import Skill, load_skill, skills_directory
@@ -134,8 +135,13 @@ def run(
             cancelled=cancelled,
             open_runtime=open_runtime,
         )
-        records = state.execute_all(_tasks(units, scanners))
+        records, rounds = _rounds(state, plan, units, scanners, config, progress)
 
+    write_json(
+        run_dir.joinpath(*replan.PLAN_PATH),
+        replan.ledger(rounds, decider=str(settings.get("replan_decider") or replan.DETERMINISTIC),
+                      limit=int(settings.get("max_replan_rounds", 0) or 0)),
+    )
     results = [
         {"unit_id": record["id"], "producer": record["producer"], "status": record["status"]}
         for record in records
@@ -153,6 +159,8 @@ def run(
         "sdk_version": _sdk_version(),
         "index": "llm/index.json",
         "cordis": "llm/cordis.json",
+        "plan": "/".join(replan.PLAN_PATH),
+        "rounds": len(rounds) + 1,
         "jobs": state.jobs,
         "planned_units": len(units),
         "scanners": {
@@ -220,6 +228,96 @@ def _phase_record(**overrides: Any) -> dict[str, Any]:
         "parse_confidence_low": 0,
         **overrides,
     }
+
+
+def _rounds(
+    state: "_Phase",
+    plan: dict[str, Any],
+    units: list[dict[str, Any]],
+    scanners: list[str],
+    config: dict[str, Any],
+    progress: Callable[[str], None],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Round 0, then at most ``max_replan_rounds`` bounded follow-ups.
+
+    Round 0 is the deterministic plan and is what every run has always done.
+    Each later round is driven by counts the previous round measured -- never
+    by a finding's text -- and may only take an action from the vocabulary in
+    ``replan.ACTIONS``, aimed at units that already exist.  The ledger records
+    every round, including the one that decided to stop.
+    """
+    limit = int(config["llm"].get("max_replan_rounds", 0) or 0)
+    decider = str(config["llm"].get("replan_decider") or replan.DETERMINISTIC)
+    records = state.execute_all(_tasks(units, scanners))
+    rounds: list[dict[str, Any]] = []
+    escalated: set[str] = set()
+    active = list(scanners)
+    by_id = {unit["unit_id"]: unit for unit in units}
+    for index in range(1, limit + 1):
+        budget_before = state.budget_state()
+        observation = replan.observe(records, plan, budget_before)
+        action = replan.decide(observation, plan, records, escalated=escalated)
+        entry = {
+            "round": index,
+            "decided_by": decider if decider == replan.DETERMINISTIC else replan.DETERMINISTIC,
+            "observation": observation,
+            "action": action["action"],
+            "targets": action["targets"],
+            "rationale": action["rationale"],
+            "budget_before": budget_before,
+        }
+        follow_up, active, escalated = _apply(action, by_id, active, escalated, state)
+        if not follow_up:
+            entry["budget_after"] = state.budget_state()
+            entry["scheduled"] = 0
+            rounds.append(entry)
+            break
+        progress(f"llm: replan round {index}: {action['action']} on {len(follow_up)} unit(s)")
+        state.round_index = index
+        records.extend(state.execute_all(follow_up))
+        state.round_index = 0
+        entry["budget_after"] = state.budget_state()
+        entry["scheduled"] = len(follow_up)
+        rounds.append(entry)
+    return records, rounds
+
+
+def _apply(
+    action: dict[str, Any],
+    by_id: dict[str, dict[str, Any]],
+    active: list[str],
+    escalated: set[str],
+    state: "_Phase",
+) -> tuple[list[Task], list[str], set[str]]:
+    """Turn one vocabulary action into the next round's tasks.
+
+    ``mark_for_validation`` and ``extend_deadline`` schedule nothing here: the
+    first is a note for ``assess`` and the second moves the phase deadline,
+    which the scheduler already reads on every dispatch.
+    """
+    name, targets = action["action"], list(action.get("targets") or [])
+    if name == "escalate_tier":
+        tier = str(action.get("to_tier") or "high")
+        escalated = escalated | set(targets)
+        raised = [
+            {**unit, "risk_tier": tier}
+            for unit in by_id.values() if unit.get("path") in set(targets)
+        ]
+        return _tasks(raised, active), active, escalated
+    if name == "rescan":
+        pairs = [item.split("::", 1) for item in targets if "::" in item]
+        tasks = [
+            (index, producer, by_id[unit_id])
+            for index, (producer, unit_id) in enumerate(sorted(pairs), 1)
+            if producer in active and unit_id in by_id
+        ]
+        return tasks, active, escalated
+    if name == "stop_producer":
+        return [], [item for item in active if item not in set(targets)], escalated
+    if name == "extend_deadline":
+        state.deadline += float(action.get("seconds") or 0.0)
+        return [], active, escalated
+    return [], active, escalated
 
 
 def _tasks(units: list[dict[str, Any]], scanners: list[str]) -> list[Task]:
@@ -451,6 +549,9 @@ class _Phase:
         self.prompt_spent = 0
         self.completion_reserved = 0
         self.measured = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+        # Which re-planning round the phase is dispatching.  0 is the
+        # deterministic first pass and keeps the historical evidence paths.
+        self.round_index = 0
         self.total = 0
         self._cancel = threading.Event()
         self._ledger = threading.Lock()
@@ -551,7 +652,7 @@ class _Phase:
         record, provider_stopped = _provider_stop(record)
         if provider_stopped:
             resync_meta_status(
-                unit_directory(self.run_dir, producer, unit_id),
+                unit_directory(self.run_dir, producer, unit_id, self.round_index),
                 str(record.get("status", "")),
                 str(record.get("reason", "")),
             )
@@ -561,7 +662,7 @@ class _Phase:
         # exists to prevent.
         cacheable = record.get("status") in {"completed", "partial"} and not provider_stopped
         if cached is None and cacheable:
-            self.cache.store(key, unit_directory(self.run_dir, producer, unit_id), self.run_dir.name)
+            self.cache.store(key, unit_directory(self.run_dir, producer, unit_id, self.round_index), self.run_dir.name)
         # A replayed unit costs the provider nothing, so its measured usage
         # belongs to the run that paid for it, not to this one.
         if cached is None:
@@ -647,6 +748,7 @@ class _Phase:
             cache=cache,
             cancelled=self.is_cancelled,
             on_event=self._forward(producer, unit["unit_id"]),
+            round_index=self.round_index,
         )
 
     def _runtime(self, producer: str, unit_id: str, settings: dict[str, Any]) -> ContextManager[Any]:
