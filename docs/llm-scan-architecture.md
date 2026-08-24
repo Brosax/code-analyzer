@@ -266,6 +266,9 @@ LLM_PRODUCERS: tuple[str, ...] = (
     "llm-memory-safety",
     "llm-security",
     "llm-firmware-concurrency",
+    "llm-undefined-behavior",
+    "llm-resource-error",
+    "llm-logic",
 )
 PRODUCER_ORDER: tuple[str, ...] = TOOL_NAMES + LLM_PRODUCERS
 ```
@@ -452,7 +455,7 @@ stdlib 实现在以下情形会失准，必须记录而非隐瞒：
 
 ### 5.1 专家 Scanner 的定义形态
 
-三个专家 scanner 定义为 `dsh` **Skill**：Markdown + YAML frontmatter，
+六个专家 scanner 定义为 `dsh` **Skill**：Markdown + YAML frontmatter，
 kebab-case 命名，目录形式 `<name>/SKILL.md` 或扁平文件 `<name>.md`。
 
 ```text
@@ -460,6 +463,10 @@ code_analyzer/skills/
     llm-memory-safety/SKILL.md
     llm-security/SKILL.md
     llm-firmware-concurrency/SKILL.md
+    llm-undefined-behavior/SKILL.md
+    llm-resource-error/SKILL.md
+    llm-logic/SKILL.md
+    llm-validator/SKILL.md          # role: validator，不是 producer
 ```
 
 **Skill 是纯声明式的，不需要写 TypeScript。** 这是第一期能做到零 TypeScript 的关键。
@@ -483,9 +490,20 @@ rank 300 的 `custom` 根（`Config.customSkillDirs`），路径通过
 
 | Scanner | 关注范围 |
 |---|---|
-| `llm-memory-safety` | 缓冲区溢出、越界、指针误用、整数溢出、不安全内存拷贝、生命周期、未初始化内存、栈使用、未定义行为 |
+| `llm-memory-safety` | 空间与时间维度：缓冲区溢出、越界、不安全内存拷贝、空指针解引用、生命周期、未初始化内存、栈使用 |
 | `llm-security` | 认证缺陷、输入校验、协议解析、硬编码密钥、信息泄露、不安全固件更新、调试后门、密码学误用、信任边界 |
 | `llm-firmware-concurrency` | ISR 竞态、`volatile` 误用、原子性、RTOS 同步、看门狗、MMIO、寄存器访问、DMA、超时、硬件状态、复位行为 |
+
+| `llm-undefined-behavior` | 算术与语义维度：整数溢出、符号/宽度转换、指针误用与对齐、移位与求值顺序等未定义行为 |
+| `llm-resource-error` | 资源泄漏、错误路径未清理、未检查返回值、句柄误用（已关闭/已释放后使用） |
+| `llm-logic` | **闭合 token 集**，只有四类：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch` |
+
+memory-safety 与 undefined-behavior 是**同一次重切**的两半：前者按空间/时间，后者按
+算术/语义；两份 `skill_version` 同期上升（2.0.0 / 1.0.0），跨运行缓存因此整体失效
+（缓存键含 `skill_version` 与 skill 内容摘要）。
+
+`llm-logic` 按构造定义而非按排除法定义：它**只**接受上表四个 token，"找一切逻辑问题"
+被明确拒绝——那会退化成建议形态，违反 README:9-11 的章程。
 
 后续可扩展 Secrets / Robustness / Architecture / Coding Standards / Crypto，
 每个仍只管自己那一块。
@@ -992,7 +1010,10 @@ endpoint = "http://127.0.0.1:11435/v1"          # 显式设置时覆盖 profile 
 api_key_env = "CODE_ANALYZER_LLM_API_KEY"
 model = "qwen3.6-27b"
 context_window = 32768
-scanners = ["llm-memory-safety", "llm-security", "llm-firmware-concurrency"]
+# 默认是全部六个 scanner。下面两个 token 预算是**单个 scanner** 的基数：
+# 未显式设置时按启用 scanner 数线性放大，显式设置则原样使用。
+scanners = ["llm-memory-safety", "llm-security", "llm-firmware-concurrency",
+            "llm-undefined-behavior", "llm-resource-error", "llm-logic"]
 temperature = 0.0
 seed = 0
 max_completion_tokens = 800
@@ -1000,8 +1021,8 @@ max_steps = 12
 max_turns = 8
 request_timeout_seconds = 600.0
 total_timeout_seconds = 14400.0
-total_prompt_tokens = 2000000
-total_completion_tokens = 400000
+total_prompt_tokens = 700000                    # 单 scanner 基数 × 启用 scanner 数
+total_completion_tokens = 140000                # 单 scanner 基数 × 启用 scanner 数
 jobs = 2
 heartbeat_seconds = 15.0
 cache = true

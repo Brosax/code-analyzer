@@ -8,15 +8,24 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from code_analyzer.process import run_process
 
 ROOT = Path(__file__).parents[1]
 
 
-def test_splint_budget_accounts_unscheduled_tus(tmp_path: Path) -> None:
+@pytest.mark.parametrize("jobs", (1, 4))
+def test_splint_budget_accounts_unscheduled_tus(tmp_path: Path, jobs: int) -> None:
+    """The total budget bounds the work on both scheduling paths.
+
+    A worker checks the budget when it picks a unit up, not when the unit is
+    submitted, so units behind an exhausted budget are unscheduled whether the
+    pool has one worker or several.
+    """
     source = tmp_path / "src"
     source.mkdir()
-    for index in range(4):
+    for index in range(2 * jobs):
         (source / f"f{index}.c").write_text("int x;\n")
     fake = tmp_path / "slow-splint"
     fake.write_text("#!/usr/bin/env python3\nimport sys, time\nif '-help' in sys.argv: print('Splint 3.1.2'); raise SystemExit()\ntime.sleep(1)\n", encoding="utf-8")
@@ -29,8 +38,9 @@ def test_splint_budget_accounts_unscheduled_tus(tmp_path: Path) -> None:
         termination_grace_seconds = 0.01
         [tools.splint]
         executable = {json.dumps(str(fake))}
-        tu_timeout_seconds = 0.02
-        total_timeout_seconds = 0.03
+        tu_timeout_seconds = 0.05
+        total_timeout_seconds = 0.02
+        jobs = {jobs}
     """))
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     result = subprocess.run(
@@ -40,7 +50,7 @@ def test_splint_budget_accounts_unscheduled_tus(tmp_path: Path) -> None:
     assert result.returncode == 20
     manifest = json.loads((Path(result.stdout.strip()) / "manifest.json").read_text())
     units = manifest["tools"]["splint"]["units"]
-    assert len(units) == 4
+    assert len(units) == 2 * jobs
     assert sum(unit["status"] == "unscheduled" for unit in units) >= 1
     counts = manifest["tools"]["splint"]["unit_counts"]
     assert counts["planned"] == counts["started"] + counts["unscheduled"]

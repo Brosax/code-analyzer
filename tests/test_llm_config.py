@@ -217,3 +217,37 @@ def _build_wheel(source: Path, destination: Path) -> Path:
     with contextlib.chdir(source):
         name = build_meta.build_wheel(str(destination))
     return destination / name
+
+
+def test_the_token_budgets_scale_with_the_scanner_roster_but_never_over_a_choice(tmp_path: Path) -> None:
+    from code_analyzer.config import SCANNER_SCALED_KEYS
+    from code_analyzer.tools import LLM_PRODUCERS
+
+    source = tmp_path / "src"
+    source.mkdir()
+    loaded = load_config_with_sources(source, None)
+    # The default roster is every scanner, and each of them reads every unit.
+    for key in SCANNER_SCALED_KEYS:
+        assert loaded.config["llm"][key] == DEFAULTS["llm"][key] * len(LLM_PRODUCERS)
+        assert loaded.sources[f"llm.{key}"] == f"default:{len(LLM_PRODUCERS)}-scanners"
+
+    # One scanner: the base, unscaled, and still recorded as a plain default.
+    one = load_config_with_sources(source, None, {"llm": {"scanners": ["llm-memory-safety"]}})
+    for key in SCANNER_SCALED_KEYS:
+        assert one.config["llm"][key] == DEFAULTS["llm"][key]
+        assert one.sources[f"llm.{key}"] == "default"
+
+    # A number the user wrote is the number the user gets, whatever the roster.
+    chosen = load_config_with_sources(source, None, {"llm": {"total_prompt_tokens": 5000}})
+    assert chosen.config["llm"]["total_prompt_tokens"] == 5000
+    assert chosen.sources["llm.total_prompt_tokens"] == "session"
+    # ... and the other budget still scales: the rule is per key, not per section.
+    assert chosen.config["llm"]["total_completion_tokens"] == DEFAULTS["llm"]["total_completion_tokens"] * len(LLM_PRODUCERS)
+
+    # Reloading a run's own effective config reproduces it: the file states the
+    # resolved product explicitly, so nothing is scaled a second time.
+    written = tmp_path / "effective.toml"
+    written.write_text(effective_toml(loaded.config), encoding="utf-8")
+    reloaded = load_config_with_sources(source, written)
+    for key in SCANNER_SCALED_KEYS:
+        assert reloaded.config["llm"][key] == loaded.config["llm"][key]

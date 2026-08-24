@@ -64,8 +64,9 @@ DEFAULTS: dict[str, Any] = {
         "max_turns": 8,
         "request_timeout_seconds": 600.0,
         "total_timeout_seconds": 14400.0,
-        "total_prompt_tokens": 2000000,
-        "total_completion_tokens": 400000,
+        # Per-scanner budgets: see scale_scanner_budgets.
+        "total_prompt_tokens": 700000,
+        "total_completion_tokens": 140000,
         "jobs": 2,
         "heartbeat_seconds": 15.0,
         "cache": True,
@@ -93,7 +94,12 @@ DEFAULTS: dict[str, Any] = {
             "tu_timeout_seconds": 60.0,
             "total_timeout_seconds": 14400.0,
             "scope": "auto",
-            "jobs": 1,
+            # splint is per-translation-unit and CPU-bound, and its units are
+            # independent: raising its own parallelism is the cheap half of
+            # "run the analyzers concurrently" without a shared-cancel rewrite.
+            # A fixed number, not a CPU count: the resolved value is recorded in
+            # inputs/effective-config.toml and must reload the same on any host.
+            "jobs": 4,
             "heartbeat_seconds": 10.0,
         },
     },
@@ -155,8 +161,8 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.max_turns", "int", "模型往返上限", "单个单元内的最大模型往返次数。", minimum=1, advanced=True),
     FieldSpec("llm.request_timeout_seconds", "float", "单元请求超时", "单个单元的壁钟超时秒数。", minimum=0.001, advanced=True),
     FieldSpec("llm.total_timeout_seconds", "float", "LLM 总超时", "整个 LLM 阶段共享的壁钟预算。", minimum=0.001, advanced=True),
-    FieldSpec("llm.total_prompt_tokens", "int", "Prompt token 预算", "预算耗尽的单元记为 unscheduled，绝不截断上下文。", minimum=1, advanced=True),
-    FieldSpec("llm.total_completion_tokens", "int", "生成 token 预算", "整个 LLM 阶段的生成 token 上限。", minimum=1, advanced=True),
+    FieldSpec("llm.total_prompt_tokens", "int", "Prompt token 预算", "单个 scanner 的预算，未显式设置时按启用 scanner 数线性放大；预算耗尽的单元记为 unscheduled，绝不截断上下文。", minimum=1, advanced=True),
+    FieldSpec("llm.total_completion_tokens", "int", "生成 token 预算", "单个 scanner 的生成 token 上限，未显式设置时按启用 scanner 数线性放大。", minimum=1, advanced=True),
     FieldSpec("llm.jobs", "int", "LLM 并发数", "并发扫描单元数量。", minimum=1, advanced=True),
     FieldSpec("llm.heartbeat_seconds", "float", "LLM 心跳", "长任务状态刷新间隔。", minimum=0.001, advanced=True),
     FieldSpec("llm.cache", "bool", "跨运行缓存", "命中缓存的单元不再调用模型。", advanced=True),
@@ -279,6 +285,32 @@ def _absolute(value: os.PathLike[str] | str, base: Path) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
 
 
+# Every enabled scanner reads every unit, so a per-run token budget has to grow
+# with the roster: leaving it fixed would silently halve each scanner's reach
+# when the roster doubles, and the units it could not afford would be reported
+# as unscheduled rather than as a budget the user chose.  The two DEFAULTS above
+# are therefore the budget for ONE scanner, multiplied here by the number of
+# enabled scanners -- but only while the value is still that default.  A number
+# the user wrote is the number the user gets, and inputs/effective-config.toml
+# records the resolved product, so reloading a run's own config reproduces it.
+SCANNER_SCALED_KEYS: tuple[str, ...] = ("total_prompt_tokens", "total_completion_tokens")
+
+
+def scale_scanner_budgets(llm: dict[str, Any], sources: dict[str, str]) -> None:
+    """Scale the still-default token budgets by the number of enabled scanners."""
+    scanners = llm.get("scanners")
+    count = len(scanners) if isinstance(scanners, list) else 0
+    if count <= 1:
+        return
+    for key in SCANNER_SCALED_KEYS:
+        path = f"llm.{key}"
+        base = DEFAULTS["llm"][key]
+        if sources.get(path, "default") != "default" or llm.get(key) != base:
+            continue
+        llm[key] = int(base) * count
+        sources[path] = f"default:{count}-scanners"
+
+
 def load_config_with_sources(
     source: Path, explicit: Path | None, session: dict[str, Any] | None = None
 ) -> LoadedConfig:
@@ -301,6 +333,7 @@ def load_config_with_sources(
         _validate_keys(session)
         _merge_with_sources(config, session, sources, "session")
     apply_profile(config["llm"], sources)
+    scale_scanner_budgets(config["llm"], sources)
     validate_config(config)
     # Runtime metadata is deliberately not part of the versioned TOML model.
     config["_config_paths"] = config_paths

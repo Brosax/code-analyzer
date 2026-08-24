@@ -9,5 +9,8 @@ LLM_PRODUCERS: tuple[str, ...] = (
     "llm-memory-safety",
     "llm-security",
     "llm-firmware-concurrency",
+    "llm-undefined-behavior",
+    "llm-resource-error",
+    "llm-logic",
 )
 PRODUCER_ORDER: tuple[str, ...] = TOOL_NAMES + LLM_PRODUCERS

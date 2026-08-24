@@ -59,6 +59,14 @@ FINDING_CATEGORIES: tuple[str, ...] = (
     "timeout",
     "hardware-state",
     "reset-behavior",
+    "sign-conversion",
+    "error-path",
+    "unchecked-return",
+    "handle-misuse",
+    "state-machine",
+    "inverted-condition",
+    "dead-code",
+    "unreachable-branch",
     "other",
 )
 

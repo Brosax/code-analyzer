@@ -212,3 +212,59 @@ def test_the_validator_is_a_role_not_a_producer() -> None:
     assert "shell" not in " ".join(skill.metadata.get("allowed-tools", []))
     # Disagreement or agreement between producers is not a verdict.
     assert "not** confirmed by their" in skill.body or "not confirmed by their" in skill.body
+
+
+def test_every_declared_category_is_in_the_shared_vocabulary() -> None:
+    """A skill may only promise categories the finding schema accepts.
+
+    A category the parser does not know is not a lenient-parse case: the
+    finding is rejected, so a scanner taught to emit one reports nothing.
+    """
+    from code_analyzer.harness.schema import FINDING_CATEGORIES
+
+    for skill in load_skills():
+        for category in skill.metadata.get("categories", []):
+            assert category in FINDING_CATEGORIES, (skill.name, category)
+
+
+def test_the_recut_partitions_the_old_memory_safety_scope_and_invalidates_its_cache() -> None:
+    """Memory safety and undefined behaviour were recut in one commit.
+
+    The old memory-safety scanner owned bounds *and* arithmetic; they are now
+    split spatial/temporal vs arithmetic/semantic.  Both skills carry the
+    versions that recut produced, and because the cross-run cache key is built
+    from ``skill_version`` and the skill's own digest, no unit scanned under
+    the old scope can be replayed under the new one.
+    """
+    memory, undefined = load_skill("llm-memory-safety"), load_skill("llm-undefined-behavior")
+    assert memory.skill_version == "2.0.0" and undefined.skill_version == "1.0.0"
+    spatial = set(memory.metadata["categories"])
+    arithmetic = set(undefined.metadata["categories"])
+    assert not spatial & arithmetic
+    # Every category the pre-recut scanner owned still has exactly one owner.
+    previous = {
+        "buffer", "out-of-bounds", "pointer-misuse", "null-dereference", "integer-overflow",
+        "unsafe-copy", "lifetime", "uninitialized", "stack-usage", "undefined-behavior",
+    }
+    assert previous <= spatial | arithmetic
+    assert "integer-overflow" in arithmetic and "buffer" in spatial
+
+    from code_analyzer.llm.scan import CACHE_SCHEMA_VERSION
+
+    assert isinstance(CACHE_SCHEMA_VERSION, int)
+    unit = {"unit_sha256": "a" * 64}
+    settings = {
+        "model": "m", "endpoint": "http://127.0.0.1:1/v1", "api_key_env": "", "temperature": 0.0,
+        "seed": 0, "max_completion_tokens": 10, "context_window": 100, "max_steps": 1, "max_turns": 1,
+    }
+
+    cache = _cache(settings)
+    keys = {cache.key("llm-memory-safety", unit, settings, skill, "prompt") for skill in (memory, undefined)}
+    assert len(keys) == 2, "a recut skill must not hit the cache entry of the scope it replaced"
+
+
+def _cache(settings: dict[str, Any]):
+    from code_analyzer.llm.scan import _Cache
+
+    config = {"llm": {"cache": True, "cache_directory": "", **settings}, "run": {"output_root": "/tmp"}}
+    return _Cache(config, Path("/tmp"))

@@ -1176,6 +1176,13 @@ _CATEGORY_ALIASES = {
     "crypto": "crypto-misuse",
     "protocol": "protocol-parsing",
     "auth": "authentication",
+    "leak": "resource-leak",
+    "memory-leak": "resource-leak",
+    "error-handling": "error-path",
+    "ignored-return": "unchecked-return",
+    "fsm": "state-machine",
+    "unreachable": "unreachable-branch",
+    "unreachable-code": "unreachable-branch",
 }
 
 _CWE_CATEGORIES: tuple[tuple[str, frozenset[int]], ...] = (
@@ -1210,7 +1217,7 @@ _KEYWORD_CATEGORIES: tuple[tuple[str, str], ...] = (
 # Reached only by LLM findings, and appended rather than merged so the static
 # rules above keep the meaning they had before the LLM vocabulary existed.
 _LLM_KEYWORD_CATEGORIES: tuple[tuple[str, str], ...] = _KEYWORD_CATEGORIES + (
-    ("integer-overflow", r"integer overflow|signed overflow|unsigned wrap|truncat|sign.?(?:ed )?conversion"),
+    ("integer-overflow", r"integer overflow|signed overflow|unsigned wrap"),
     ("lifetime", r"use.?after.?free|double free|dangling|freed memory|after it is freed"),
     ("race", r"\brace\b|data race|concurrent|reentran|thread.?unsafe"),
     ("isr-safety", r"\bisr\b|\birq\b|interrupt (?:handler|context|service)"),
@@ -1233,6 +1240,14 @@ _LLM_KEYWORD_CATEGORIES: tuple[tuple[str, str], ...] = _KEYWORD_CATEGORIES + (
     ("debug-backdoor", r"backdoor|debug port|\bjtag\b|\bswd\b"),
     ("stack-usage", r"stack (?:usage|overflow|frame)|alloca|variable.?length array"),
     ("undefined-behavior", r"undefined behaviou?r|strict aliasing|unsequenced"),
+    ("sign-conversion", r"sign.?(?:ed )?conversion|signed.?unsigned|narrowing"),
+    ("error-path", r"error path|on failure|early return|without (?:releasing|unlocking|freeing|closing)"),
+    ("unchecked-return", r"unchecked return|return value (?:is )?ignored|ignores? the (?:return|result)|discarded result"),
+    ("handle-misuse", r"after (?:it is |being )?closed|double close|closed twice|released twice|use.?after.?close"),
+    ("state-machine", r"state machine|\bfsm\b|transition"),
+    ("inverted-condition", r"inverted|reversed (?:condition|check)|wrong sense|negat(?:ed|ion) of the wrong"),
+    ("dead-code", r"dead code|never (?:read|executed|used)|overwritten before"),
+    ("unreachable-branch", r"unreachable|always (?:true|false)|cannot execute"),
 )
 
 

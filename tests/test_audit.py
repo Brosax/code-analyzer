@@ -76,13 +76,16 @@ def test_a_static_cwe_meets_the_matching_llm_category() -> None:
     fires first), so it could never meet an LLM "integer-overflow".
     """
     static = _row("flawfinder", "20", cwe="CWE-190", message="atoi: integer overflow risk")
-    llm = _row("llm-memory-safety", "21", cwe="CWE-190", category="integer-overflow", message="signed overflow")
+    llm = _row("llm-undefined-behavior", "21", cwe="CWE-190", category="integer-overflow", message="signed overflow")
     assert correlation_category(static) == "integer-overflow"
     assert correlation_category(llm) == "integer-overflow"
     assessment = build_assessment(_review(static, llm))
     [candidate] = assessment["candidates"]
     assert candidate["origin"] == "both" and candidate["category"] == "integer-overflow"
-    assert candidate["id"].startswith("MEM-")
+    # Arithmetic moved from the memory-safety scanner to the undefined-behaviour
+    # one when the two were recut along spatial/temporal vs arithmetic/semantic
+    # lines, so the candidate id follows the category, not the old owner.
+    assert candidate["id"].startswith("UB-")
 
 
 def test_findings_without_a_line_are_counted_not_dropped() -> None:

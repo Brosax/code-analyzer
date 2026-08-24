@@ -27,7 +27,7 @@ def test_v1_config_is_upgraded_with_v2_defaults(tmp_path: Path) -> None:
     assert config["config_schema_version"] == 2
     assert config["review"] == {"enabled": True, "fail_on": "none", "max_markdown_findings": 200}
     assert config["tools"]["splint"]["scope"] == "auto"
-    assert config["tools"]["splint"]["jobs"] == 1
+    assert config["tools"]["splint"]["jobs"] == 4
 
 
 def test_splint_flags_resolve_each_entry_directory_and_drop_gcc_only_options(tmp_path: Path) -> None:

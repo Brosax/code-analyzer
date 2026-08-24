@@ -57,8 +57,11 @@ _FROZEN_STATIC_CWES: tuple[tuple[str, frozenset[int]], ...] = (
 # A candidate id names the family a reader would triage it under.
 _ID_PREFIXES: dict[str, str] = {
     "buffer": "MEM", "null-dereference": "MEM", "uninitialized": "MEM", "lifetime": "MEM",
-    "integer-overflow": "MEM", "stack-usage": "MEM", "undefined-behavior": "UB",
-    "resource-leak": "RES", "format": "SEC", "randomness": "SEC", "input-validation": "SEC",
+    "stack-usage": "MEM", "integer-overflow": "UB", "undefined-behavior": "UB",
+    "sign-conversion": "UB", "pointer-misuse": "UB",
+    "resource-leak": "RES", "error-path": "RES", "unchecked-return": "RES", "handle-misuse": "RES",
+    "state-machine": "LOG", "inverted-condition": "LOG", "dead-code": "LOG", "unreachable-branch": "LOG",
+    "format": "SEC", "randomness": "SEC", "input-validation": "SEC",
     "protocol-parsing": "SEC", "info-leak": "SEC", "hardcoded-secret": "SEC",
     "authentication": "SEC", "trust-boundary": "SEC", "crypto-misuse": "SEC",
     "firmware-update": "SEC", "debug-backdoor": "SEC", "race": "FW", "isr-safety": "FW",
