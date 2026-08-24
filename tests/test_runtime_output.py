@@ -229,3 +229,48 @@ def test_running_page_batches_and_bounds_log_lines(tmp_path: Path) -> None:
             assert not log.lines
 
     asyncio.run(exercise())
+
+
+def test_a_runaway_tool_is_capped_without_being_blocked(tmp_path: Path) -> None:
+    """The ceiling bounds the disk, never the child.
+
+    The project refuses Docker (README:9) and cannot use ``preexec_fn`` under
+    the adapters' thread pools, so this cap is the whole resource limit.  It
+    has to keep draining the pipe after it stops storing: a pipe left unread
+    blocks the writer, which would turn a limit on disk use into a hang.
+    """
+    script = tmp_path / "runaway.py"
+    script.write_text(textwrap.dedent("""\
+        import os, sys
+        payload = b'x' * 4096
+        for _ in range(256):          # 1 MiB, far past the ceiling below
+            os.write(1, payload)
+        os.write(2, b'e' * 5000)
+        sys.exit(3)
+    """), encoding="utf-8")
+    stdout, stderr = tmp_path / "stdout.raw", tmp_path / "stderr.raw"
+
+    result = run_process(
+        [sys.executable, str(script)], tmp_path, stdout, stderr,
+        timeout=30.0, grace=1.0, max_output_bytes=4096,
+    )
+
+    # The child ran to completion and was reaped: capped, not killed.
+    assert result.exit_code == 3 and result.timed_out is False and result.interrupted is False
+    assert stdout.stat().st_size == 4096 and stderr.stat().st_size == 4096
+    assert result.truncated_bytes["stdout"] == 1024 * 1024 - 4096
+    assert result.truncated_bytes["stderr"] == 5000 - 4096
+    # Truncation is evidence: it travels in the unit record like any other
+    # process fact, so a report that fails to parse can be explained.
+    assert result.as_dict()["truncated_bytes"] == result.truncated_bytes
+
+
+def test_output_below_the_ceiling_is_stored_whole_and_reports_no_truncation(tmp_path: Path) -> None:
+    script = tmp_path / "small.py"
+    script.write_text("import os\nos.write(1, b'ok\\n')\n", encoding="utf-8")
+    stdout, stderr = tmp_path / "stdout.raw", tmp_path / "stderr.raw"
+
+    result = run_process([sys.executable, str(script)], tmp_path, stdout, stderr, timeout=30.0, grace=1.0)
+
+    assert stdout.read_bytes() == b"ok\n"
+    assert result.truncated_bytes == {"stdout": 0, "stderr": 0}

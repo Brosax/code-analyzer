@@ -6,9 +6,9 @@ import selectors
 import signal
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Collection
+from typing import Any, Callable, Collection
 
 OutputSink = Callable[[str, str], None]
 
@@ -63,6 +63,15 @@ class _LineForwarder:
             pass
 
 
+# A per-stream ceiling on what one analyzer may write to disk.  This is the
+# project's answer to "resource limits": Docker would violate README:9 ("does
+# not install tools") and ``preexec_fn`` is not safe under the thread pools two
+# adapters use, but a runaway tool filling the disk is a real failure mode.
+# Generous on purpose -- flawfinder's native report *is* its stdout, so the cap
+# has to sit far above any real report and act only against a runaway.
+MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+
+
 @dataclass
 class ProcessResult:
     argv: list[str]
@@ -74,6 +83,10 @@ class ProcessResult:
     timed_out: bool
     interrupted: bool
     termination: str | None
+    # Bytes the tool wrote past the ceiling and this process refused to store,
+    # per stream.  Truncation is evidence, not a silent repair: a report that
+    # hits it fails its own validation, and the number says why.
+    truncated_bytes: dict[str, int] = field(default_factory=lambda: {"stdout": 0, "stderr": 0})
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -92,6 +105,7 @@ def run_process(
     cancelled: Callable[[], bool] | None = None,
     output: OutputSink | None = None,
     output_streams: Collection[str] = ("stdout", "stderr"),
+    max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> ProcessResult:
     """Run an argv and drain output without trusting descendants to close pipes.
 
@@ -144,6 +158,25 @@ def run_process(
         raise
     timed_out = interrupted = False
     termination = None
+    stored = {pipe: 0 for pipe in outputs}
+    truncated = {"stdout": 0, "stderr": 0}
+
+    def absorb(pipe: Any, chunk: bytes) -> None:
+        """Store a chunk, up to the ceiling, and count what is refused.
+
+        Reading never stops, whatever the ceiling: a pipe left unread blocks
+        the child, which would turn a cap on disk use into a hang.
+        """
+        destination, forwarder = outputs[pipe]
+        room = len(chunk) if max_output_bytes <= 0 else max(0, max_output_bytes - stored[pipe])
+        keep = chunk if room >= len(chunk) else chunk[:room]
+        if keep:
+            destination.write(keep)
+            forwarder.feed(keep)
+            stored[pipe] += len(keep)
+        if len(keep) < len(chunk):
+            truncated[forwarder.stream] += len(chunk) - len(keep)
+
     deadline = started + timeout
     next_heartbeat = started + max(0.1, heartbeat_seconds)
     child_exited_at: float | None = None
@@ -184,9 +217,7 @@ def run_process(
                 except BlockingIOError:
                     continue
                 if chunk:
-                    destination, forwarder = outputs[pipe]
-                    destination.write(chunk)
-                    forwarder.feed(chunk)
+                    absorb(pipe, chunk)
                 else:
                     selector.unregister(pipe)
         # One last non-blocking sweep captures bytes already in either pipe.
@@ -198,9 +229,7 @@ def run_process(
                     break
                 if not chunk:
                     break
-                destination, forwarder = outputs[pipe]
-                destination.write(chunk)
-                forwarder.feed(chunk)
+                absorb(pipe, chunk)
     except KeyboardInterrupt:
         interrupted = True
         termination = _terminate(proc, grace)
@@ -229,6 +258,7 @@ def run_process(
         timed_out=timed_out,
         interrupted=interrupted,
         termination=termination,
+        truncated_bytes=dict(truncated),
     )
 
 
