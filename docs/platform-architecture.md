@@ -649,14 +649,28 @@ Correlator 用一个**变体**同时应用到两个 engine 做分组。**评审�
 （已实测：今天它归类为 `buffer`），而 `_LLM_KEYWORD_CATEGORIES` 以同一张静态表开头
 （`:1212`），所以"把 LLM 词汇应用到两个 engine"本身并不能让 `CWE-190` 对上 `integer-overflow`。
 
-**实现期实测补充（2026-08-24，升级 cppcheck 之后才暴露）**：同一条规则必须对 **LLM 行**
-也成立。原实现对 LLM 行直接返回其声明类别、**根本不看它的 CWE**，于是 cppcheck 的
-`memleak` CWE-401（`src/alloc.c:11`）与 llm-resource-error 的 `error-path` CWE-401
-（覆盖 9–12 行）——同一个泄漏、同一个 CWE、行号重叠——被分成两个 candidate，一个
-`llm-only` 一个 `static-only`。这不只是丢了一次关联：它**抬高了 `llm_only_confirmed`**，
-而那正是整个 LLM 层被拿来评判的那个数字。现在共享 CWE 表对两个 engine 都优先于声明类别；
-静态规则不认领的类别（`state-machine`、`dead-code`）仍保留 scanner 自己的词，
-logic scanner 的闭合 token 集因此不会在进入 audit 层时被抹平。
+**实现期实测补充（2026-08-24，升级 cppcheck 之后）**：LLM 行的类别解析必须对**同一个缺陷
+的两种叫法都成立**。scanner 的 token 选择在不同运行之间会变——同一类 alloc.c 泄漏，一次
+实测报 `error-path`，另一次报 `resource-leak`，两个都在该 skill 的声明集合里。原实现对
+LLM 行直接返回声明类别、不看 CWE：报 `resource-leak` 时能和 cppcheck 的 `memleak`
+（CWE-401）对上，报 `error-path` 时对不上，于是同一个缺陷是否被算作跨引擎一致，取决于模型
+挑了哪个词。
+
+解析顺序因此定为三段，**顺序本身是实测定出来的**：
+
+1. 声明类别经别名表归一后**若已在静态词汇表内**（`buffer`、`resource-leak`…），用它。
+   这一步不能省：`llm-memory-safety` 在 `src/frame.c:19` 报 `out-of-bounds`（→`buffer`）
+   却带 CWE-129，而 cppcheck 同几行报 CWE-788（→`buffer`）；先查 CWE 会把前者归到
+   `input-validation`，**拆掉一个本来正确的关联**——这正是本次修复的第一版造成的回归，
+   由这次实跑发现。
+2. 否则查两个 engine 共用的 CWE 表：`error-path` + CWE-401 → `resource-leak`，与 cppcheck 相遇。
+3. 都不命中时保留 scanner 自己的词（`state-machine`、`dead-code`），
+   logic scanner 的闭合 token 集因此不会在进入 audit 层时被抹平。
+
+**对实测数字的订正**：这次改动在本次实跑的语料上**一条 candidate 都没有改变**（scanner 恰好
+选了 `resource-leak`）。真正改变 `llm_only_confirmed` 的是**升级 cppcheck 本身**：在 cppcheck
+不可用的那次运行里，alloc.c 的两处泄漏被记为 `llm-only`；cppcheck 恢复工作后，同一语料上它们
+是 `both`。
 
 输出 `audit/assessment.json` 的 candidate：
 

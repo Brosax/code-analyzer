@@ -23,6 +23,7 @@ from .persist import write_json
 from .review import (
     _CATEGORY_ALIASES,
     _CWE_CATEGORIES,
+    _KEYWORD_CATEGORIES,
     _LLM_KEYWORD_CATEGORIES,
     _line_number,
     _producer_rank,
@@ -45,6 +46,10 @@ NOTICE = (
 
 # The static rule set the review layer freezes for its own overlap groups
 # (review.py _finding_category, the CWE sets inlined there at 4dbb5c0).
+# Every category a static row can be classified as.  Derived from the tables
+# themselves so the two vocabularies cannot drift apart silently.
+_SHARED_CATEGORIES: frozenset[str] = frozenset()
+
 _FROZEN_STATIC_CWES: tuple[tuple[str, frozenset[int]], ...] = (
     ("null-dereference", frozenset({476})),
     ("buffer", frozenset({119, 120, 121, 122, 124, 125, 126, 127, 131, 680, 787, 788, 805})),
@@ -52,6 +57,12 @@ _FROZEN_STATIC_CWES: tuple[tuple[str, frozenset[int]], ...] = (
     ("resource-leak", frozenset({401, 404, 772, 775})),
     ("format", frozenset({134})),
     ("randomness", frozenset({327, 330, 338})),
+)
+
+_SHARED_CATEGORIES = frozenset(
+    {name for name, _numbers in _FROZEN_STATIC_CWES}
+    | {name for name, _numbers in _CWE_CATEGORIES}
+    | {name for name, _pattern in _KEYWORD_CATEGORIES}
 )
 
 # A candidate id names the family a reader would triage it under.
@@ -82,9 +93,17 @@ def correlation_category(item: dict[str, Any]) -> str:
     """
     declared = ""
     if item.get("engine") == "llm":
-        declared = _CATEGORY_ALIASES.get(
-            str(item.get("category", "")).strip().lower(), str(item.get("category", "")).strip().lower()
-        )
+        raw = str(item.get("category", "")).strip().lower()
+        declared = _CATEGORY_ALIASES.get(raw, raw)
+        # A declared category that the static side can also produce is already
+        # the meeting point, and it is the more accurate of the two: the alias
+        # table exists to map a scanner's finer word onto the shared one.
+        # Measured: llm-memory-safety reports `out-of-bounds` (-> buffer) with
+        # CWE-129 on the same lines cppcheck reports CWE-788 (-> buffer).
+        # Letting the CWE win there would split a correlation that the
+        # declared name gets right.
+        if declared in _SHARED_CATEGORIES:
+            return declared
     value = f"{item.get('cwe', '')} {item.get('rule_id', '')} {item.get('message', '')}"
     match = re.search(r"CWE-?(\d+)", value, re.I)
     cwe = int(match.group(1)) if match else None
@@ -101,8 +120,9 @@ def correlation_category(item: dict[str, Any]) -> str:
                 # metric the whole LLM layer is judged by.
                 return category
     if declared:
-        # No shared CWE to meet on: the scanner's own word stands, which is how
-        # state-machine, dead-code and the rest keep their names.
+        # Neither a shared category nor a shared CWE: the scanner's own word
+        # stands, which is how state-machine, dead-code and the rest keep the
+        # closed vocabulary that defines them.
         return declared
     for category, pattern in _LLM_KEYWORD_CATEGORIES:
         if re.search(pattern, value, re.I):

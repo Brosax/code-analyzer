@@ -293,6 +293,25 @@ def test_two_engines_naming_the_same_cwe_on_the_same_lines_meet() -> None:
     assert assessment["metrics"]["by_origin"] == {"static-only": 0, "llm-only": 0, "both": 1}
 
 
+def test_a_declared_category_already_in_the_shared_vocabulary_outranks_its_cwe() -> None:
+    """The alias table is more accurate than the finding's own CWE number.
+
+    Measured on src/frame.c:19: llm-memory-safety reports `out-of-bounds`
+    (aliased to `buffer`) carrying CWE-129, while cppcheck reports CWE-788 on
+    the same lines, which is `buffer` too. Letting the CWE win would file the
+    scanner's row under `input-validation` and split a correlation the
+    declared name gets right — a regression an earlier attempt at this fix
+    actually caused, and which this run caught.
+    """
+    static = _row("cppcheck", "18", cwe="CWE-788", message="array 'f->payload[64]' index out of bounds")
+    llm = _row("llm-memory-safety", "19", cwe="CWE-129", category="out-of-bounds",
+               message="negative i passes the bounds check and indexes out of bounds")
+
+    assert correlation_category(static) == correlation_category(llm) == "buffer"
+    [candidate] = build_assessment(_review(static, llm))["candidates"]
+    assert candidate["origin"] == "both" and candidate["sources"] == ["cppcheck", "llm-memory-safety"]
+
+
 def test_a_category_no_static_tool_can_produce_keeps_its_own_name() -> None:
     """The CWE table is a meeting point, not a flattener.
 
