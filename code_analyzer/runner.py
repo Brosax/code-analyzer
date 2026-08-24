@@ -366,7 +366,10 @@ def _analyze(
                 _log(run_dir, f"correlation completed; {manifest['audit']['candidates']} candidates")
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
-    if manifest["exit_code"] == 0 and review_summary is not None and should_fail(review_summary, config["review"]["fail_on"]):
+    gate_includes_llm = bool(config["review"]["gate_includes_llm"])
+    if manifest["exit_code"] == 0 and review_summary is not None and should_fail(
+        review_summary, config["review"]["fail_on"], include_generated=gate_includes_llm
+    ):
         manifest["gate"]["triggered"] = True
         manifest["exit_code"] = 1
     artifact_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}

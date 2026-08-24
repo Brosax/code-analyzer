@@ -63,6 +63,7 @@ TUI_FIELDS = (
     "tools.splint.enabled",
     "run.shareable_export",
     "review.fail_on",
+    "llm.enabled",
 )
 
 # 两栏布局的最小终端宽度；低于该值回落为单栏。
@@ -260,6 +261,10 @@ class AnalyzerApp(App[TuiOutcome]):
                         yield Label("分析工具", classes="section-title")
                         for path in ("tools.cppcheck.enabled", "tools.flawfinder.enabled", "tools.splint.enabled"):
                             yield self._field_widget(FIELD_BY_PATH[path])
+                        # The second detection path, off by default: a scan
+                        # that may run for hours is never a side effect here
+                        # either.  Endpoint and model stay in the config file.
+                        yield self._field_widget(FIELD_BY_PATH["llm.enabled"])
                     with Vertical(id="column-right", classes="column"):
                         yield Label("构建上下文", classes="section-title first")
                         yield self._field_widget(FIELD_BY_PATH["build.compile_database_mode"])

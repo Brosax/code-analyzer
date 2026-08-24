@@ -25,7 +25,9 @@ def test_v1_config_is_upgraded_with_v2_defaults(tmp_path: Path) -> None:
     config_file.write_text("config_schema_version=1\n[run]\nshareable_export=false\n", encoding="utf-8")
     config = load_config(source, config_file)
     assert config["config_schema_version"] == 2
-    assert config["review"] == {"enabled": True, "fail_on": "none", "max_markdown_findings": 200}
+    assert config["review"] == {
+        "enabled": True, "fail_on": "none", "max_markdown_findings": 200, "gate_includes_llm": False,
+    }
     assert config["tools"]["splint"]["scope"] == "auto"
     assert config["tools"]["splint"]["jobs"] == 4
 

@@ -339,6 +339,24 @@ def test_gate_ignores_llm_findings_but_still_fires_for_static_ones() -> None:
     assert not should_fail({"findings": [static_critical]}, "none")
 
 
+def test_a_team_can_opt_its_own_repository_into_gating_on_llm_findings() -> None:
+    """The exclusion is the default, not a law about somebody else's repo.
+
+    A hallucinated critical must never fail a pipeline by surprise -- but a
+    team that has read the caveats and wants its own build to stop on a
+    generated finding is making an explicit choice, and the flag lives in
+    their config where that choice is recorded.
+    """
+    llm_critical = {"rank": 5, "engine": "llm", "gate_eligible": False}
+
+    assert not should_fail({"findings": [llm_critical]}, "critical")
+    assert should_fail({"findings": [llm_critical]}, "critical", include_generated=True)
+    # The opt-in widens what counts, never what the policy is: "none" is still
+    # "never fail", and a finding below the threshold still does not fire.
+    assert not should_fail({"findings": [llm_critical]}, "none", include_generated=True)
+    assert not should_fail({"findings": [{"rank": 3, "gate_eligible": False}]}, "critical", include_generated=True)
+
+
 def test_schema_three_review_with_an_llm_producer_passes_the_offline_validators() -> None:
     review = {
         "review_schema_version": 3, "project": "/tmp/project",

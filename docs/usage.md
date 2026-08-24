@@ -401,7 +401,78 @@ code-analyzer recover-report /path/to/report-directory
 退出码及开始/结束时间保持不变，manifest 另记恢复审计和派生文件 SHA-256。
 成功时退出 `0`，stdout 只输出恢复后的 `index.html` 绝对路径；无效目录退出 `2`。
 
-## 12. 退出码
+## 12. LLM 专家 scanner（第二条检测路径）
+
+LLM 层默认**关闭**：一次可能耗时数小时的扫描，绝不能是 `analyze .` 顺手触发的结果。
+启用后，六个专家 scanner 各自独立复审每一个扫描单元——彼此不可见，也看不到静态工具
+的结果。它们是**第一层检测器**，不是静态结果的复核者。
+
+| Scanner | 范围 |
+|---|---|
+| `llm-memory-safety` | 空间/时间：越界、不安全拷贝、空指针、生命周期、未初始化、栈使用 |
+| `llm-undefined-behavior` | 算术/语义：整数溢出、符号与宽度转换、对齐与别名、移位与求值顺序 |
+| `llm-resource-error` | 资源泄漏、错误路径未清理、未检查返回值、句柄误用 |
+| `llm-security` | 认证、输入校验、协议解析、硬编码密钥、信息泄露、固件更新、调试后门、密码学 |
+| `llm-firmware-concurrency` | ISR 竞态、`volatile`、原子性、RTOS 同步、看门狗、MMIO、DMA、超时、复位 |
+| `llm-logic` | 闭合四类：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch` |
+
+### 12.1 先体检，再扫描
+
+```bash
+code-analyzer llm-doctor ./project --llm-profile gpu-host
+```
+
+它会列出端点上的模型、确认配置的模型确实在其中、核对**回复上盖的模型名**是否就是它
+（这两件事不是一回事：端点可能列出 A 却用 B 回答）、比较端点实际提供的 context window
+与配置值（更小的窗口会**静默截断** prompt，scanner 会去评审一段被砍掉的代码）、实测一次
+请求的 tok/s，并按本次源码树的确定性单元计划估算全扫壁钟。任一项不通过时退出码 `20`。
+
+### 12.2 扫描
+
+```bash
+code-analyzer analyze ./project --llm --llm-profile gpu-host
+```
+
+预算有四道闸：单元步数、模型往返次数、token 账本、总壁钟 deadline。任何一道用尽时，
+剩余单元记为 `unscheduled` 并如实写进覆盖率——**不会**截断上下文去硬塞。
+`total_prompt_tokens` / `total_completion_tokens` 是**单个 scanner** 的基数，未显式设置
+时按启用 scanner 数线性放大；显式设置则原样使用。
+
+### 12.3 续扫与验证
+
+```bash
+code-analyzer llm-resume ./reports/<run>     # 补扫 unscheduled / interrupted 的单元
+code-analyzer assess     ./reports/<run>     # 第二层 validator 对关联候选逐个判定
+```
+
+`llm-resume` 重放该次运行**自己存下的 prompt**（`llm/units/<unit_id>.json`），而不是
+按今天的源码重新规划——否则同一个 unit_id 下会混进不同的代码。它确实会调用 scanner，
+因此在 manifest 里标记 `analyzers_invoked: true`，与永不调用分析器的 `recover-report`
+明确区分。
+
+`assess` 产出 `audit/assessment.json` 中的 `verdict`：`CONFIRMED` / `LIKELY` /
+`UNCERTAIN` / `FALSE_POSITIVE`。它**永不**改动 `review/summary.json`，也不影响退出码。
+
+### 12.4 门禁与章程
+
+LLM 发现在 `review/summary.json` 中带 `gate_eligible: false`，默认**不影响退出码**——
+一条幻觉出来的 critical 不该让任何人的流水线失败。团队若为自己的仓库明确选择了另一种
+取舍，可以打开：
+
+```toml
+[review]
+fail_on = "high"
+gate_includes_llm = true
+```
+
+### 12.5 源码会离开本机吗？
+
+用 `gpu-host` 这类本地 profile 时不会。切换到第三方 profile（如 `openrouter`）时，
+被扫描的固件源码会发送给该服务商及其背后的模型提供方；CLI 与 `llm-doctor` 都会打印
+这条警告。API key 只通过**环境变量名**配置（`api_key_env`），绝不写进 TOML、
+`manifest.json`、`inputs/effective-config.toml` 或共享 ZIP。
+
+## 13. 退出码
 
 | 退出码 | 含义 |
 |---:|---|

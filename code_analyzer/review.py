@@ -360,12 +360,21 @@ def markdown_report(summary: dict[str, Any], max_findings: int = 200) -> str:
     return "\n".join(lines)
 
 
-def should_fail(summary: dict[str, Any], policy: str) -> bool:
+def should_fail(summary: dict[str, Any], policy: str, *, include_generated: bool = False) -> bool:
+    """Does this review trip the quality gate?
+
+    Generated findings are excluded by default and that default is the
+    charter: a hallucinated critical must not be able to fail somebody's
+    pipeline.  ``include_generated`` is the opt-in for a team that has decided
+    otherwise for its own repository -- an explicit choice in their config,
+    never something a scan turns on for them.
+    """
     if policy == "none":
         return False
     minimum = SEVERITY_RANK[policy]
     return any(
-        int(item.get("rank", 0)) >= minimum and item.get("gate_eligible", True)
+        int(item.get("rank", 0)) >= minimum
+        and (include_generated or item.get("gate_eligible", True))
         for item in summary.get("findings", [])
     )
 

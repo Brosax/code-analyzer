@@ -45,6 +45,9 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "fail_on": "none",
         "max_markdown_findings": 200,
+        # Off by default, and that default is the charter: generated findings
+        # never fail a build unless a team says so for its own repository.
+        "gate_includes_llm": False,
     },
     "llm": {
         "enabled": False,
@@ -172,6 +175,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.min_tier", "choice", "最低档位", "档位下限，保证没有代码被排除在计划外。", choices=RISK_TIERS, advanced=True),
     FieldSpec("llm.export_sessions", "bool", "导出 Session 证据", "含源码片段的会话日志默认不进入可分享导出。", advanced=True),
     FieldSpec("llm.lsp", "bool", "启用 LSP 导航", "为 agent 提供编译器级符号导航。", advanced=True),
+    FieldSpec("review.gate_includes_llm", "bool", "门禁纳入 LLM 发现", "默认关闭：LLM 发现不影响退出码。开启后 LLM 发现与静态发现一同参与 fail_on 判定。", advanced=True),
     FieldSpec("audit.enabled", "bool", "启用 Audit 层", "关联与验证，产出非权威的 audit/assessment.json。"),
     FieldSpec("audit.validation_model", "string", "验证模型", "留空则沿用 [llm] model。", advanced=True),
     FieldSpec("audit.validation_max_candidates", "int", "最大验证 candidate 数", "按风险排序优先验证。", minimum=1, advanced=True),
@@ -372,6 +376,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in ("include", "system_include", "define", "undefine"):
         _string_list(build[key], f"build.{key}")
     _expect(review["enabled"], bool, "review.enabled")
+    _expect(review["gate_includes_llm"], bool, "review.gate_includes_llm")
     _expect(review["fail_on"], str, "review.fail_on")
     if review["fail_on"] not in {"none", "medium", "high", "critical"}:
         raise UserError("review.fail_on must be none, medium, high, or critical")
