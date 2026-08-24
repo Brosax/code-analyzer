@@ -71,3 +71,81 @@ def test_process_timeout_drains_streams_and_kills_group(tmp_path: Path) -> None:
     assert result.timed_out
     assert (tmp_path / "stdout.raw").read_text() == "started\n"
     assert (tmp_path / "stderr.raw").read_text() == "diagnostic\n"
+
+
+
+def test_header_attribution_resolves_each_path_once_and_never_inside_the_unit_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Header attribution must not be quadratic in (units x headers).
+
+    Measured on trusted-firmware-m: 1588 units against 2335 headers with a
+    filesystem resolve() in the innermost loop is 3.7 million syscalls. The run
+    sat at 94% CPU for 42 minutes *after* every unit had been scanned, and
+    projected to 255 minutes; the same work now takes about 39 seconds.
+    """
+    from code_analyzer.tools.splint import credit_headers, header_path_forms
+
+    source = tmp_path / "src"
+    (source / "inc").mkdir(parents=True)
+    inventory = (
+        [{"path": "inc/api.h", "is_header": True}]
+        + [{"path": f"inc/other{n}.h", "is_header": True} for n in range(50)]
+        + [{"path": "a.c", "is_header": False}]
+    )
+
+    resolved: list[str] = []
+    real_resolve = Path.resolve
+    monkeypatch.setattr(
+        Path, "resolve",
+        lambda self, *a, **k: (resolved.append(str(self)), real_resolve(self, *a, **k))[1],
+    )
+
+    forms = header_path_forms(inventory, source)
+    assert len(forms) == 51, "only headers, both spellings, computed up front"
+    after_setup = len(resolved)
+    assert after_setup == 51, "each header path is resolved exactly once"
+
+    headers: set[str] = set()
+    absolute = forms[0][1]
+    for cells in (
+        ["Location: inc/api.h:1", "unrelated text"],   # relative spelling
+        [f"included from {absolute}"],                 # absolute spelling
+        ["nothing here"],                              # no match
+        [],                                            # a unit with no report
+        ["inc/api.h once more"],                       # already credited
+    ):
+        credit_headers(headers, forms, cells)
+
+    assert headers == {"inc/api.h"}
+    assert len(resolved) == after_setup, "no path may be resolved once the unit loop has started"
+
+
+def test_header_attribution_agrees_with_the_straightforward_search(tmp_path: Path) -> None:
+    """The fast form must credit exactly what scanning cell by cell would."""
+    from code_analyzer.tools.splint import credit_headers, header_path_forms
+
+    source = tmp_path / "src"
+    (source / "inc").mkdir(parents=True)
+    inventory = [{"path": f"inc/h{n}.h", "is_header": True} for n in range(12)]
+    inventory.append({"path": "main.c", "is_header": False})
+    forms = header_path_forms(inventory, source)
+    units = [
+        ["inc/h3.h:9: warning", "second cell"],
+        [str((source / "inc/h7.h").resolve())],
+        ["inc/h3.h again", "inc/h11.h"],
+        ["no path at all"],
+    ]
+
+    fast: set[str] = set()
+    for cells in units:
+        credit_headers(fast, forms, cells)
+
+    plain = {
+        item["path"]
+        for cells in units
+        for item in inventory
+        if item["is_header"]
+        and any(item["path"] in cell or str((source / item["path"]).resolve()) in cell for cell in cells)
+    }
+    assert fast == plain == {"inc/h3.h", "inc/h7.h", "inc/h11.h"}

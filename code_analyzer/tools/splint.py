@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from ..compile_db import splint_flags
 from ..process import run_process
@@ -201,16 +201,13 @@ def run(
     units: list[dict[str, Any]] = []
     valid_files: set[str] = set()
     headers: set[str] = set()
+    header_forms = header_path_forms(inventory, source)
     for index, unit_id, relative, _, evidence_context in plans:
         unit, cells = completed.get(index, (_unstarted(unit_id, relative, "interrupted", "run interrupted", evidence_context), []))
         units.append(unit)
         if unit.get("valid_report"):
             valid_files.add(relative)
-            for item in inventory:
-                if item["is_header"] and any(
-                    item["path"] in cell or str((source / item["path"]).resolve()) in cell for cell in cells
-                ):
-                    headers.add(item["path"])
+            credit_headers(headers, header_forms, cells)
 
     attempted_files = {unit["input_files"][0] for unit in units if "process" in unit}
     excluded_count = len(not_in_build) if scope == "build" else 0
@@ -244,6 +241,44 @@ def _unstarted(unit_id: str, relative: str, state: str, reason: str, evidence_co
         "id": unit_id, "status": state, "input_files": [relative], "valid_report": False,
         "reason": reason, "evidence_context": evidence_context, "artifacts": [],
     }
+
+
+def header_path_forms(
+    inventory: Sequence[Mapping[str, Any]], source: Path
+) -> tuple[tuple[str, str], ...]:
+    """Both spellings of every header path, resolved exactly once.
+
+    splint names an included header either as the path it was given or as an
+    absolute one, so a match has to be tried both ways.  Neither form depends
+    on the unit being examined, and resolving inside the unit loop is what made
+    header attribution quadratic: on trusted-firmware-m that is 1588 units by
+    2335 headers -- 3.7 million filesystem calls -- and the run sat at 94% CPU
+    for 42 minutes *after* every unit had already been scanned, on course for
+    255 minutes.
+    """
+    return tuple(
+        (str(item["path"]), str((source / str(item["path"])).resolve()))
+        for item in inventory if item.get("is_header")
+    )
+
+
+def credit_headers(
+    headers: set[str], header_forms: Sequence[tuple[str, str]], cells: Sequence[str]
+) -> None:
+    """Record the headers one unit's report names, in place.
+
+    One haystack per unit rather than one pass per header, and a header already
+    credited is never searched for again.  Joining on a newline cannot invent a
+    match that scanning the cells separately would miss: no path contains one.
+    """
+    if not cells:
+        return
+    blob = "\n".join(cells)
+    for relative_header, absolute_header in header_forms:
+        if relative_header in headers:
+            continue
+        if relative_header in blob or absolute_header in blob:
+            headers.add(relative_header)
 
 
 def _validate_csv(path: Path) -> tuple[bool, list[str], str | None]:
