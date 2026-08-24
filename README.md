@@ -29,6 +29,24 @@ code-analyzer doctor --json
 Doctor reports missing executables or capabilities and prints Ubuntu 24.04 apt
 guidance, but never runs installation commands.
 
+The three analyzers are not interchangeable with any version of themselves —
+the runner drives them through a fixed argv contract and rejects a build that
+cannot honour it:
+
+| Analyzer | Minimum | Why |
+|---|---|---|
+| Cppcheck | **2.11** | `--check-level` and `--checkers-report` do not exist before it; 1.90, still shipped by Ubuntu 20.04, is rejected |
+| Flawfinder | **2.0.19** | `--sarif` was added there; 2.0.10, still shipped by Ubuntu 20.04, is rejected |
+| Splint | 3.1.2 | The final release (2018); there is nothing newer to require |
+
+Older distributions carry versions below these. Neither tool needs root to
+replace: `uv tool install flawfinder` (or `pip install --user flawfinder`)
+puts a current Flawfinder on `PATH`, and Cppcheck builds from its own source
+with `cmake -DCMAKE_INSTALL_PREFIX=$HOME/.local`. Doctor decides compatibility
+by running each tool over a canary rather than by reading its `--help`, so a
+build that implements an option without advertising it is accepted — and said
+to be, on the line beneath.
+
 ## Full-screen configuration
 
 Run `code-analyzer` with no arguments in an interactive terminal, or invoke the

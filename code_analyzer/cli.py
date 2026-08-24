@@ -404,6 +404,13 @@ def _print_doctor(result: dict[str, Any]) -> None:
         print(f"{name}: {item['status']}{version}")
         if item.get("missing_capabilities"):
             print("  missing capabilities: " + ", ".join(item["missing_capabilities"]))
+        # A build that implements an option without listing it is compatible,
+        # but silently so: the JSON has always recorded which flags the help
+        # omitted and that the canary is what decided, and the terminal should
+        # say the same rather than leaving the operator to trust a bare word.
+        undocumented = [flag for flag in item.get("help_missing_capabilities") or [] if flag not in (item.get("missing_capabilities") or [])]
+        if undocumented and item.get("status") == "compatible":
+            print(f"  not listed in --help, verified by canary: {', '.join(undocumented)}")
         if item.get("guidance"):
             print("  " + item["guidance"])
 
