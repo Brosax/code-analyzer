@@ -159,7 +159,10 @@ def run_resume(
             for unit in block.get("units", [])
             if isinstance(unit, dict)
         ]
-        blocks[name] = {**block, **_scanner_record(name, skills[name], settings, units)} if name in skills else block
+        if name not in skills:
+            continue
+        rebuilt = {**block, **_scanner_record(name, skills[name], settings, units)}
+        blocks[name] = _honest_skill_version(rebuilt, block, units)
 
     phase = dict(phase)
     phase["scanners"] = blocks
@@ -211,6 +214,32 @@ def _rederive(run_dir: Path, manifest: dict[str, Any], config: dict[str, Any], p
     (run_dir / "manifest.json").write_bytes(json_bytes(manifest))
     rebuild_dashboard(run_dir)
     progress(f"resume: review re-derived; {review['total_findings']} findings")
+
+
+def _honest_skill_version(
+    rebuilt: dict[str, Any], original: dict[str, Any], units: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Never let the block claim one scanner version for two of them.
+
+    ``_scanner_record`` stamps the skill that just ran, which is right when
+    nothing changed and a lie when a skill was edited between the run and the
+    resume: the units scanned in the first pass carry the old version in their
+    own records.  When the block spans more than one, it says so instead of
+    picking a winner.
+    """
+    versions = sorted({
+        (str(unit.get("skill_version") or ""), str(unit.get("skill_sha256") or ""))
+        for unit in units
+        if unit.get("skill_version")
+    })
+    if len(versions) <= 1:
+        return rebuilt
+    return {
+        **rebuilt,
+        "skill_version": original.get("skill_version"),
+        "skill_sha256": original.get("skill_sha256"),
+        "skill_versions": [{"skill_version": version, "skill_sha256": digest} for version, digest in versions],
+    }
 
 
 def _unit_payload(run_dir: Path, unit_id: str) -> dict[str, Any] | None:

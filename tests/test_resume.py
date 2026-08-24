@@ -28,6 +28,7 @@ from test_llm_pipeline import (  # noqa: F401  (fixtures)
 
 from code_analyzer.errors import UserError
 from code_analyzer.llm.resume import RESUMABLE, run_resume
+from code_analyzer.llm.skills import load_skill
 
 SCANNER = "llm-memory-safety"
 
@@ -129,8 +130,35 @@ def test_resume_reports_a_scanner_that_changed_under_the_run(
 
     drift = [text for text in messages if "0.0.1" in text]
     assert drift and "resumed units are scanned by the newer scanner" in drift[0]
-    # The record follows the scanner that actually ran, not the one that did not.
-    assert _manifest(run_dir)["llm"]["scanners"][SCANNER]["skill_version"] != "0.0.1"
+    # Every unit carries the version that actually scanned it.
+    block = _manifest(run_dir)["llm"]["scanners"][SCANNER]
+    assert {unit["skill_version"] for unit in block["units"]} == {load_skill(SCANNER).skill_version}
+    # One version scanned everything here, so the block states it plainly.
+    assert block["skill_version"] == load_skill(SCANNER).skill_version
+    assert "skill_versions" not in block
+
+
+def test_a_block_spanning_two_scanner_versions_names_both(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str  # noqa: F811
+) -> None:
+    """A resumed run can hold units scanned by two different scanners.
+
+    Stamping the block with whichever ran last would claim the new version for
+    units the old one produced, and their own records would contradict it.
+    """
+    run_dir, config = _starved(tmp_path, fake, closed_endpoint)
+    manifest = _manifest(run_dir)
+    units = manifest["llm"]["scanners"][SCANNER]["units"]
+    # One unit already scanned, by an older scanner than the one on disk.
+    units[0].update({"status": "completed", "valid_report": True, "skill_version": "0.9.0", "skill_sha256": "a" * 64})
+    manifest["llm"]["scanners"][SCANNER].update({"skill_version": "0.9.0", "skill_sha256": "a" * 64})
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    _resume(run_dir, config, fake)
+
+    block = _manifest(run_dir)["llm"]["scanners"][SCANNER]
+    assert block["skill_version"] == "0.9.0", "the block must not adopt the newer version wholesale"
+    assert [item["skill_version"] for item in block["skill_versions"]] == ["0.9.0", load_skill(SCANNER).skill_version]
 
 
 def test_resume_leaves_a_finished_run_untouched(
