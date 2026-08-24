@@ -522,8 +522,8 @@ LLM-only 指标只数第 0 轮。
 | splint 内部 | `ThreadPoolExecutor(jobs)` | `splint.py:165` |
 | cppcheck 内部 | `-j min(4, cpu)` | `cppcheck.py:33,69` |
 | LLM 阶段内部 | `ThreadPoolExecutor(jobs)` | `scan.py:427-467` |
-| **三个静态工具之间** | **串行** | `runner.py:169` |
-| **静态 vs LLM** | **串行** | `runner.py:249` 在工具循环之后 |
+| **三个静态工具之间** | **串行** | `runner.py:318` `run_static()` 内的循环 |
+| **静态 ∥ LLM** | **已并行（P3）** | `runner.py:123 _run_together`；`:437` 调度点 |
 
 ### 10.2 只有静态 ∥ LLM 值得做
 
@@ -531,20 +531,55 @@ cppcheck 与 splint 都吃 CPU，cppcheck 已经 `-j`；两者并行只是争抢
 LLM 阶段是网络绑定的，与静态并行几乎白赚壁钟。
 把 `tools.splint.jobs` 默认从 1 提高（`config.py:92`）是更便宜的静态侧提速。
 
-### 10.3 必须先修的前置条件
+### 10.3 并发窗口：工作量比例式 progress
 
-`tests/test_runtime_output.py:200` 断言 progress **单调**；今天 progress 按工具索引分段
-（`runner.py:171-172`），LLM 固定 0.80–0.84（`runner.py:251-270`）。两个阶段并行后这会乱序。
+固定梯子（按工具索引分段 + LLM 固定 0.80–0.84）在两个阶段同时上报时必然乱序，
+所以并发窗口内的 progress 改成**工作量比例**（`runner.py:59-78`、`_Window` 在 `:81`）：
 
-**评审订正：单调性在并行之前就已经是坏的。** `[llm] enabled` 时 LLM 阶段以 0.84 结束，稳定性复扫
+```
+value = WINDOW_START + (WINDOW_END - WINDOW_START) × (w_static × f_static + w_llm × f_llm)
+       = 0.10       + 0.75                          × (0.5 × f_static + 0.5 × f_llm)
+```
+
+- `f_static = (已完成工具数 + 当前工具内单元进度) / 请求工具数`；`f_llm` 由 `scan.py` 上报的
+  `index / total` 直接给出。两者各自单调不减，加权和因此单调不减。
+- **权重相等**：静态成本随文件数走、LLM 成本随模型时延走，运行时无从预知谁占主导；
+  要知道就得计时，而计时正是这个模型排除的输入。各占一半等于不作任何断言。
+- **绝不用壁钟推导 progress**：`events.jsonl` 的 progress 列是"做了多少活"的陈述，
+  不是计时测量，否则同一棵树两次运行的事件日志无法比较。
+- `[llm] enabled = false` 时权重塌缩成 `(1.0, 0.0)`，静态独占整个窗口，
+  最后一个工具正好落在 `WINDOW_END`，即并发之前的形状。
+- 窗口终点 `0.85` 与稳定性复扫的起点重合，其后的梯子（review 0.86–0.92、export 0.93+）未动。
+
+**历史订正：单调性在并行之前就已经是坏的。** `[llm] enabled` 时 LLM 阶段以 0.84 结束，稳定性复扫
 紧接着发 0.8；另外 `0.8 + 0.04 × 1.0` 在浮点下是 `0.8400000000000001`，高于字面量 0.84。
 既有测试只在静态模式下跑所以一直绿。**已在 `1a3a370` 修复**并补了 LLM 模式下的单调性测试。
 
-先做：progress = 已完成工作量 / 总工作量，单调，加锁；或由调度器发一条聚合的
-`phase="progress"` 事件。再做：共享 cancel `Event`（`splint.py:157-171` 模式）；
-`manifest.json` 的 mutate + `_save_manifest`（12 处调用，`runner.py:460` 定义）加锁。
+### 10.4 并发下被序列化的三样东西
 
-源码稳定性复扫（`runner.py:275-293`）是后置条件，放在全部阶段之后；并发反而缩短窗口。
+| 共享物 | 锁 | 为什么 |
+|---|---|---|
+| `manifest` + `_save_manifest` | `manifest_lock`（`RLock`，`runner.py:309`） | 静态侧只写 `manifest["tools"]`、LLM 侧只写 `manifest["llm"]`，但序列化会遍历整棵树；锁覆盖 mutate+save 整段，否则会落盘一份撕裂的快照 |
+| `progress` 的取值与发射 | `_Window` 自带的锁 | 两个线程各自算完再发，仍可能倒序发出；算值和发事件必须在同一把锁里 |
+| `EventSink` 扇出 | `fan_out` 的锁（`events.py:86`） | 一条事件到达所有 sink 之后下一条才开始，否则 JSONL 文件与 TUI 会对事件顺序各执一词。`JsonlEventSink` 自己的锁只保证单行不撕裂 |
+
+cancel 是共享的：两侧都拿 `cancellation.is_cancelled`；主线程收到 `KeyboardInterrupt`
+时 `_run_together` 主动 `cancel()`，否则 join 会等满一整轮 LLM 扫描。
+任一侧抛异常都先让另一侧写完自己那半份 manifest 再上抛（`runner.py:123-157`）。
+
+**并发反而加强了盲扫不变量**：第 0 轮 scanner 运行期间 `tools/*/report.*` 尚未写出，
+根本无可偷看。`output_root` 不得在被扫描树内的硬门（`runner.py:211`）原样保留——
+盲扫不能变成依赖竞态。
+
+### 10.5 证据字节不变的证明方式
+
+`CONCURRENT_PHASES`（`runner.py:78`）保留串行代码路径，不进配置——运维没有理由选，
+差异只可能是 bug。`tests/test_concurrency.py` 对同一棵树跑两次串行 + 一次并发：
+两次串行的差集定义了"任何重跑都会变"的叶子（run id / 运行目录 / 时刻 / 时长 /
+嵌了这些的文件的 sha256），该差集必须逐条通过 `_per_run` 的白名单，
+然后三份 manifest 与三份 `review/summary.json` 在抹掉这些叶子后**字节相等**。
+
+源码稳定性复扫（`runner.py:447`）是后置条件，放在全部阶段之后；并发反而缩短窗口。
 
 ---
 
@@ -884,16 +919,17 @@ LLM 门禁、usage.md）归入本文 P4。既有设计 §2.2 的 `process.py` �
 | `tools/cppcheck.py:69` | `--quiet`，无心跳 |
 | `tools/splint.py:128, 165` | `heartbeat=` 传法；`ThreadPoolExecutor` |
 | `analysis.py:25, 36, 58, 61` | `AnalysisEvent` / `CancellationToken` / `EventSink` / `run_analysis` |
-| `runner.py:43` | `_analyze` 确定性主干 |
-| `runner.py:81` | `output_root` 不得在被扫描树内 |
-| `runner.py:171-172, 251-270` | progress 分段（并发前必须改） |
-| `runner.py:202` | `running` 占位态插入点 |
-| `runner.py:214-226` | 硬编码 adapter 分派；`:226` 的 `else` 静默误派发到 splint |
-| `runner.py:526-529` | `_incompatibility` 的字典索引，真正的 `KeyError` 崩溃点 |
-| `runner.py:249, 275` | LLM 阶段；源码稳定性复扫 |
-| `runner.py:55-67` | `event()` 闭包 |
-| `runner.py:169` | 三个静态工具的串行循环 |
-| `runner.py:460` | `_save_manifest`（12 处调用） |
+| `runner.py:172` | `_analyze` 确定性主干 |
+| `runner.py:211` | `output_root` 不得在被扫描树内 |
+| `runner.py:59-78, 81` | 并发窗口的常量与权重；`_Window`（progress 的唯一取值处） |
+| `runner.py:123` | `_run_together`：静态在调用线程、LLM 在工作线程 |
+| `runner.py:78` | `CONCURRENT_PHASES`，串行对照路径（不是配置项） |
+| `runner.py:358` | `running` 占位态插入点 |
+| `runner.py:704-707` | `_incompatibility` 的字典索引，真正的 `KeyError` 崩溃点 |
+| `runner.py:399, 447` | LLM 阶段 `run_llm()`；源码稳定性复扫 |
+| `runner.py:184` | `event()` 闭包 |
+| `runner.py:318` | `run_static()`：三个静态工具的串行循环 |
+| `runner.py:309, 659` | `manifest_lock` / `_save_manifest` |
 | `review.py:28, 36, 46` | `_producer_rank` / `build_review` / `parsers`（崩溃点） |
 | `review.py:368` | `should_fail` + `gate_eligible` |
 | `review.py:783` | `_parse_llm_units` |
@@ -924,7 +960,8 @@ LLM 门禁、usage.md）归入本文 P4。既有设计 §2.2 的 `process.py` �
 | `inventory.py:34`、`doctor.py:24`、`preflight.py:32` | 确定性的"项目分析" |
 | `persist.py:14` | `json_bytes` |
 | `tui.py:620` | TUI 消费事件流 |
-| `tests/test_runtime_output.py:200` | progress 单调断言 |
+| `tests/test_runtime_output.py:200` | progress 单调断言（纯静态） |
+| `tests/test_concurrency.py` | 并发窗口：单调、真重叠、证据字节不变、双侧 cancel、事件日志双写 |
 | `tests/test_llm_index.py:287` | 单元计划字节稳定 |
 | `tests/test_dashboard.py:72, 131` | 两个 `<script>`；重建字节幂等 |
 | `tests/test_v2.py:175` | 无 `http://` |

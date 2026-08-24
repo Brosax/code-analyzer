@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -40,6 +41,122 @@ from .tools.common import artifact_index
 
 class AnalysisCancelled(Exception):
     """Cancellation observed before a report directory exists."""
+
+
+# --- the concurrent window --------------------------------------------------
+#
+# The static adapters and the LLM scan phase run at the same time, so neither
+# of them owns a progress segment any more.  One window covers both, and inside
+# it progress is *work-proportional*: each side reports the fraction of its own
+# work that is finished, and the reported value is
+#
+#     WINDOW_START + (WINDOW_END - WINDOW_START) * (w_static * f_static + w_llm * f_llm)
+#
+# Each fraction is individually non-decreasing, so the weighted sum is too.
+# Wall clock is deliberately never an input: a value derived from elapsed time
+# is unrepeatable, and the progress column of events.jsonl would stop being a
+# statement about work and become a timing measurement.
+WINDOW_START = 0.1
+# The window ends exactly where the stability rescan starts, so the ladder past
+# it (stability 0.85, review 0.86-0.92, export 0.93+) is untouched.
+WINDOW_END = 0.85
+# Equal weights.  The runner cannot know which side dominates -- static cost
+# scales with the file count, LLM cost with model latency -- and finding out
+# would mean timing them, which is the one input this model excludes.  Half
+# each therefore claims nothing about the ratio.  With the LLM phase disabled
+# the static side takes the whole window, which reproduces the pre-concurrency
+# ladder for every static-only run.
+WEIGHTS_WITH_LLM = (0.5, 0.5)
+WEIGHTS_STATIC_ONLY = (1.0, 0.0)
+STATIC, LLM = 0, 1
+
+# The serial control path.  "Concurrency changes no evidence" is only a real
+# claim while the serial result can still be produced on demand and compared,
+# which is what tests/test_concurrency.py does with this flag.  Not a config
+# key: an operator has no reason to choose, and a run that differs by it would
+# be a bug rather than an option.
+CONCURRENT_PHASES = True
+
+
+class _Window:
+    """The progress segment the static adapters and the LLM phase share.
+
+    The lock covers the emission, not just the arithmetic.  Two threads that
+    each computed a value and then emitted it could still emit them out of
+    order, and the event log -- which is read in file order -- would show the
+    bar walking backwards even though neither fraction ever did.
+    """
+
+    def __init__(self, emit: Callable[..., None], *, llm: bool) -> None:
+        self._emit = emit
+        self._weights = WEIGHTS_WITH_LLM if llm else WEIGHTS_STATIC_ONLY
+        self._done = [0.0, 0.0]
+        self._lock = threading.Lock()
+
+    def event(
+        self, side: int, fraction: float | None, phase: str, status: str, message: str, **fields: Any
+    ) -> None:
+        """Advance one side and announce it; a None fraction reports no work."""
+        with self._lock:
+            value = None
+            if fraction is not None:
+                # Clamped as well as ratcheted: the weights sum to 1, so two
+                # fractions that cannot exceed 1 cannot put the value past
+                # WINDOW_END, where the stability phase's literal 0.85 waits.
+                self._done[side] = max(self._done[side], min(1.0, fraction))
+                # Rounded only to keep binary-float noise (0.10375000000000001)
+                # out of the event log; round() is non-decreasing, so it cannot
+                # disturb the ordering the lock above is protecting.
+                value = round(WINDOW_START + (WINDOW_END - WINDOW_START) * sum(
+                    weight * done for weight, done in zip(self._weights, self._done, strict=True)
+                ), 6)
+            self._emit(phase, status, message, value=value, **fields)
+
+    def finish(self, side: int) -> None:
+        """This side has no work left; the next event carries its whole share.
+
+        Nothing is emitted: a side that ends without an event of its own (no
+        requested tools, a disabled phase) must still not strand its weight
+        below the window's end.
+        """
+        with self._lock:
+            self._done[side] = 1.0
+
+
+def _run_together(
+    static: Callable[[], None], llm: Callable[[], None], cancel: Callable[[], None]
+) -> None:
+    """Run both sides at once, keep both outcomes, re-raise the first failure.
+
+    The static side stays on the calling thread so a Ctrl-C still lands where
+    the interpreter delivers it.  A crash on one side is held until the other
+    has finished writing its half of the manifest: an exception must cost the
+    run one producer's results, never both.
+    """
+    failures: list[BaseException] = []
+
+    def guarded() -> None:
+        try:
+            llm()
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=guarded, name="llm-phase")
+    worker.start()
+    try:
+        static()
+    except BaseException as exc:
+        failures.append(exc)
+        if not isinstance(exc, Exception):
+            # KeyboardInterrupt and SystemExit are stop signals, not bugs: the
+            # other side has to hear one or the join below waits out a full LLM
+            # scan.  An ordinary exception is one producer's problem and must
+            # not cost the other producer the results it already has.
+            cancel()
+    finally:
+        worker.join()
+    if failures:
+        raise failures[0]
 
 
 def analyze(
@@ -180,121 +297,160 @@ def _analyze(
     }
     _save_manifest(run_dir, manifest)
     _log(run_dir, f"run {run_id} started; {len(inventory)} source files")
-    event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=0.1)
+    event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=WINDOW_START)
+
+    # From here to the join below, two threads publish into one manifest: the
+    # static side owns manifest["tools"], the LLM side owns manifest["llm"].
+    # The lock spans the read-modify-write, not just the write -- a
+    # serialisation running while the other side swaps a subtree would persist
+    # a torn snapshot -- and it is reentrant so that a mutation region can save
+    # without unlocking.  Outside the window there is exactly one thread and
+    # the lock is uncontended.
+    manifest_lock = threading.RLock()
+    llm_enabled = bool(config["llm"]["enabled"])
+    window = _Window(event, llm=llm_enabled)
+
+    def save_manifest() -> None:
+        with manifest_lock:
+            _save_manifest(run_dir, manifest)
 
     interrupted = cancellation.cancelled
     requested_names = [name for name in TOOL_NAMES if requested[name]]
     tool_count = max(1, len(requested_names))
-    for tool_index, name in enumerate(requested_names, 1):
-        tool_prefix = f"tool {tool_index}/{len(requested_names)} {name}"
-        tool_start_progress = 0.1 + 0.7 * (tool_index - 1) / tool_count
-        tool_finish_progress = 0.1 + 0.7 * tool_index / tool_count
-        if not requested[name]:
-            continue
-        if interrupted or cancellation.cancelled:
-            interrupted = True
-            manifest["tools"][name] = _preflight_state("interrupted", inventory, name, "run interrupted before tool start")
-            progress(f"{tool_prefix}: interrupted before start")
-            event("tool", "interrupted", "run interrupted before tool start", tool=name, value=tool_finish_progress)
-            continue
-        executable = config["tools"][name]["executable"]
-        resolved = shutil.which(executable)
-        if not resolved:
-            manifest["tools"][name] = _preflight_state("missing", inventory, name, f"executable not found: {executable}")
-            _log(run_dir, f"{name}: missing executable {executable}")
-            progress(f"{tool_prefix}: missing executable")
-            event("tool", "missing", f"executable not found: {executable}", tool=name, value=tool_finish_progress)
-            _save_manifest(run_dir, manifest)
-            continue
-        incompatibility = _incompatibility(name, resolved)
-        if incompatibility:
-            manifest["tools"][name] = _preflight_state("incompatible", inventory, name, incompatibility)
-            manifest["tools"][name]["executable"] = resolved
-            manifest["tools"][name]["version"] = _version(name, resolved)
-            _log(run_dir, f"{name}: incompatible: {incompatibility}")
-            progress(f"{tool_prefix}: incompatible")
-            event("tool", "incompatible", incompatibility, tool=name, value=tool_finish_progress)
-            _save_manifest(run_dir, manifest)
-            continue
-        _log(run_dir, f"{name}: starting {resolved}")
-        progress(f"{tool_prefix}: starting")
-        version = _version(name, resolved)
-        # Persisted before the event so that whoever reacts to `tool started`
-        # already finds the placeholder on disk.
-        manifest["tools"][name] = _running_state(inventory, name, resolved, version)
-        _save_manifest(run_dir, manifest)
-        event("tool", "started", f"{name} starting", tool=name, value=tool_start_progress)
-        def unit_progress(message: str, prefix: str = tool_prefix, tool_name: str = name) -> None:
-            progress(f"{prefix}: {message}")
-        def structured_unit(
-            unit: str, status: str, message: str, value: float | None,
-            tool_name: str = name, tool_start: float = tool_start_progress,
-        ) -> None:
-            overall_value = None if value is None else tool_start + 0.7 * value / tool_count
-            event("unit", status, message, tool=tool_name, unit=unit, value=overall_value)
-        def streamed_output(unit: str, stream: str, message: str, tool_name: str = name) -> None:
-            event("output", "running", message, tool=tool_name, unit=unit, stream=stream)
-        context = RunContext(
-            source=source, run_dir=run_dir, inventory=inventory,
-            compile_db=CompileDatabase(
-                entries=filtered_db, covered=frozenset(db_covered), present=compile_path is not None,
-            ),
-            config=config, progress=unit_progress, cancelled=cancellation.is_cancelled,
-            unit_event=structured_unit, output_event=streamed_output if live_events else None,
-        )
-        try:
-            result = adapter(name).run(resolved, context)
-        except Exception as exc:
-            result = _preflight_state("failed", inventory, name, f"adapter failure: {exc}")
-        result["executable"] = resolved
-        result["version"] = version
-        manifest["tools"][name] = result
-        interrupted = result["status"] == "interrupted"
-        _log(run_dir, f"{name}: {result['status']}")
-        progress(f"{tool_prefix}: finished with status {result['status']}")
-        event(
-            "tool", result["status"], f"{name} finished with status {result['status']}",
-            tool=name, value=tool_finish_progress,
-        )
-        _save_manifest(run_dir, manifest)
 
-    if interrupted or cancellation.cancelled:
-        return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
+    def run_static() -> None:
+        nonlocal interrupted
+        for tool_index, name in enumerate(requested_names, 1):
+            tool_prefix = f"tool {tool_index}/{len(requested_names)} {name}"
+            started_fraction = (tool_index - 1) / tool_count
+            finished_fraction = tool_index / tool_count
+            if interrupted or cancellation.cancelled:
+                interrupted = True
+                with manifest_lock:
+                    manifest["tools"][name] = _preflight_state("interrupted", inventory, name, "run interrupted before tool start")
+                progress(f"{tool_prefix}: interrupted before start")
+                window.event(STATIC, finished_fraction, "tool", "interrupted", "run interrupted before tool start", tool=name)
+                continue
+            executable = config["tools"][name]["executable"]
+            resolved = shutil.which(executable)
+            if not resolved:
+                with manifest_lock:
+                    manifest["tools"][name] = _preflight_state("missing", inventory, name, f"executable not found: {executable}")
+                    save_manifest()
+                _log(run_dir, f"{name}: missing executable {executable}")
+                progress(f"{tool_prefix}: missing executable")
+                window.event(STATIC, finished_fraction, "tool", "missing", f"executable not found: {executable}", tool=name)
+                continue
+            incompatibility = _incompatibility(name, resolved)
+            if incompatibility:
+                with manifest_lock:
+                    manifest["tools"][name] = _preflight_state("incompatible", inventory, name, incompatibility)
+                    manifest["tools"][name]["executable"] = resolved
+                    manifest["tools"][name]["version"] = _version(name, resolved)
+                    save_manifest()
+                _log(run_dir, f"{name}: incompatible: {incompatibility}")
+                progress(f"{tool_prefix}: incompatible")
+                window.event(STATIC, finished_fraction, "tool", "incompatible", incompatibility, tool=name)
+                continue
+            _log(run_dir, f"{name}: starting {resolved}")
+            progress(f"{tool_prefix}: starting")
+            version = _version(name, resolved)
+            # Persisted before the event so that whoever reacts to `tool started`
+            # already finds the placeholder on disk.
+            with manifest_lock:
+                manifest["tools"][name] = _running_state(inventory, name, resolved, version)
+                save_manifest()
+            window.event(STATIC, started_fraction, "tool", "started", f"{name} starting", tool=name)
+            def unit_progress(message: str, prefix: str = tool_prefix, tool_name: str = name) -> None:
+                progress(f"{prefix}: {message}")
+            def structured_unit(
+                unit: str, status: str, message: str, value: float | None,
+                tool_name: str = name, index: int = tool_index,
+            ) -> None:
+                fraction = None if value is None else (index - 1 + value) / tool_count
+                window.event(STATIC, fraction, "unit", status, message, tool=tool_name, unit=unit)
+            def streamed_output(unit: str, stream: str, message: str, tool_name: str = name) -> None:
+                event("output", "running", message, tool=tool_name, unit=unit, stream=stream)
+            context = RunContext(
+                source=source, run_dir=run_dir, inventory=inventory,
+                compile_db=CompileDatabase(
+                    entries=filtered_db, covered=frozenset(db_covered), present=compile_path is not None,
+                ),
+                config=config, progress=unit_progress, cancelled=cancellation.is_cancelled,
+                unit_event=structured_unit, output_event=streamed_output if live_events else None,
+            )
+            try:
+                result = adapter(name).run(resolved, context)
+            except Exception as exc:
+                result = _preflight_state("failed", inventory, name, f"adapter failure: {exc}")
+            result["executable"] = resolved
+            result["version"] = version
+            with manifest_lock:
+                manifest["tools"][name] = result
+                save_manifest()
+            interrupted = result["status"] == "interrupted"
+            _log(run_dir, f"{name}: {result['status']}")
+            progress(f"{tool_prefix}: finished with status {result['status']}")
+            window.event(
+                STATIC, finished_fraction, "tool", result["status"],
+                f"{name} finished with status {result['status']}", tool=name,
+            )
+        # A run with no requested tools still has to hand the static weight on,
+        # or the window could never reach its end.
+        window.finish(STATIC)
 
-    if config["llm"]["enabled"]:
+    def run_llm() -> None:
         progress("llm: starting semantic scan")
-        manifest["llm"] = llm_scan.running(config["llm"])
-        _save_manifest(run_dir, manifest)
-        event("llm", "started", "starting LLM semantic scan", value=0.8)
+        with manifest_lock:
+            manifest["llm"] = llm_scan.running(config["llm"])
+            save_manifest()
+        window.event(LLM, 0.0, "llm", "started", "starting LLM semantic scan")
         def llm_unit(producer: str, unit: str, status: str, message: str, value: float | None) -> None:
-            # Rounded so the last unit (0.8 + 0.04 * 1.0 = 0.8400000000000001)
-            # cannot land above the phase's own 0.84 completion value.
-            event("unit", status, message, tool=producer, unit=unit, value=None if value is None else round(0.8 + 0.04 * value, 6))
+            window.event(LLM, value, "unit", status, message, tool=producer, unit=unit)
         def llm_output(producer: str, unit: str, stream: str, message: str) -> None:
             event("output", "running", message, tool=producer, unit=unit, stream=stream)
         try:
-            manifest["llm"] = llm_scan.run(
+            record = llm_scan.run(
                 source, run_dir, inventory, config, progress,
                 cancelled=cancellation.is_cancelled, unit_event=llm_unit,
                 output_event=llm_output if live_events else None,
             )
         except InterruptedError:
-            manifest["llm"] = llm_scan.failed(config["llm"], "run interrupted")
-            manifest["llm"]["status"] = "interrupted"
+            record = llm_scan.failed(config["llm"], "run interrupted")
+            record["status"] = "interrupted"
         except Exception as exc:
-            manifest["llm"] = llm_scan.failed(config["llm"], f"llm phase failure: {exc}")
-        llm_status = manifest["llm"]["status"]
-        _log(run_dir, f"llm: {llm_status}")
-        progress(f"llm: finished with status {llm_status}")
-        event("llm", llm_status, f"LLM scan finished with status {llm_status}", value=0.84)
-        _save_manifest(run_dir, manifest)
-        if llm_status == "interrupted" or cancellation.cancelled:
-            return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
+            record = llm_scan.failed(config["llm"], f"llm phase failure: {exc}")
+        with manifest_lock:
+            manifest["llm"] = record
+            save_manifest()
+        _log(run_dir, f"llm: {record['status']}")
+        progress(f"llm: finished with status {record['status']}")
+        window.event(
+            LLM, 1.0, "llm", record["status"],
+            f"LLM scan finished with status {record['status']}",
+        )
+
+    # The two sides share only the manifest, the event sink and the
+    # cancellation token, each of which is serialised above; everything else
+    # they touch is disjoint (tools/ against llm/, CPU against network).
+    # Running them together also *strengthens* the first-round blindness rule:
+    # while a scanner runs, tools/*/report.* has not been written yet, so there
+    # is nothing for it to peek at.  The output_root guard above stays exactly
+    # as it was -- blindness must not come to depend on a race.
+    if llm_enabled and CONCURRENT_PHASES:
+        _run_together(run_static, run_llm, cancellation.cancel)
+    else:
+        run_static()
+        if llm_enabled:
+            run_llm()
+
+    if interrupted or cancellation.cancelled or manifest["llm"].get("status") == "interrupted":
+        return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
 
     progress("verifying source stability")
-    # The LLM phase ends at 0.84; a lower value here would walk progress
-    # backwards on every run that enables it.
-    event("stability", "started", "verifying source stability", value=0.84)
+    # The concurrent window ends here; a lower value would walk progress
+    # backwards on every run that enables the LLM phase.
+    event("stability", "started", "verifying source stability", value=WINDOW_END)
     try:
         after = discover(source, config, output_root, cancelled=cancellation.is_cancelled)
     except InterruptedError:
@@ -371,7 +527,7 @@ def _analyze(
         manifest["exit_code"] = 1
     artifact_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
     manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
-    _save_manifest(run_dir, manifest)
+    save_manifest()
 
     if config["run"]["shareable_export"] and exit_code != 130:
         progress("creating redacted shareable export")
@@ -407,7 +563,7 @@ def _analyze(
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
     manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
-    _save_manifest(run_dir, manifest)
+    save_manifest()
     try:
         _update_latest(run_dir.parent, manifest)
     except OSError as exc:
@@ -418,7 +574,7 @@ def _analyze(
         manifest["publication_error"] = str(exc)
         (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
         manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
-        _save_manifest(run_dir, manifest)
+        save_manifest()
         progress("latest.json publication failed; unique run evidence was retained")
     progress(f"run finished: status {manifest['status']}, exit code {manifest['exit_code']}")
     return int(manifest["exit_code"]), run_dir
