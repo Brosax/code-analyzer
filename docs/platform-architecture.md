@@ -649,6 +649,15 @@ Correlator 用一个**变体**同时应用到两个 engine 做分组。**评审�
 （已实测：今天它归类为 `buffer`），而 `_LLM_KEYWORD_CATEGORIES` 以同一张静态表开头
 （`:1212`），所以"把 LLM 词汇应用到两个 engine"本身并不能让 `CWE-190` 对上 `integer-overflow`。
 
+**实现期实测补充（2026-08-24，升级 cppcheck 之后才暴露）**：同一条规则必须对 **LLM 行**
+也成立。原实现对 LLM 行直接返回其声明类别、**根本不看它的 CWE**，于是 cppcheck 的
+`memleak` CWE-401（`src/alloc.c:11`）与 llm-resource-error 的 `error-path` CWE-401
+（覆盖 9–12 行）——同一个泄漏、同一个 CWE、行号重叠——被分成两个 candidate，一个
+`llm-only` 一个 `static-only`。这不只是丢了一次关联：它**抬高了 `llm_only_confirmed`**，
+而那正是整个 LLM 层被拿来评判的那个数字。现在共享 CWE 表对两个 engine 都优先于声明类别；
+静态规则不认领的类别（`state-machine`、`dead-code`）仍保留 scanner 自己的词，
+logic scanner 的闭合 token 集因此不会在进入 audit 层时被抹平。
+
 输出 `audit/assessment.json` 的 candidate：
 
 ```json
