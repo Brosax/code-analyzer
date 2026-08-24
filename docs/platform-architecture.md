@@ -4,7 +4,8 @@
 它不是从零设计，而是把规范逐项对照本仓库的现状：哪些已经存在，哪些可以扩展，
 哪些与既有契约冲突，哪些是规范自己原则意义上的过度设计。
 
-每一节标注判定并锚定到真实的 `file:line`（基于 HEAD `1a3a370`，296 tests，ruff 干净）。
+每一节标注判定并锚定到真实的 `file:line`。判定写于设计时（HEAD `1a3a370`，296 tests）；
+**P1–P3 已实现**，实现后的状态见每节的「已交付」注记与 §18 的路线表（HEAD `cdfeff2`，410 passed，ruff 干净）。
 本文经过一轮对抗性评审（逐条核对代码）；评审发现的错误已订正，并在相应处标注「评审订正」。
 
 | 判定 | 含义 |
@@ -147,7 +148,7 @@ NL → 受约束的 config patch（只能改 `[llm] scanners`、`risk_overrides`
 
 ---
 
-## 3. Agent / Tool / Skill 的接口设计 — EXTEND
+## 3. Agent / Tool / Skill 的接口设计 — EXTEND ✅ 已交付（P2）
 
 ### 3.1 现状：三个 Adapter 的签名不一致
 
@@ -166,7 +167,16 @@ def run(executable, source, run_dir, inventory, filtered_db, config, progress, *
 `doctor.py:49`、`doctor.py:140`。另有 **1 处静默误派发**，比崩溃更糟：`runner.py:226` 的 `else:`
 会把任何未知名字交给 `splint.run`。（评审订正：初稿把 `runner.py:214,220` 列为崩溃点，实际它们不抛异常。）
 
-### 3.2 Adapter 协议（P2）
+### 3.2 Adapter 协议（P2）✅ 已交付
+
+**实现与下面的草案有一处刻意的差异**：`Adapter` 落地为 `tools/adapter.py` 的**冻结
+dataclass（字段即绑定的模块函数）**，而不是 Protocol + 三个类——三个工具模块本就是函数
+的集合，包成对象只增加仪式、不增加接缝。`validate_report` 没有进协议：它今天只被各
+adapter 自己的 `run()` 调用，没有外部消费者，凭空导出一个没人调的方法不是设计。
+字段还多了两个实现需要的：`reported_version`（doctor 报的版本号，与 manifest 记录的
+整行原文不是同一件事）与 `apt_package`。四个崩溃点已全部改为具名 `UserError`
+（`tests/test_adapters.py`）。
+
 
 ```python
 class RunContext:            # 一次运行中 adapter 需要的全部只读输入
@@ -220,7 +230,19 @@ PRODUCER_ORDER = TOOL_NAMES + LLM_PRODUCERS
 LLM 侧：`llm/skills.py:75 skill_names()` / `:84 load_skill()` 从打包目录发现 Skill，
 `pyproject.toml` 的 package-data 保证 wheel 安装时 `SKILL.md` 随包分发。
 
-### 4.2 Producer Manifest（P2）
+### 4.2 Producer Manifest（P2）◐ 部分交付
+
+已交付的是**行为**部分：每个静态工具一份 `Adapter` 声明（§3.2），一次查表拿到
+run/parse/severity/探测/canary/包名；`allowed-tools` 并集已接入 `cordis.py`
+（`harness/cordis.py:tool_allowlist`），并记录 `granted_by` 与
+`requested_unavailable`——被声明但当前可信插件树无法授予的工具（如 `lsp`）如实记为
+不可用，而不是悄悄当作已授予。
+
+**未交付**的是下面 TOML 里的元数据部分：`capabilities` / `languages` / `applies_to`
+仍散在各 adapter 的代码里（`splint.py:35` 只扫 `.c`；`cppcheck.py:34-40` 的
+compile-db pass + fallback）。把它们提成声明式表格是可做的，但今天没有第二个消费者，
+提了也只是换个地方写同一件事。
+
 
 每个 producer 一份声明块。静态工具在 `tools/<name>/manifest.toml`，
 LLM scanner 复用 `SKILL.md` 的 frontmatter：
@@ -311,7 +333,7 @@ Validated = `CONFIRMED`；Potential FP = `FALSE_POSITIVE`。
 
 ---
 
-## 6. Event Schema — EXTEND；运行级事件日志是 NEW
+## 6. Event Schema — EXTEND；运行级事件日志是 NEW ✅ 已交付（P1）
 
 ### 6.1 现状
 
@@ -444,7 +466,7 @@ spawn（`runtime.py:323`），本项目只透传 `request_timeout_seconds` / `sh
 
 ---
 
-## 9. 动态规划与重规划 — NEW，有界
+## 9. 动态规划与重规划 — NEW，有界 ⬜ 未交付（P4；`max_replan_rounds` 仍为设计，默认 0 即当前行为）
 
 ### 9.1 冲突
 
@@ -548,7 +570,7 @@ LLM 阶段是网络绑定的，与静态并行几乎白赚壁钟。
 
 ---
 
-## 11. 聚合与去重策略 — EXISTS（证据层）/ NEW（意见层）
+## 11. 聚合与去重策略 — EXISTS（证据层）/ NEW（意见层）✅ 已交付（P1）
 
 ### 11.1 证据层的三个冻结点
 
@@ -621,7 +643,7 @@ line_span)` 键。没有行号的 finding（splint 的 `<Location unknown>`）�
 
 ---
 
-## 12. 验证策略 — NEW（既有设计 §7 已设计）
+## 12. 验证策略 — NEW（既有设计 §7 已设计）✅ 已交付（P2，`assess`）
 
 | 项 | 设计 |
 |---|---|
@@ -676,7 +698,7 @@ line_span)` 键。没有行号的 finding（splint 的 `<Location unknown>`）�
 
 ---
 
-## 14. Web UI 架构 — EXISTS（离线）/ NEW（实时）
+## 14. Web UI 架构 — EXISTS（离线）/ NEW（实时）✅ 已交付（P1，`serve`）
 
 ### 14.1 离线 dashboard：五条契约冻结，文件可追加
 
@@ -832,14 +854,27 @@ MVP 交付后即可回答"static-only / llm-only / both 各多少"，即便还�
 
 ## 18. 后续扩展路线
 
-| 期 | 范围 | 解锁 | 前置 |
-|---|---|---|---|
-| **P1 可观察 + 已关联（MVP）** | §17 的 1–6 + **README:9-11 章程修订**（评审订正：`audit/` 在 P1 落地，章程必须同期改，不能让一个版本与 README 自相矛盾） | origin 指标、实时视图、CI 接入 | 无 |
-| **P2 已验证** | Validator `_Phase` 消费者 + `VERDICT_SCHEMA` + `assess` 子命令 + dashboard verdict 区（caveat 紧挨数字）；`Adapter`/`RunContext` 协议重构（消除 4 个崩溃点，字节钉死）；「声明 == 磁盘发现」测试已在；`allowed-tools` 并集接入 `cordis.py`；`recommendation` 上 candidate | **`llm_only_confirmed`**——LLM 层存在的理由 | P1 |
-| **P3 更快 + 更宽** | 进度模型改为工作量比例后做静态 ∥ LLM（锁、共享 cancel）；输出字节上限；`llm-doctor` 与 `llm-resume`（既有设计 Phase 2 的交付物，尚未存在于 `cli.py`）；验证上游 notification 是否携带 token usage；**三个新 scanner**：Resource/Error（枚举加 token + `_LLM_KEYWORD_CATEGORIES` 一行 + memory-safety 的"错误路径未释放"条款迁入）、UB（与 memory-safety **同一 commit** 按 空间/时间 vs 算术/语义 重切，两份 `skill_version` 同升，跨运行缓存失效）、Logic（**只接受闭合 token 集**：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch`；拒绝"找一切逻辑问题"）；`total_*_tokens` 随启用 scanner 数线性缩放（**规则**：仅当用户未显式设置、值仍为 `DEFAULTS` 时，默认值 = 基数 × 启用 scanner 数；显式设置则不缩放；`inputs/effective-config.toml` 记录解析后的数值，`reload` 一致性校验因此不受影响）；include 图 + 头文件配对；`splint.jobs` 默认提高 | 壁钟 ≈ max(静态, LLM)；6 个 scanner；更准的上下文 | P1 |
-| **P4 自适应** | 有界重规划（§9，含按轮次分目录的证据路径）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF）；TUI 的 `[llm]` 字段、可选 LLM 门禁、`docs/usage.md` 新章节（既有设计 Phase 4 的交付物） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 |
+| 期 | 范围 | 解锁 | 前置 | 状态 |
+|---|---|---|---|---|
+| **P1 可观察 + 已关联（MVP）** | §17 的 1–6 + **README:9-11 章程修订**（评审订正：`audit/` 在 P1 落地，章程必须同期改，不能让一个版本与 README 自相矛盾） | origin 指标、实时视图、CI 接入 | 无 | ✅ 已交付 |
+| **P2 已验证** | Validator `_Phase` 消费者 + `VERDICT_SCHEMA` + `assess` 子命令 + dashboard verdict 区（caveat 紧挨数字）；`Adapter`/`RunContext` 协议重构（消除 4 个崩溃点，字节钉死）；「声明 == 磁盘发现」测试已在；`allowed-tools` 并集接入 `cordis.py`；`recommendation` 上 candidate | **`llm_only_confirmed`**——LLM 层存在的理由 | P1 | ✅ 已交付（§4.2 的元数据表格部分除外） |
+| **P3 更快 + 更宽** | 进度模型改为工作量比例后做静态 ∥ LLM（锁、共享 cancel）；输出字节上限；`llm-doctor` 与 `llm-resume`（既有设计 Phase 2 的交付物，尚未存在于 `cli.py`）；验证上游 notification 是否携带 token usage；**三个新 scanner**：Resource/Error（枚举加 token + `_LLM_KEYWORD_CATEGORIES` 一行 + memory-safety 的"错误路径未释放"条款迁入）、UB（与 memory-safety **同一 commit** 按 空间/时间 vs 算术/语义 重切，两份 `skill_version` 同升，跨运行缓存失效）、Logic（**只接受闭合 token 集**：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch`；拒绝"找一切逻辑问题"）；`total_*_tokens` 随启用 scanner 数线性缩放（**规则**：仅当用户未显式设置、值仍为 `DEFAULTS` 时，默认值 = 基数 × 启用 scanner 数；显式设置则不缩放；`inputs/effective-config.toml` 记录解析后的数值，`reload` 一致性校验因此不受影响）；include 图 + 头文件配对；`splint.jobs` 默认提高 | 壁钟 ≈ max(静态, LLM)；6 个 scanner；更准的上下文 | P1 | ✅ 已交付 |
+| **P4 自适应** | 有界重规划（§9，含按轮次分目录的证据路径）：`llm/plan.json`、rounds 循环、动作词汇表、`--plan` 重放、`max_replan_rounds` 默认 0；可选 NL → config-patch 前端；`@media print`（替代 PDF）；TUI 的 `[llm]` 字段、可选 LLM 门禁、`docs/usage.md` 新章节（既有设计 Phase 4 的交付物） | Plan→Execute→Observe→Re-plan，可复现性不破 | P2 | ◐ 部分：`@media print`、TUI `[llm]` 字段、可选 LLM 门禁（`[review] gate_includes_llm`）、`docs/usage.md` 第 12 章已交付；有界重规划（§9）与 NL 前端未交付 |
 
 每期独立可 ship、测试全绿、不改前一期的契约。
+
+**实现期间对设计的三处修正**（都由实测推翻了设计时的假设）：
+
+1. **上游确实提供 token usage**（附录 A #11 记为「未验证」）。2026-08-24 对 GPU 主机实测：
+   每次模型回复都带 `{"chunk":{"type":"usage","usage":{"inputTokens","outputTokens"}}}`。
+   于是 `llm.budget.measured` 记录提供方自己的计数；估算仍是调度依据（预算必须在派发前
+   决定），但两者不相等且差异是结构性的，见 `docs/llm-scan-architecture.md` 的 token 账本节。
+2. **validator 需要自己的步数上限**。第一次实测 `assess` 时，validator 在 scanner 的
+   4 步上限下被截断——它要用文件工具回溯调用者，这正是设计要它做的事。新增
+   `[audit] validation_max_steps`（默认 12）后，同一批候选给出了正确的 CONFIRMED 与
+   FALSE_POSITIVE。
+3. **`llm-logic` 的闭合 token 集需要反例，不只是定义**。首轮实测中它把「缺少 NULL 检查」
+   报成了 `dead-code`。skill 升到 1.1.0，显式写明四个 token **不**包含什么。
 
 **与既有设计 §12 分期的对应**（评审指出初稿复用了期号却换了内容）：既有 Phase 0–1 已实现；
 既有 Phase 2（三个 Skill、风险图、预算、`llm-resume`、`llm-doctor`）中前三项已实现，后两项归入本文 P3；
