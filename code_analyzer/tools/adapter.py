@@ -18,6 +18,7 @@ seam.  ``Adapter`` binds those functions; it does not reimplement them.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +47,34 @@ class CompileDatabase:
         return set(self.covered)
 
 
+class OutputBudget:
+    """How many bytes of tool output one whole run may keep.
+
+    ``run_process`` caps a single invocation, which bounds one translation
+    unit; splint calls it once per unit, so a large tree could still fill a
+    disk one bounded unit at a time.  This is the run-level half of the same
+    limit, shared by every adapter and safe to spend from the thread pools two
+    of them use.
+    """
+
+    def __init__(self, total: int) -> None:
+        self._remaining = max(0, int(total))
+        self._lock = threading.Lock()
+        self.spent = 0
+
+    def remaining(self) -> int:
+        with self._lock:
+            return self._remaining
+
+    def spend(self, result: Any) -> None:
+        """Charge one process's stored output against the run."""
+        stored = getattr(result, "stored_bytes", None) or {}
+        total = sum(value for value in stored.values() if isinstance(value, int) and value > 0)
+        with self._lock:
+            self._remaining = max(0, self._remaining - total)
+            self.spent += total
+
+
 @dataclass(frozen=True)
 class RunContext:
     """Everything one analysis run hands an adapter, read-only.
@@ -64,6 +93,7 @@ class RunContext:
     cancelled: Callable[[], bool]
     unit_event: UnitEvent
     output_event: UnitEvent | None = None
+    output_budget: OutputBudget | None = None
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..errors import UserError
-from .adapter import Adapter, CompileDatabase, RunContext
+from .adapter import Adapter, CompileDatabase, OutputBudget, RunContext
 
 # The single registry of supported analyzers, in canonical execution order.
 TOOL_NAMES: tuple[str, ...] = ("cppcheck", "flawfinder", "splint")
@@ -58,6 +58,7 @@ _ADAPTERS: dict[str, Adapter] | None = None
 __all__ = [
     "Adapter",
     "CompileDatabase",
+    "OutputBudget",
     "LLM_PRODUCERS",
     "PRODUCER_ORDER",
     "RunContext",

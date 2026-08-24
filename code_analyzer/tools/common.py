@@ -37,6 +37,19 @@ def utf8_validation(path: Path, chunk_size: int = 1024 * 1024) -> tuple[bool, di
     return True, None
 
 
+def output_room(budget: Any) -> int:
+    """Bytes this invocation may store, from the run-level budget.
+
+    ``None`` means no run-level budget (a direct adapter call in a test, or a
+    caller that does not care), in which case ``run_process``'s own per-call
+    ceiling is the only limit -- exactly the behaviour before the budget
+    existed.
+    """
+    from ..process import MAX_OUTPUT_BYTES
+
+    return MAX_OUTPUT_BYTES if budget is None else min(MAX_OUTPUT_BYTES, budget.remaining())
+
+
 def unit_outcome(
     process: Any, valid: bool, succeeded: bool, reason: str | None, failure_reason: str
 ) -> tuple[str, str | None]:

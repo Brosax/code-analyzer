@@ -158,3 +158,57 @@ def test_the_canary_isolates_every_adapter_the_same_way(tmp_path: Path, monkeypa
     assert "int main(void)" in seen["source"]
     # The temporary tree is gone: no adapter can leave a canary behind.
     assert not seen["root"].exists()
+
+
+def test_the_output_ceiling_is_a_run_budget_not_a_per_unit_one(tmp_path: Path) -> None:
+    """splint calls run_process once per translation unit.
+
+    A per-invocation ceiling bounds one unit; a five-hundred-file tree could
+    still fill a disk one bounded unit at a time, which is what the design's
+    resource limit exists to prevent.
+    """
+    from code_analyzer.process import MAX_OUTPUT_BYTES
+    from code_analyzer.tools import OutputBudget
+    from code_analyzer.tools.common import output_room
+
+    budget = OutputBudget(10_000)
+    assert budget.remaining() == 10_000
+    # The per-call ceiling still applies when it is the smaller of the two.
+    assert output_room(budget) == 10_000
+    assert output_room(None) == MAX_OUTPUT_BYTES
+
+    class _Result:
+        stored_bytes = {"stdout": 4_000, "stderr": 1_000}
+
+    budget.spend(_Result())
+    assert budget.remaining() == 5_000 and budget.spent == 5_000
+    budget.spend(_Result())
+    budget.spend(_Result())
+    # Exhausted, never negative: the next unit is allowed zero bytes, which
+    # run_process records as truncation rather than as a crash.
+    assert budget.remaining() == 0
+    assert output_room(budget) == 0
+
+
+def test_the_run_shares_one_output_budget_across_every_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    seen: list[RunContext] = []
+    monkeypatch.setattr(tools_package, "_ADAPTERS", {**adapters(), "cppcheck": _fake_adapter(seen)})
+
+    config = validate_config(json.loads(json.dumps(DEFAULTS)))
+    config["run"]["output_root"] = str(tmp_path / "reports")
+    config["run"]["shareable_export"] = False
+    config["build"]["compile_database_mode"] = "disabled"
+    for name in TOOL_NAMES:
+        config["tools"][name]["enabled"] = name == "cppcheck"
+    config["tools"]["cppcheck"]["executable"] = "/bin/true"
+
+    run_analysis(AnalysisRequest(source, config))
+
+    [context] = seen
+    assert context.output_budget is not None
+    assert context.output_budget.remaining() == runner.RUN_OUTPUT_BYTES

@@ -106,6 +106,8 @@ class ProcessResult:
     # per stream.  Truncation is evidence, not a silent repair: a report that
     # hits it fails its own validation, and the number says why.
     truncated_bytes: dict[str, int] = field(default_factory=lambda: {"stdout": 0, "stderr": 0})
+    # What reached disk, per stream: the number a run-level budget spends.
+    stored_bytes: dict[str, int] = field(default_factory=lambda: {"stdout": 0, "stderr": 0})
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -278,6 +280,7 @@ def run_process(
         interrupted=interrupted,
         termination=termination,
         truncated_bytes=dict(truncated),
+        stored_bytes={forwarder.stream: stored[pipe] for pipe, (_destination, forwarder) in outputs.items()},
     )
 
 

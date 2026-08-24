@@ -10,7 +10,7 @@ from typing import Any, Callable
 from ..process import run_process
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
-from .common import attach_artifacts, unit_outcome, utf8_validation
+from .common import attach_artifacts, output_room, unit_outcome, utf8_validation
 
 
 def shard_files(files: list[str], prefix_bytes: int = 200) -> list[list[str]]:
@@ -39,6 +39,7 @@ def run(
     *,
     cancelled: Callable[[], bool] | None = None,
     unit_event: Callable[[str, str, str, float | None], None] | None = None,
+    output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
@@ -99,7 +100,10 @@ def run(
                 if output_event is not None else None
             ),
             output_streams=("stderr",),
+            max_output_bytes=output_room(output_budget),
         )
+        if output_budget is not None:
+            output_budget.spend(process)
         report.unlink(missing_ok=True)
         valid, reason = _validate(stdout)
         if valid:
@@ -164,6 +168,7 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
     return run(
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.config, ctx.progress,
         cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
+        output_budget=ctx.output_budget,
     )
 
 

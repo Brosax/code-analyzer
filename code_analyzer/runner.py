@@ -35,8 +35,13 @@ from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_revi
 from .sanitize import ExportError, export_shareable
 from .sarif import build_sarif, write_sarif
 from .status import overall
-from .tools import TOOL_NAMES, CompileDatabase, RunContext, adapter
+from .tools import TOOL_NAMES, CompileDatabase, OutputBudget, RunContext, adapter
 from .tools.common import artifact_index
+
+# The whole run's share of disk for tool output.  Generous: flawfinder's native
+# report is its stdout, so this has to sit far above any real report and act
+# only against a runaway.
+RUN_OUTPUT_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class AnalysisCancelled(Exception):
@@ -307,6 +312,10 @@ def _analyze(
     # without unlocking.  Outside the window there is exactly one thread and
     # the lock is uncontended.
     manifest_lock = threading.RLock()
+    # One ceiling for the whole run, not one per invocation: splint calls
+    # run_process once per translation unit, so a large tree could otherwise
+    # fill a disk one bounded unit at a time.
+    output_budget = OutputBudget(RUN_OUTPUT_BYTES)
     llm_enabled = bool(config["llm"]["enabled"])
     window = _Window(event, llm=llm_enabled)
 
@@ -378,6 +387,7 @@ def _analyze(
                 ),
                 config=config, progress=unit_progress, cancelled=cancellation.is_cancelled,
                 unit_event=structured_unit, output_event=streamed_output if live_events else None,
+                output_budget=output_budget,
             )
             try:
                 result = adapter(name).run(resolved, context)

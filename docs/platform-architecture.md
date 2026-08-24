@@ -459,7 +459,7 @@ spawn（`runtime.py:323`），本项目只透传 `request_timeout_seconds` / `sh
 |---|---|---|
 | subprocess isolation | EXISTS：进程组、`shell=False`、`stdin=DEVNULL`（`process.py:82`） | **NEW**：由 SDK spawn，本项目不控制进程组 |
 | timeout | EXISTS：TERM → grace → KILL，有界 | PARTIAL：只有 SDK 的两个超时参数；无进程组清理 |
-| resource limit | 无 | `preexec_fn` 在线程池下（`splint.py:165`、`scan.py:440`）不安全；Docker 违反 README:9 "does not install tools"。**改为输出字节上限**（`process.py:188,202`，~10 行），把 `truncated_bytes` 记进 `ProcessResult`——截断成为证据 |
+| resource limit | ✅ 已交付：**两级输出字节上限** | `preexec_fn` 在线程池下（`splint.py:165`、`scan.py:440`）不安全；Docker 违反 README:9 "does not install tools"。落地为：`run_process` 的单次调用上限（每流 256 MiB）**加上** `OutputBudget` 的整轮上限（2 GiB，跨 adapter 共享、可并发扣减）——只有前者时，splint 每个 translation unit 调一次，500 个文件仍可一个个把磁盘写满。`truncated_bytes` 进 `ProcessResult` 并进入 unit 的 `reason`：截断成为可读的证据，而不是一个无人解释的解析失败 |
 | working directory isolation | EXISTS：`cwd` 限定 | **NOT EXISTS**：`cwd` 对 agent **不是**边界——`runtime.py:251-253` 引用上游原话 "a resolution default, NOT a containment boundary"；`cordis.py:21-28` 记录没有任何上游包限制**读取**；证据文件如实盖章 `"confinement": "unenforced-upstream"`（`cordis.py:80`）。今天真正保证 scanner 对静态结果盲的是 `runner.py:81` 的 `output_root` 不得在被扫描树内——且它**只在 `[llm] enabled` 时**生效 |
 | output size limit | 无 | 同上，P3 |
 | Docker | 无 | 路线图：作为 `run_process` 的替代后端，返回同一个 `ProcessResult` |
