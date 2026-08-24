@@ -56,7 +56,10 @@ CHARS_PER_TOKEN = 4
 # harness's own system prompt, the skill catalogue reminder and the tool
 # schemas add roughly this much on top of the rendered unit.
 PROMPT_OVERHEAD_TOKENS = 1900
-TOKEN_ACCOUNTING = "estimated: prompt characters / 4, completion reserved at max_completion_tokens"
+TOKEN_ACCOUNTING = (
+    "budget: estimated (prompt characters / 4, completion reserved at max_completion_tokens); "
+    "measured: the provider's own per-request counts, summed"
+)
 
 Task = tuple[int, str, dict[str, Any]]
 OpenRuntime = Callable[[str, str, dict[str, Any]], ContextManager[Any]]
@@ -447,6 +450,7 @@ class _Phase:
         self.completion_budget = int(settings["total_completion_tokens"])
         self.prompt_spent = 0
         self.completion_reserved = 0
+        self.measured = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
         self.total = 0
         self._cancel = threading.Event()
         self._ledger = threading.Lock()
@@ -558,6 +562,10 @@ class _Phase:
         cacheable = record.get("status") in {"completed", "partial"} and not provider_stopped
         if cached is None and cacheable:
             self.cache.store(key, unit_directory(self.run_dir, producer, unit_id), self.run_dir.name)
+        # A replayed unit costs the provider nothing, so its measured usage
+        # belongs to the run that paid for it, not to this one.
+        if cached is None:
+            self.account(record)
         return self._report(task, self._decorate(record, task, skill))
 
     # --- budget -------------------------------------------------------------
@@ -593,7 +601,23 @@ class _Phase:
             "endpoint_context_length": self.effective_context,
             "total_completion_tokens": self.completion_budget,
             "completion_tokens_reserved": self.completion_reserved,
+            # What the provider says it actually read and wrote.  The estimate
+            # above still drives scheduling -- a budget has to be reserved
+            # before it is spent -- but the run now records both, so the
+            # estimate can be checked against reality instead of trusted.
+            "measured": self.measured,
         }
+
+    def account(self, record: dict[str, Any]) -> None:
+        """Add one session's measured usage to the phase ledger."""
+        usage = record.get("usage_measured")
+        if not isinstance(usage, dict):
+            return
+        with self._ledger:
+            for key in ("prompt_tokens", "completion_tokens", "requests"):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    self.measured[key] += value
 
     # --- plumbing -----------------------------------------------------------
 

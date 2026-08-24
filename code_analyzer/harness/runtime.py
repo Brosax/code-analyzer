@@ -97,6 +97,46 @@ class RunOutcome:
     duration_seconds: float
 
 
+def measured_usage(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Sum the provider's own token counts over one session's requests.
+
+    Verified against the pinned runtime on 2026-08-24: every model reply
+    carries ``{"chunk": {"type": "usage", "usage": {"inputTokens", "outputTokens"}}}``,
+    one per step.  Each step re-sends the conversation so far, so summing the
+    input counts measures what the provider was actually asked to read, which
+    is the quantity a budget is about -- not the size of the last prompt.
+
+    Absent or malformed usage is zero, never an exception: this is measurement,
+    and a session whose provider reports nothing must still produce a record.
+    """
+    prompt = completion = requests = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        chunk = (event.get("data") or {}).get("chunk") if isinstance(event.get("data"), dict) else None
+        if not isinstance(chunk, dict) or chunk.get("type") != "usage":
+            continue
+        usage = chunk.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        prompt += _count(usage, "inputTokens", "input_tokens", "promptTokens", "prompt_tokens")
+        completion += _count(usage, "outputTokens", "output_tokens", "completionTokens", "completion_tokens")
+        requests += 1
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "requests": requests}
+
+
+def _count(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, float) and value >= 0:
+            return int(value)
+    return 0
+
+
 def harness_available() -> bool:
     try:
         _sdk()

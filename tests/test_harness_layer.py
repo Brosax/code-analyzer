@@ -11,6 +11,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -852,3 +853,52 @@ def test_the_allowlist_is_the_union_of_the_enabled_skills_and_records_what_the_t
     shelly = type("S", (), {"metadata": {"allowed-tools": ["fs", "shell"]}})()
     with pytest.raises(UserError, match="untrusted"):
         cordis.cordis_document(settings, skill_dir=tmp_path, session_root=tmp_path / "sessions", tools=cordis.tool_allowlist([shelly]))
+
+
+# --- measured token usage ----------------------------------------------------
+
+
+def _usage_event(input_tokens: int, output_tokens: int, step: int = 1) -> dict[str, Any]:
+    """One usage chunk, in the shape the pinned runtime really emits.
+
+    Copied from a live session log against the GPU host on 2026-08-24; the
+    project's own accounting was estimate-only until that shape was verified.
+    """
+    return {
+        "type": "assistant/chunk", "seq": 41, "time": 1787481252684,
+        "data": {"turn": 1, "step": step, "chunk": {"type": "usage", "usage": {
+            "inputTokens": input_tokens, "outputTokens": output_tokens,
+        }}},
+    }
+
+
+def test_measured_usage_sums_every_request_and_never_raises_on_junk() -> None:
+    from code_analyzer.harness.runtime import measured_usage
+
+    # Two steps: the second re-sends the conversation, and the provider bills
+    # both, so the sum is what the run cost -- not the size of the last prompt.
+    events = [
+        {"type": "step/start", "data": {"step": 1}},
+        _usage_event(3507, 35, step=1),
+        {"type": "tool/result", "data": {"content": "..."}},
+        _usage_event(3670, 29, step=2),
+    ]
+    assert measured_usage(events) == {"prompt_tokens": 7177, "completion_tokens": 64, "requests": 2}
+
+    # Model output and provider payloads are untrusted input: measurement is
+    # best-effort, and anything unreadable is zero rather than an exception.
+    junk: list[Any] = [
+        None, "not an event", 42, {"type": "assistant/chunk"},
+        {"data": None}, {"data": {"chunk": None}}, {"data": {"chunk": {"type": "usage"}}},
+        {"data": {"chunk": {"type": "usage", "usage": {"inputTokens": True, "outputTokens": -5}}}},
+        {"data": {"chunk": {"type": "usage", "usage": {"inputTokens": "many"}}}},
+        {"data": {"chunk": {"type": "text-delta", "usage": {"inputTokens": 999}}}},
+    ]
+    # Two requests counted: the two chunks that carry a usage object at all.
+    # A usage chunk without one is not a request whose cost was reported.
+    assert measured_usage(junk) == {"prompt_tokens": 0, "completion_tokens": 0, "requests": 2}
+    assert measured_usage([]) == {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+
+    # The other spelling providers use for the same two numbers.
+    snake = [{"data": {"chunk": {"type": "usage", "usage": {"prompt_tokens": 10, "completion_tokens": 4}}}}]
+    assert measured_usage(snake) == {"prompt_tokens": 10, "completion_tokens": 4, "requests": 1}

@@ -25,6 +25,7 @@ from .runtime import (
     HarnessRuntime,
     RunOutcome,
     finish_status,
+    measured_usage,
     redact_credential,
     request_description,
 )
@@ -281,6 +282,7 @@ def _run_session(
         "reason": reason,
         "evidence_context": "source-only",
         "finish_reason": outcome.finish_reason if outcome else "",
+        "usage_measured": measured_usage(outcome.events if outcome else []),
         **parsed.counts,
         **redact_credential(parsed.record, active),
     }
@@ -350,6 +352,7 @@ def _meta(
         "event_count": len(events),
         "tool_call_count": _tool_calls(events),
         "notification_count": len(outcome.notifications) if outcome else 0,
+        "usage_measured": measured_usage(events),
         **counts,
         "cache": {
             "hit": bool((cache or {}).get("hit", False)),
