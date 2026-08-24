@@ -188,3 +188,46 @@ def test_manifest_replace_failure_rolls_back_index(
     assert index_path.read_bytes() == index_before
     assert not list(report.glob(".index.html.*"))
     assert not list(report.glob(".manifest.json.*"))
+
+
+def test_the_print_stylesheet_is_the_pdf_this_project_does_not_ship() -> None:
+    """Printing must show what the screen showed, and fit on paper.
+
+    The design rejects a PDF exporter (one more dependency, one more format
+    with no machine consumer) in favour of print CSS.  That trade only holds
+    if the printed page is actually usable, so the two ways it was observed
+    to break are pinned here.
+    """
+    html = render({"manifest_schema_version": 2, "run_id": "r", "status": "complete", "exit_code": 0,
+                   "tools": {}, "source_inventory": {"total": 1}, "artifacts": []}, None, None)
+    print_rules = html.split("@media print{", 1)[1].split("\n}", 1)[0]
+
+    # Controls are noise on paper; the report itself is not.
+    assert ".nav,.controls,.pagination,button,.mast-actions{display:none!important}" in print_rules
+    # Severity and origin are carried by colour: the browser's ink-saving
+    # default would erase half the meaning.
+    assert "print-color-adjust:exact" in print_rules
+    # A wide table scrolls on screen and would be cut off on paper.
+    assert ".table-wrap{overflow:visible!important" in print_rules
+    # ... but never with a fixed layout: eleven equal columns shred every word
+    # into one letter per line, which turned a 15-page report into 71 pages.
+    assert "table-layout:fixed" not in print_rules
+    # A link to native evidence is useless on paper unless the path prints.
+    assert 'content:" (" attr(href) ")"' in print_rules
+
+
+def test_printing_expands_what_pagination_and_details_hide() -> None:
+    """CSS cannot reliably open a <details>, and cannot un-paginate at all."""
+    html = render({"manifest_schema_version": 2, "run_id": "r", "status": "complete", "exit_code": 0,
+                   "tools": {}, "source_inventory": {"total": 1}, "artifacts": []}, None, None)
+
+    assert 'window.addEventListener("beforeprint"' in html
+    assert 'window.addEventListener("afterprint"' in html
+    assert 'document.querySelectorAll("details:not([open])")' in html
+    # "all" is a real page size, not a print-only sentinel: a reader with 300
+    # findings wants it too.
+    assert '<option value="all" data-i18n="page_all">' in html
+    # Both language tables carry the key: a missing one degrades to the raw key.
+    zh, en = html.split("en: {", 1)
+    assert 'page_all: "全部"' in zh and 'page_all: "All"' in en
+    assert 'id("page-size").value === "all"' in html

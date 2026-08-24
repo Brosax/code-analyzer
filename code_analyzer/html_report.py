@@ -322,11 +322,34 @@ tbody tr:hover td{background:var(--soft)}
   .section-head{display:block}
   .sheet{margin:0;border:none}
 }
+/* Print is this project's PDF: one dependency-free path to a fixed artifact a
+   reviewer can carry, sign or attach to a ticket.  What it must not do is
+   print something *different* from what the screen showed -- a paper report
+   that quietly drops a rationale or a bar is worse than no paper report. */
 @media print{
   .nav,.controls,.pagination,button,.mast-actions{display:none!important}
   body{background:#fff}
   .sheet{border:none;margin:0;max-width:none}
-  section,.panel,.tool-card{break-inside:avoid}
+  /* Panels and cards are small enough to keep whole; a *section* is not, and
+     asking for one would push most of a page's ink onto the next one. */
+  .panel,.tool-card,.metric,.bar-row{break-inside:avoid}
+  /* Severity and origin are carried by colour as much as by text, so the
+     bars and badges have to survive the browser's ink-saving default. */
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  /* On screen a wide table scrolls; on paper it would simply be cut off, so
+     it wraps instead.  Auto layout, deliberately: a fixed layout gives eleven
+     columns equal width and shreds every word into one letter per line. */
+  .table-wrap{overflow:visible!important;border:none}
+  table{width:100%;font-size:8.5pt}
+  td,th{overflow-wrap:break-word;padding:.25rem .35rem}
+  td details{max-width:none;font-size:.8em}
+  td details summary{display:none}
+  /* A link to native evidence is useless on paper unless the path prints. */
+  .evidence a[href]:after,.tool-card a[href]:after{content:" (" attr(href) ")";font-family:var(--mono);font-size:.85em;color:var(--muted)}
+  h2{break-after:avoid}
+  thead{display:table-header-group}
+  tr{break-inside:avoid}
+  @page{margin:14mm}
 }
 """
 
@@ -466,6 +489,7 @@ _JS_MAIN = r"""
       caveat_validator_sees_static: "llm_only_confirmed 由能看到同一文件静态结果的 validator 产出；应理解为“被第二个角色佐证”，而非独立确认。",
       verdict_decisive_line: "决定性行：",
       verdict_remediation: "建议修复（非权威）：",
+      page_all: "全部",
       caveat_validator_ran: "validator 已运行：{total} 个候选中 {validated} 个带有判定，{unvalidated} 个没有（其中 {unscheduled} 个未被调度：受 validation_max_candidates 上限或 token 预算限制）。validator 看得到同一文件的静态结果。",
       caveat_grouping_not_identity: "候选只是把指向相同行与类别的发现分到一组，并不断言它们描述的是同一个缺陷。",
       card_llm_only_confirmed: "仅 LLM 发现且判定 CONFIRMED", card_validated: "已核验 / 未核验",
@@ -552,6 +576,7 @@ _JS_MAIN = r"""
       caveat_validator_sees_static: "llm_only_confirmed is produced by a validator that sees the static findings for the same file; read it as corroborated by a second role, not as an independent confirmation.",
       verdict_decisive_line: "Decisive line:",
       verdict_remediation: "Remediation (non-authoritative):",
+      page_all: "All",
       caveat_validator_ran: "A validator has run: {validated} of {total} candidates carry a verdict and {unvalidated} do not ({unscheduled} were never scheduled, by the validation_max_candidates cap or the token budget). The validator saw the static findings for the same file.",
       caveat_grouping_not_identity: "A candidate groups findings that name the same lines and category; it does not assert that they describe the same defect.",
       card_llm_only_confirmed: "LLM-only and CONFIRMED", card_validated: "Validated / unvalidated",
@@ -1259,7 +1284,10 @@ _JS_MAIN = r"""
         : sort === "tool" ? String(a.tool || "").localeCompare(String(b.tool || ""))
           : sort === "rule" ? String(a.rule_id || "").localeCompare(String(b.rule_id || ""))
             : (Number(b.rank || 0) - Number(a.rank || 0)));
-    const size = Number(id("page-size").value);
+    // "all" is what print needs and what a reader with 300 findings wants:
+    // one page is the honest view when the pagination is the only thing
+    // hiding a row.
+    const size = id("page-size").value === "all" ? Math.max(rows.length, 1) : Number(id("page-size").value);
     const pages = Math.max(1, Math.ceil(rows.length / size));
     state.page = Math.min(state.page, pages);
     const body = id("finding-body");
@@ -1299,6 +1327,22 @@ _JS_MAIN = r"""
   /* ---------- wiring ---------- */
   ["search", "context", "engine", "review-level", "severity", "tool", "cwe", "sort", "page-size"].forEach(x =>
     id(x).addEventListener("input", () => { state.page = 1; renderFindings(); }));
+  // Print must show what the screen showed.  A collapsed <details> is hidden
+  // by the UA in a way CSS cannot reliably override, and the findings table is
+  // paginated, so both are expanded for the print and restored afterwards.
+  let restore = null;
+  window.addEventListener("beforeprint", () => {
+    const closed = Array.from(document.querySelectorAll("details:not([open])"));
+    closed.forEach(node => { node.open = true; });
+    const size = id("page-size").value;
+    const page = state.page;
+    if (size !== "all") { id("page-size").value = "all"; state.page = 1; renderFindings(); }
+    restore = () => {
+      closed.forEach(node => { node.open = false; });
+      if (size !== "all") { id("page-size").value = size; state.page = page; renderFindings(); }
+    };
+  });
+  window.addEventListener("afterprint", () => { if (restore) { restore(); restore = null; } });
   id("previous").onclick = () => { state.page--; renderFindings(); };
   id("next").onclick = () => { state.page++; renderFindings(); };
   id("reset").onclick = () => {
@@ -1481,7 +1525,7 @@ _HTML_BODY = r"""<div class="sheet">
 <div class="pagination">
 <span id="page-status" class="muted"></span>
 <span>
-<select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>250</option></select>
+<select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>250</option><option value="all" data-i18n="page_all">全部</option></select>
 <button id="previous" data-i18n="prev">上一页</button>
 <button id="next" data-i18n="next">下一页</button>
 </span>

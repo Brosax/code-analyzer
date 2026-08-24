@@ -75,6 +75,39 @@ output remains a single final run-directory path, so scripts can safely capture 
 [complete usage tutorial](docs/usage.md) for configuration, reports, progress,
 and exit-code details.
 
+## LLM scanners
+
+The LLM layer is off by default: a scan that may take hours must never be a
+side effect of `analyze .`. Enabled, six specialist scanners review every unit
+independently of the native tools and of each other — memory safety, security,
+firmware concurrency, undefined behaviour, resource and error handling, and a
+closed set of four control-flow logic classes.
+
+```bash
+code-analyzer llm-doctor /path/to/project --llm-profile gpu-host
+code-analyzer analyze /path/to/project --llm --llm-profile gpu-host
+code-analyzer llm-resume /path/to/report-directory
+code-analyzer assess /path/to/report-directory
+```
+
+`llm-doctor` probes the provider before a long scan commits to it: it lists the
+endpoint's models, checks that the configured one is among them *and* that the
+reply comes back stamped with it, compares the served context window against
+the configured one (a smaller window truncates prompts silently), times one
+real request for a tokens-per-second figure, and estimates the full scan from
+the run's own unit plan. Exit `20` when any of that fails, like `doctor`.
+
+`llm-resume` finishes the units a run left `unscheduled` (token budget or
+deadline) or `interrupted`, then re-derives the review. Unlike
+`recover-report` it does invoke the scanner, and says so in the manifest. It
+replays each unit's stored prompt rather than re-planning, so a resumed unit
+scans the bytes its plan described.
+
+`assess` runs the second layer over a finished run: one validator session per
+correlated candidate, riskiest first, writing verdicts into
+`audit/assessment.json`. The evidence layer is never touched. Exit `10` when
+some candidates were left unvalidated by the cap or the budget.
+
 To rebuild a missing or outdated offline dashboard without rerunning analyzers,
 point the dedicated command at an unpacked report directory:
 

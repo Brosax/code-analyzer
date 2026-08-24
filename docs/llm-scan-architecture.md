@@ -561,8 +561,21 @@ agent loop 的成本远高于单次补全——它会多轮调用工具、反复
 |---|---|
 | step 上限 | 单个单元内 agent 的最大步数 |
 | turn 上限 | 单个单元内的最大模型往返次数 |
-| token 账本 | `total_prompt_tokens` / `total_completion_tokens` 累计上限 |
+| token 账本 | `total_prompt_tokens` / `total_completion_tokens` 累计上限（单 scanner 基数 × 启用 scanner 数） |
 | wall-clock deadline | 整个 LLM 阶段的总壁钟预算 |
+
+**估算与实测并存，且两者不相等。** 预算必须在派发**之前**决定，所以调度只能用估算
+（prompt 字符数 / 4 + 固定开销）；而 2026-08-24 对 GPU 主机的实测显示上游每次模型回复
+都带 `usage` 块，于是 `llm.budget.measured` 记录提供方自己的计数。一次 resume 的实测：
+
+| | prompt tokens |
+|---|---|
+| 估算（调度依据） | 25 166 |
+| 实测（提供方计数） | 58 409 / 15 次请求 |
+
+差异不是估算公式的误差，而是**结构性**的：估算按"每单元一次 prompt"计，而一个多步
+会话每一步都会把此前的上下文重发一次，每一步都是一次真实计费请求。因此估算是预算的
+**下界**，实测才是账单。两个数字都记进 `manifest.json`，谁也不替换谁。
 
 **直接沿用 splint 已经验证过的预算模型**：
 
