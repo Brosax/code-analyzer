@@ -269,3 +269,44 @@ def test_every_category_a_skill_declares_has_an_id_family() -> None:
     resolved = {_CATEGORY_ALIASES.get(category, category) for category in declared}
     missing = sorted(category for category in resolved if category not in _ID_PREFIXES)
     assert missing == [], f"no candidate id family for: {missing}"
+
+
+def test_two_engines_naming_the_same_cwe_on_the_same_lines_meet() -> None:
+    """A scanner's vocabulary is finer than a static tool's, not different.
+
+    Observed against real output once cppcheck was upgraded: cppcheck reports
+    `memleak` CWE-401 at src/alloc.c:11 and llm-resource-error reports
+    `error-path` CWE-401 covering lines 9-12 — the same leak. Correlating on
+    the declared name alone filed them as two candidates, one llm-only and one
+    static-only, which does not merely lose a correlation: it inflates
+    llm_only_confirmed, the one metric the LLM layer is judged by.
+    """
+    static = _row("cppcheck", "11", cwe="CWE-401", message="Memory leak: buf")
+    llm = _row("llm-resource-error", "9", cwe="CWE-401", category="error-path",
+               message="the error path returns without freeing the buffer")
+
+    assert correlation_category(static) == correlation_category(llm) == "resource-leak"
+    assessment = build_assessment(_review(static, llm))
+    [candidate] = assessment["candidates"]
+    assert candidate["origin"] == "both" and candidate["category"] == "resource-leak"
+    assert candidate["sources"] == ["cppcheck", "llm-resource-error"]
+    assert assessment["metrics"]["by_origin"] == {"static-only": 0, "llm-only": 0, "both": 1}
+
+
+def test_a_category_no_static_tool_can_produce_keeps_its_own_name() -> None:
+    """The CWE table is a meeting point, not a flattener.
+
+    Nothing in the static vocabulary corresponds to a broken state machine, so
+    the scanner's own word has to survive — otherwise the closed token set the
+    logic scanner is defined by would be erased on the way into the audit layer.
+    """
+    # CWE-670 is what the live logic scanner emits, and no static rule claims
+    # it; a finding with no CWE at all takes the same path.
+    llm = _row("llm-logic", "5", category="state-machine", cwe="CWE-670",
+               message="no event leaves LINK_FAULT, so the link never recovers")
+
+    assert correlation_category(llm) == "state-machine"
+    assert correlation_category({**llm, "cwe": ""}) == "state-machine"
+    [candidate] = build_assessment(_review(llm))["candidates"]
+    assert candidate["origin"] == "llm-only" and candidate["category"] == "state-machine"
+    assert candidate["id"].startswith("LOG-")

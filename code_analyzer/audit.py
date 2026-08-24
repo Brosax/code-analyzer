@@ -80,17 +80,30 @@ def correlation_category(item: dict[str, Any]) -> str:
     flawfinder CWE-190 whose message says "integer overflow" lands in "buffer"
     via the static keyword table and never meets an LLM "integer-overflow".
     """
+    declared = ""
     if item.get("engine") == "llm":
-        declared = str(item.get("category", "")).strip().lower()
-        if declared:
-            return _CATEGORY_ALIASES.get(declared, declared)
+        declared = _CATEGORY_ALIASES.get(
+            str(item.get("category", "")).strip().lower(), str(item.get("category", "")).strip().lower()
+        )
     value = f"{item.get('cwe', '')} {item.get('rule_id', '')} {item.get('message', '')}"
     match = re.search(r"CWE-?(\d+)", value, re.I)
     cwe = int(match.group(1)) if match else None
     if cwe is not None:
         for category, numbers in (*_FROZEN_STATIC_CWES, *_CWE_CATEGORIES):
             if cwe in numbers:
+                # The shared CWE table wins over a declared name, for both
+                # engines.  A scanner's vocabulary is finer than a static
+                # tool's -- "error-path" where cppcheck says "memleak" -- and
+                # correlating on the declared name alone kept two findings
+                # that carry the SAME CWE on the same lines in two candidates,
+                # one "llm-only" and one "static-only".  That does not just
+                # lose a correlation: it inflates llm_only_confirmed, the one
+                # metric the whole LLM layer is judged by.
                 return category
+    if declared:
+        # No shared CWE to meet on: the scanner's own word stands, which is how
+        # state-machine, dead-code and the rest keep their names.
+        return declared
     for category, pattern in _LLM_KEYWORD_CATEGORIES:
         if re.search(pattern, value, re.I):
             return category
