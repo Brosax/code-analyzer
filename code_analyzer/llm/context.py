@@ -110,6 +110,14 @@ def _context(
 ) -> str:
     sections: list[tuple[str, list[str], bool]] = []
     omitted = 0
+    # The interface comes first and is never dropped for budget: it is two or
+    # three lines, and it is the only place the unit's *contract* appears.  A
+    # bound the caller must respect lives in the prototype, and a function the
+    # header does not declare has no callers outside this file at all -- both
+    # change what a finding means, and neither is visible in the body.
+    interface, remaining = _interface(unit, index, remaining)
+    if interface:
+        sections.append(("Interface", interface, False))
     if budget.types:
         entries, dropped, remaining = _fill(_definitions(unit, index, "types"), remaining)
         omitted += dropped
@@ -183,6 +191,47 @@ def _numbered(source: str, start: int) -> str:
     lines = source.splitlines() or [""]
     width = len(str(start + len(lines) - 1))
     return "\n".join(f"{start + offset:>{width}} | {line}" for offset, line in enumerate(lines))
+
+
+def _interface(
+    unit: Mapping[str, Any], index: Mapping[str, Any], remaining: int
+) -> tuple[list[str], int]:
+    """The unit's header contract and the headers its file pulls in."""
+    graph = index.get("include_graph")
+    if not isinstance(graph, Mapping):
+        return [], remaining
+    path = _text(unit, "path", "canonical_path", "file")
+    symbol = _text(unit, "symbol", "name")
+    files = index.get("files") if isinstance(index.get("files"), Mapping) else {}
+    lines: list[str] = []
+    header = (graph.get("pairs") or {}).get(path)
+    if header and symbol:
+        declaration = _prototype(files.get(header) or {}, symbol)
+        if declaration is not None:
+            lines.append(f"declared in {header}:{declaration['line']} as `{declaration['definition']}`")
+        else:
+            lines.append(
+                f"not declared in {header}: this symbol is not part of the file's published interface, "
+                f"so its callers are the ones shown below and nothing outside this file"
+            )
+    edges = (graph.get("edges") or {}).get(path) or []
+    external = (graph.get("unresolved") or {}).get(path) or []
+    if edges:
+        lines.append("includes from this tree: " + ", ".join(edges))
+    if external:
+        lines.append("includes from outside this tree: " + ", ".join(external))
+    if not lines:
+        return [], remaining
+    rendered = [f"- {line}" for line in lines]
+    cost = sum(len(line) + 1 for line in rendered)
+    return (rendered, remaining - cost) if cost <= max(remaining, 0) else ([], remaining)
+
+
+def _prototype(header: Mapping[str, Any], symbol: str) -> Mapping[str, Any] | None:
+    for item in header.get("globals", ()):
+        if item.get("kind") == "prototype" and item.get("name") == symbol:
+            return item
+    return None
 
 
 def _definitions(unit: Mapping[str, Any], index: Mapping[str, Any], section: str) -> list[str]:

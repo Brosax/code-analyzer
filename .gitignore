@@ -12,3 +12,4 @@ uv.lock
 datas/
 plugin_version/
 trusted-firmware-m/
+.claude/worktrees/

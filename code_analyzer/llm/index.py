@@ -238,6 +238,7 @@ def build_index(
         "globals": _definition_table(files, "globals"),
     }
     index["call_graph"] = _call_graph(files, index["symbols"])
+    index["include_graph"] = _include_graph(files)
     index["totals"] = {
         "files": len(files),
         "functions": sum(len(item.get("functions", ())) for item in files.values()),
@@ -809,6 +810,118 @@ def _call_graph(files: dict[str, Any], symbols: dict[str, Any]) -> dict[str, Any
         "callees": callees,
         "callers": {name: sorted(set(keys)) for name, keys in sorted(callers.items())},
     }
+
+
+# --- pass F: include graph and header pairing --------------------------------
+
+
+def _include_graph(files: dict[str, Any]) -> dict[str, Any]:
+    """Which files include which, and which header states a unit's contract.
+
+    A unit's caller-visible contract lives in its header, not beside it: the
+    prototype says what callers may pass, and its *absence* says the function
+    is not part of the interface at all.  Neither fact is reachable from the
+    implementation file alone, so the pairing has to be an index-level fact.
+
+    Resolution is textual and tree-local on purpose.  There is no preprocessor
+    here and no ``-I`` search path, so a target that names no file in the
+    scanned tree is recorded as unresolved (a system or vendor header) rather
+    than guessed at.
+    """
+    by_path = {path: path for path in files}
+    by_suffix: dict[str, list[str]] = {}
+    for path in sorted(files):
+        parts = path.split("/")
+        for depth in range(len(parts)):
+            by_suffix.setdefault("/".join(parts[depth:]), []).append(path)
+
+    edges: dict[str, list[str]] = {}
+    unresolved: dict[str, list[str]] = {}
+    included_by: dict[str, set[str]] = {}
+    for path in sorted(files):
+        directory = path.rsplit("/", 1)[0] if "/" in path else ""
+        resolved: set[str] = set()
+        missing: set[str] = set()
+        for item in files[path].get("includes", ()):
+            target = str(item.get("target") or "").strip()
+            if not target:
+                continue
+            found = _resolve_include(target, directory, by_path, by_suffix)
+            if found is None or found == path:
+                missing.add(target)
+                continue
+            resolved.add(found)
+            included_by.setdefault(found, set()).add(path)
+        if resolved:
+            edges[path] = sorted(resolved)
+        if missing:
+            unresolved[path] = sorted(missing)
+
+    pairs: dict[str, str] = {}
+    for path in sorted(files):
+        if files[path].get("is_header"):
+            continue
+        header = _paired_header(path, files, edges.get(path, ()), by_suffix)
+        if header is not None:
+            pairs[path] = header
+    return {
+        "edges": edges,
+        "unresolved": unresolved,
+        "included_by": {path: sorted(sources) for path, sources in sorted(included_by.items())},
+        "pairs": pairs,
+    }
+
+
+def _resolve_include(
+    target: str, directory: str, by_path: dict[str, str], by_suffix: dict[str, list[str]]
+) -> str | None:
+    """Resolve one include target to a file in the tree, or ``None``."""
+    normalized = _normalize_include(f"{directory}/{target}" if directory else target)
+    if normalized in by_path:
+        return normalized
+    plain = _normalize_include(target)
+    if plain in by_path:
+        return plain
+    # A tail match is the last resort and only when it is unambiguous: two
+    # files ending "config.h" must not silently become one edge.
+    matches = by_suffix.get(plain, ())
+    return matches[0] if len(matches) == 1 else None
+
+
+def _normalize_include(target: str) -> str:
+    parts: list[str] = []
+    for part in target.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        if part == ".." and parts:
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _paired_header(
+    path: str, files: dict[str, Any], includes: Sequence[str], by_suffix: dict[str, list[str]]
+) -> str | None:
+    """The header that declares this implementation file's interface.
+
+    An include edge is the evidence; the ``foo.c`` / ``foo.h`` name match is
+    the tie-breaker among several included headers, and on its own is enough
+    only when the file includes no header from the tree at all.
+    """
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    headers = [item for item in includes if files.get(item, {}).get("is_header")]
+    named = [item for item in headers if item.rsplit("/", 1)[-1].rsplit(".", 1)[0] == stem]
+    if named:
+        return named[0]
+    if headers:
+        return None
+    directory = path.rsplit("/", 1)[0] if "/" in path else ""
+    for suffix in (".h", ".hpp", ".hh"):
+        candidate = _normalize_include(f"{directory}/{stem}{suffix}" if directory else f"{stem}{suffix}")
+        if files.get(candidate, {}).get("is_header"):
+            return candidate
+    return None
 
 
 # --- shared helpers ----------------------------------------------------------
