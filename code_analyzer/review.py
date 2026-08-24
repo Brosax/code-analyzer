@@ -16,7 +16,7 @@ from .grading import (
     grading_reference,
     reference_review_level,
 )
-from .tools import PRODUCER_ORDER, TOOL_NAMES
+from .tools import PRODUCER_ORDER, TOOL_NAMES, adapter, adapters
 
 REVIEW_SCHEMA_VERSION = 3
 SEVERITY_MAPPING_VERSION = 2
@@ -43,16 +43,11 @@ def build_review(
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    parsers = {
-        "cppcheck": _parse_cppcheck_units,
-        "flawfinder": _parse_flawfinder_units,
-        "splint": _parse_splint_units,
-    }
     for tool in TOOL_ORDER:
         _check_cancelled(cancelled)
         execution = dict(manifest.get("tools", {}).get(tool, {}))
         execution["_allow_undeclared_valid"] = manifest.get("manifest_schema_version") is None
-        tool_findings, tool_diagnostics = parsers[tool](source, run_dir, execution)
+        tool_findings, tool_diagnostics = adapter(tool).parse(source, run_dir, execution)
         findings.extend(tool_findings)
         diagnostics.extend(tool_diagnostics)
     # Scanners are parsed alongside the native tools but never inside the
@@ -1034,36 +1029,11 @@ def _normalize_severity(tool: str, value: str, scale: str | None = None, *, engi
         # Without a real normalized severity every LLM finding ranks 0, sorts
         # last, and is the first thing the dashboard embed limit discards.
         return raw if raw in SEVERITY_RANK else "unknown"
-    if tool == "cppcheck":
-        return {
-            "error": "high", "warning": "medium", "style": "low", "performance": "low",
-            "portability": "low", "information": "info", "debug": "info",
-        }.get(raw, "unknown")
-    if tool == "flawfinder":
-        try:
-            numeric = float(raw)
-        except ValueError:
-            return {"error": "high", "warning": "medium", "note": "info", "none": "unknown"}.get(raw, "unknown")
-        if scale == "security-severity":
-            # SARIF security-severity is a CVSS-like 0-10 scale.
-            if numeric >= 9:
-                return "critical"
-            if numeric >= 7:
-                return "high"
-            if numeric >= 4:
-                return "medium"
-        else:
-            # Flawfinder's native risk level is a 0-5 scale.
-            if numeric >= 5:
-                return "critical"
-            if numeric >= 4:
-                return "high"
-            if numeric >= 3:
-                return "medium"
-        if numeric > 0:
-            return "low"
-        return "info" if numeric == 0 else "unknown"
-    return "unknown"
+    # A total function: a manifest from a future version, or one hand-edited to
+    # name a tool this build does not have, must normalise to "unknown" rather
+    # than abort a review of the findings that *are* readable.
+    declared = adapters().get(tool)
+    return declared.severity(raw, scale) if declared is not None else "unknown"
 
 
 def _sarif_raw_severity(result: dict[str, Any], rule: dict[str, Any]) -> tuple[str, str | None]:

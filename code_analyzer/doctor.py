@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import locale
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -13,12 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .tools import TOOL_NAMES
-
-REQUIRED = {
-    "cppcheck": ["--xml-version", "--output-file", "--project", "--file-list", "--check-level", "--check-library", "--checkers-report", "--cppcheck-build-dir"],
-    "flawfinder": ["--sarif", "--minlevel", "--columns", "--neverignore"],
-}
+from .tools import TOOL_NAMES, adapter
 
 
 def probe_all(config: dict[str, Any]) -> dict[str, Any]:
@@ -36,18 +30,15 @@ def probe_tool(name: str, executable: str) -> dict[str, Any]:
     resolved = shutil.which(executable)
     if not resolved:
         return {"status": "missing", "executable": executable, "version": None, "missing_capabilities": [], "guidance": _guidance(name)}
+    declared = adapter(name)
     try:
-        if name == "splint":
-            version_text = _capture([resolved, "-help", "version"])
-            match = re.search(r"^Splint\s+([0-9][^\s]*)", version_text, re.MULTILINE)
-            topics = {topic: _capture([resolved, "-help", topic]) for topic in ("nof", "csv", "tmpdir", "modes", "ITS4")}
+        version = declared.reported_version(_capture(declared.version_argv(resolved)))
+        if declared.help_topics:
+            topics = {topic: _capture([resolved, "-help", topic]) for topic in declared.help_topics}
             missing = [topic for topic, text in topics.items() if not text.strip()]
-            version = match.group(1) if match else None
         else:
-            version_text = _capture([resolved, "--version"])
             help_text = _capture([resolved, "--help"])
-            missing = [flag for flag in REQUIRED[name] if flag not in help_text]
-            version = version_text.strip().splitlines()[0] if version_text.strip() else None
+            missing = [flag for flag in declared.required_capabilities if flag not in help_text]
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"status": "incompatible", "executable": resolved, "version": None, "missing_capabilities": [str(exc)], "guidance": _guidance(name)}
     canary_ok, canary_reason = verify_canary(name, resolved)
@@ -68,35 +59,21 @@ def probe_tool(name: str, executable: str) -> dict[str, Any]:
 
 
 def verify_canary(name: str, executable: str) -> tuple[bool, str | None]:
+    """Run the tool over a minimal source file and check its native report.
+
+    Help text is advisory -- distro builds and wrappers implement options they
+    do not list -- so this is the capability check that decides.  Each adapter
+    owns the argv and the report check for its own tool; this function owns
+    the isolation and the failure vocabulary they share.
+    """
     try:
         with tempfile.TemporaryDirectory(prefix=f"code-analyzer-{name}-canary-") as temporary:
             root = Path(temporary)
-            source = root / "canary.c"
-            source.write_text("int main(void) { int value; return value; }\n", encoding="utf-8")
-            if name == "cppcheck":
-                report, checkers, files, build = root / "report.xml", root / "checkers.txt", root / "files.txt", root / "build"
-                files.write_text("canary.c\n", encoding="utf-8")
-                build.mkdir()
-                argv = [
-                    executable, "--xml", "--xml-version=2", f"--output-file={report}",
-                    f"--checkers-report={checkers}", f"--cppcheck-build-dir={build}",
-                    "--check-level=exhaustive", "--check-library", f"--file-list={files}", "--quiet",
-                ]
-                completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
-                valid = completed.returncode in {0, 1} and report.is_file() and ET.parse(report).getroot().tag == "results"
-            elif name == "flawfinder":
-                argv = [executable, "--sarif", "--minlevel=0", "--columns", "--neverignore", "--omittime", "--quiet", "--", "canary.c"]
-                completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
-                data = json.loads(completed.stdout.decode("utf-8", errors="strict"))
-                valid = completed.returncode in {0, 1} and data.get("version") == "2.1.0"
-            else:
-                report, tmp = root / "report.csv", root / "tmp"
-                tmp.mkdir()
-                argv = [executable, "+nof", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report), "./canary.c"]
-                completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
-                output = (completed.stdout + completed.stderr).decode("utf-8", errors="replace").lower()
-                valid = completed.returncode in {0, 1} and report.is_file() and report.stat().st_size > 0 and "finished checking" in output
-            return (True, None) if valid else (False, f"minimal {name} canary did not produce a valid native report")
+            (root / "canary.c").write_text("int main(void) { int value; return value; }\n", encoding="utf-8")
+            valid, reason = adapter(name).canary(executable, root)
+            if valid:
+                return True, None
+            return False, reason or f"minimal {name} canary did not produce a valid native report"
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError, ET.ParseError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
 
@@ -136,5 +113,4 @@ def _platform_probe() -> dict[str, Any]:
 
 
 def _guidance(name: str) -> str:
-    packages = {"cppcheck": "cppcheck", "flawfinder": "flawfinder", "splint": "splint"}
-    return f"Ubuntu 24.04: sudo apt update && sudo apt install {packages[name]} (not run automatically)"
+    return f"Ubuntu 24.04: sudo apt update && sudo apt install {adapter(name).apt_package} (not run automatically)"

@@ -34,7 +34,7 @@ from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_revi
 from .sanitize import ExportError, export_shareable
 from .sarif import build_sarif, write_sarif
 from .status import overall
-from .tools import TOOL_NAMES, cppcheck, flawfinder, splint
+from .tools import TOOL_NAMES, CompileDatabase, RunContext, adapter
 from .tools.common import artifact_index
 
 
@@ -234,25 +234,16 @@ def _analyze(
             event("unit", status, message, tool=tool_name, unit=unit, value=overall_value)
         def streamed_output(unit: str, stream: str, message: str, tool_name: str = name) -> None:
             event("output", "running", message, tool=tool_name, unit=unit, stream=stream)
+        context = RunContext(
+            source=source, run_dir=run_dir, inventory=inventory,
+            compile_db=CompileDatabase(
+                entries=filtered_db, covered=frozenset(db_covered), present=compile_path is not None,
+            ),
+            config=config, progress=unit_progress, cancelled=cancellation.is_cancelled,
+            unit_event=structured_unit, output_event=streamed_output if live_events else None,
+        )
         try:
-            if name == "cppcheck":
-                result = cppcheck.run(
-                    resolved, source, run_dir, inventory, filtered_db, db_covered, config, unit_progress,
-                    cancelled=cancellation.is_cancelled, unit_event=structured_unit,
-                    output_event=streamed_output if live_events else None,
-                )
-            elif name == "flawfinder":
-                result = flawfinder.run(
-                    resolved, source, run_dir, inventory, config, unit_progress,
-                    cancelled=cancellation.is_cancelled, unit_event=structured_unit,
-                    output_event=streamed_output if live_events else None,
-                )
-            else:
-                result = splint.run(
-                    resolved, source, run_dir, inventory, filtered_db, config, unit_progress,
-                    compile_db_present=compile_path is not None, cancelled=cancellation.is_cancelled,
-                    unit_event=structured_unit, output_event=streamed_output if live_events else None,
-                )
+            result = adapter(name).run(resolved, context)
         except Exception as exc:
             result = _preflight_state("failed", inventory, name, f"adapter failure: {exc}")
         result["executable"] = resolved
@@ -548,7 +539,7 @@ def _update_latest(source_root: Path, manifest: dict[str, Any]) -> None:
 
 
 def _version(name: str, executable: str) -> str | None:
-    argv = [executable, "-help", "version"] if name == "splint" else [executable, "--version"]
+    argv = adapter(name).version_argv(executable)
     try:
         completed = subprocess.run(argv, capture_output=True, timeout=10, shell=False)
         text = (completed.stdout + completed.stderr).decode("utf-8", errors="replace").strip()
@@ -564,9 +555,10 @@ def _incompatibility(name: str, executable: str) -> str | None:
     and test doubles usable while still rejecting a real, recognizable help
     page that lacks capabilities required by the v1 argv contract.
     """
-    if name == "splint":
+    declared = adapter(name)
+    if declared.help_topics:
         missing = []
-        for topic in ("nof", "csv", "tmpdir", "modes", "ITS4"):
+        for topic in declared.help_topics:
             result = _help([executable, "-help", topic])
             if result is not None and not result.strip():
                 missing.append(topic)
@@ -574,10 +566,7 @@ def _incompatibility(name: str, executable: str) -> str | None:
             verified, reason = verify_canary(name, executable)
             return None if verified else "missing help topics: " + ", ".join(missing) + (f"; canary: {reason}" if reason else "")
         return None
-    required = {
-        "cppcheck": ("--xml-version", "--output-file", "--project", "--file-list", "--check-level", "--check-library", "--checkers-report", "--cppcheck-build-dir"),
-        "flawfinder": ("--sarif", "--minlevel", "--columns", "--neverignore"),
-    }[name]
+    required = declared.required_capabilities
     text = _help([executable, "--help"])
     if text is None or text.lstrip().startswith(("{", "<")):
         return None

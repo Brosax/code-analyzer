@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Callable
 
 from ..process import run_process
 from ..status import aggregate_units, counts
+from .adapter import Adapter, RunContext
 from .common import attach_artifacts, unit_outcome
 
 
@@ -147,3 +149,59 @@ def _result(units: list[dict[str, Any]], attempted: int, analyzed: int, total: i
         },
         "unit_counts": counts(units),
     }
+
+
+# --- the adapter ------------------------------------------------------------
+
+
+def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
+    return run(
+        executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries,
+        ctx.compile_db.covered_set, ctx.config, ctx.progress,
+        cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
+    )
+
+
+def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Imported here, not at module scope: parsing a native report produces
+    # review rows, so it lives in the review layer, and that layer imports this
+    # package.  Late binding keeps the dependency one-way.
+    from ..review import _parse_cppcheck_units
+
+    return _parse_cppcheck_units(source, run_dir, execution)
+
+
+def _severity(raw: str, _scale: str | None = None) -> str:
+    return {
+        "error": "high", "warning": "medium", "style": "low", "performance": "low",
+        "portability": "low", "information": "info", "debug": "info",
+    }.get(str(raw or "").strip().lower(), "unknown")
+
+
+def _canary(executable: str, root: Path) -> tuple[bool, str | None]:
+    report, checkers, files, build = root / "report.xml", root / "checkers.txt", root / "files.txt", root / "build"
+    files.write_text("canary.c\n", encoding="utf-8")
+    build.mkdir()
+    argv = [
+        executable, "--xml", "--xml-version=2", f"--output-file={report}",
+        f"--checkers-report={checkers}", f"--cppcheck-build-dir={build}",
+        "--check-level=exhaustive", "--check-library", f"--file-list={files}", "--quiet",
+    ]
+    completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
+    valid = completed.returncode in {0, 1} and report.is_file() and ET.parse(report).getroot().tag == "results"
+    return (True, None) if valid else (False, None)
+
+
+ADAPTER = Adapter(
+    name="cppcheck",
+    run=_run,
+    parse=_parse,
+    severity=_severity,
+    version_argv=lambda executable: [executable, "--version"],
+    required_capabilities=(
+        "--xml-version", "--output-file", "--project", "--file-list",
+        "--check-level", "--check-library", "--checkers-report", "--cppcheck-build-dir",
+    ),
+    canary=_canary,
+    apt_package="cppcheck",
+)

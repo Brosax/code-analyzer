@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from ..process import run_process
 from ..status import aggregate_units, counts
+from .adapter import Adapter, RunContext
 from .common import attach_artifacts, unit_outcome, utf8_validation
 
 
@@ -153,3 +155,66 @@ def _validate(path: Path) -> tuple[bool, str | None]:
     if not isinstance(data.get("runs"), list) or not all(isinstance(run, dict) for run in data["runs"]):
         return False, "invalid Flawfinder SARIF: runs must be an array of objects"
     return True, None
+
+
+# --- the adapter ------------------------------------------------------------
+
+
+def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
+    return run(
+        executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.config, ctx.progress,
+        cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
+    )
+
+
+def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from ..review import _parse_flawfinder_units  # late-bound; see cppcheck._parse
+
+    return _parse_flawfinder_units(source, run_dir, execution)
+
+
+def _severity(raw: str, scale: str | None = None) -> str:
+    value = str(raw or "").strip().lower()
+    try:
+        numeric = float(value)
+    except ValueError:
+        return {"error": "high", "warning": "medium", "note": "info", "none": "unknown"}.get(value, "unknown")
+    if scale == "security-severity":
+        # SARIF security-severity is a CVSS-like 0-10 scale.
+        if numeric >= 9:
+            return "critical"
+        if numeric >= 7:
+            return "high"
+        if numeric >= 4:
+            return "medium"
+    else:
+        # Flawfinder's native risk level is a 0-5 scale.
+        if numeric >= 5:
+            return "critical"
+        if numeric >= 4:
+            return "high"
+        if numeric >= 3:
+            return "medium"
+    if numeric > 0:
+        return "low"
+    return "info" if numeric == 0 else "unknown"
+
+
+def _canary(executable: str, root: Path) -> tuple[bool, str | None]:
+    argv = [executable, "--sarif", "--minlevel=0", "--columns", "--neverignore", "--omittime", "--quiet", "--", "canary.c"]
+    completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
+    data = json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    valid = completed.returncode in {0, 1} and data.get("version") == "2.1.0"
+    return (True, None) if valid else (False, None)
+
+
+ADAPTER = Adapter(
+    name="flawfinder",
+    run=_run,
+    parse=_parse,
+    severity=_severity,
+    version_argv=lambda executable: [executable, "--version"],
+    required_capabilities=("--sarif", "--minlevel", "--columns", "--neverignore"),
+    canary=_canary,
+    apt_package="flawfinder",
+)

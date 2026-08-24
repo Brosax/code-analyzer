@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +13,7 @@ from typing import Any, Callable
 from ..compile_db import splint_flags
 from ..process import run_process
 from ..status import aggregate_units, counts
+from .adapter import Adapter, RunContext
 from .common import attach_artifacts, unit_outcome
 
 Plan = tuple[int, str, str, list[str], str]
@@ -265,3 +268,58 @@ def _combined_text(*paths: Path) -> str:
         except OSError:
             pass
     return "\n".join(result)
+
+
+# --- the adapter ------------------------------------------------------------
+
+
+def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
+    return run(
+        executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries, ctx.config, ctx.progress,
+        compile_db_present=ctx.compile_db.present, cancelled=ctx.cancelled,
+        unit_event=ctx.unit_event, output_event=ctx.output_event,
+    )
+
+
+def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from ..review import _parse_splint_units  # late-bound; see cppcheck._parse
+
+    return _parse_splint_units(source, run_dir, execution)
+
+
+def _severity(_raw: str, _scale: str | None = None) -> str:
+    # splint's own levels are not a severity ladder, and the gate treats its
+    # findings as "unknown" on purpose; inventing a mapping here would give
+    # them a rank they have not earned.
+    return "unknown"
+
+
+def _canary(executable: str, root: Path) -> tuple[bool, str | None]:
+    report, tmp = root / "report.csv", root / "tmp"
+    tmp.mkdir()
+    argv = [executable, "+nof", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report), "./canary.c"]
+    completed = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, shell=False)
+    output = (completed.stdout + completed.stderr).decode("utf-8", errors="replace").lower()
+    valid = (
+        completed.returncode in {0, 1} and report.is_file()
+        and report.stat().st_size > 0 and "finished checking" in output
+    )
+    return (True, None) if valid else (False, None)
+
+
+def _reported_version(text: str) -> str | None:
+    match = re.search(r"^Splint\s+([0-9][^\s]*)", text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+ADAPTER = Adapter(
+    name="splint",
+    run=_run,
+    parse=_parse,
+    severity=_severity,
+    version_argv=lambda executable: [executable, "-help", "version"],
+    reported_version=_reported_version,
+    help_topics=("nof", "csv", "tmpdir", "modes", "ITS4"),
+    canary=_canary,
+    apt_package="splint",
+)
