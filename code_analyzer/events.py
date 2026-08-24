@@ -84,12 +84,22 @@ class JsonlEventSink:
 
 
 def fan_out(*sinks: EventSink | None) -> EventSink:
-    """Deliver each event to every given sink, in order; None entries are skipped."""
+    """Deliver each event to every given sink, in order; None entries are skipped.
+
+    One event reaches every sink before the next event reaches any of them.
+    The static adapters and the LLM phase emit from two threads, and without
+    this lock the JSONL file and the caller's own sink could disagree about the
+    order of two events -- the log says a tool finished first, the TUI says the
+    scanner did.  ``JsonlEventSink`` has a lock of its own for the line itself;
+    this one is about the sequence the sinks agree on.
+    """
     targets = [sink for sink in sinks if sink is not None]
+    lock = threading.Lock()
 
     def deliver(event: AnalysisEvent) -> None:
-        for sink in targets:
-            sink(event)
+        with lock:
+            for sink in targets:
+                sink(event)
 
     return deliver
 
