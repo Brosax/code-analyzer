@@ -1,7 +1,7 @@
 ---
 name: llm-logic
 description: Reviews one C/C++ scan unit for four closed classes of control-flow logic defect only — broken state machines, inverted conditions, dead code and unreachable branches — and returns them as a single JSON object.
-skill_version: 1.0.0
+skill_version: 1.1.0
 engine: llm
 allowed-tools:
   - fs
@@ -34,6 +34,27 @@ A finding in any of the four categories must name the *observable* consequence
 in the description — the state that is never left, the input that is accepted
 when it should be rejected, the assignment that never reaches a read. A
 category name alone is not a finding.
+
+### What these four tokens do not mean
+
+The tokens are narrow on purpose, and a defect that is merely *adjacent* to one
+of them belongs to another scanner. In particular:
+
+- A **missing check** is not `dead-code`. Code that runs and does the wrong
+  thing is not code that cannot take effect. An unchecked `malloc` result, an
+  unvalidated length, an ignored error code: all are real defects, and none of
+  them is yours. `dead-code` requires that the statement's effect can never be
+  observed on any path.
+- A **check that exists but is written backwards** is `inverted-condition`; a
+  check that is simply absent is not.
+- A branch you merely *think* is unlikely is not `unreachable-branch`. The
+  types, constants or earlier tests in the code you were shown must make the
+  other arm impossible, and you must say which ones do.
+- A `switch` that lacks a `default` is not by itself a `state-machine` defect.
+  Name the state that becomes unreachable or is never left.
+
+If your description would read more naturally as "this should have been
+checked", stop: you are describing another scanner's finding.
 
 ## Out of scope — do not report
 

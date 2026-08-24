@@ -13,7 +13,9 @@ from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
 from .events import JsonlEventSink, events_file
+from .llm.doctor import probe_llm
 from .llm.profiles import PROFILE_NAMES, third_party_warning
+from .llm.resume import run_resume
 from .recovery import recover_report
 from .runner import analyze
 from .serve import DEFAULT_PORT, serve
@@ -31,6 +33,15 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="probe analyzer and WSL capabilities")
     doctor.add_argument("--config", type=Path)
     doctor.add_argument("--json", action="store_true", dest="as_json")
+    llm_doctor = commands.add_parser("llm-doctor", help="probe the LLM provider and estimate a full scan")
+    llm_doctor.add_argument("source", type=Path, nargs="?", help="source tree to estimate a full scan of")
+    llm_doctor.add_argument("--config", type=Path)
+    llm_doctor.add_argument("--json", action="store_true", dest="as_json")
+    _add_llm_arguments(llm_doctor)
+    llm_resume = commands.add_parser("llm-resume", help="scan the units a run left unscheduled or interrupted")
+    llm_resume.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    llm_resume.add_argument("--config", type=Path)
+    _add_llm_arguments(llm_resume)
     compile_db = commands.add_parser("compile-db", help="discover or prepare a JSON compilation database")
     compile_db.add_argument("source", type=Path)
     compile_db.add_argument("--json", action="store_true", dest="as_json", help="report discovery without executing anything")
@@ -152,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _print_doctor(result)
             return 0 if result["ok"] else 20
+        if args.command == "llm-doctor":
+            source = (args.source or Path.cwd()).expanduser().resolve()
+            config = load_config(source, args.config, {"llm": _llm_overrides(args)} if _llm_overrides(args) else None)
+            result = probe_llm(config, source if args.source is not None else None)
+            if args.as_json:
+                print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                _print_llm_doctor(result)
+            return 0 if result["ok"] else 20
         if args.command == "compile-db":
             return run_compile_db(args)
         if args.command == "rebuild-dashboard":
@@ -160,6 +180,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "recover-report":
             print(recover_report(args.report_directory))
             return 0
+        if args.command == "llm-resume":
+            report_directory = args.report_directory.expanduser().resolve()
+            config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))
+            _warn_third_party(config)
+            block = run_resume(report_directory, config,
+                               progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+            print(report_directory)
+            return int(block["exit_code"])
         if args.command == "assess":
             report_directory = args.report_directory.expanduser().resolve()
             config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))
@@ -224,7 +252,7 @@ def _assess_overrides(args: argparse.Namespace) -> dict[str, Any]:
     llm = _llm_overrides(args)
     if llm:
         value["llm"] = llm
-    if args.max_candidates is not None:
+    if getattr(args, "max_candidates", None) is not None:
         value["audit"] = {"validation_max_candidates": args.max_candidates}
     return value
 
@@ -378,6 +406,51 @@ def _print_doctor(result: dict[str, Any]) -> None:
             print("  missing capabilities: " + ", ".join(item["missing_capabilities"]))
         if item.get("guidance"):
             print("  " + item["guidance"])
+
+
+def _print_llm_doctor(result: dict[str, Any]) -> None:
+    print(f"endpoint: {result['endpoint']}  (profile: {result['profile']})")
+    print(f"model: {result['model']}")
+    if result["third_party_warning"]:
+        print(f"WARNING: {result['third_party_warning']}")
+    runtime = result["runtime"]
+    print(f"runtime: {'available' if runtime['available'] else 'MISSING'}  sdk {runtime['sdk_version'] or 'unknown'}")
+    credential = result["credential"]
+    print(f"credential: {'ok' if credential['ok'] else 'unusable'}"
+          + (f" — {credential.get('source')}" if credential["ok"] else f" — {credential['reason']}"))
+    models = result["models"]
+    if not models["reachable"]:
+        print(f"models: unreachable — {models['reason']}")
+    else:
+        print(f"models: {len(models['available'])} served; configured model {'present' if models['model_present'] else 'ABSENT'}")
+        if not models["model_present"]:
+            print(f"  {models['reason']}")
+    window = result["context_window"]
+    print(f"context window: configured {window['configured']}, served {window['served'] if window['served'] is not None else 'unreported'}")
+    if window["reason"]:
+        print(f"  {window['reason']}")
+    benchmark = result["benchmark"]
+    if not benchmark["ok"]:
+        print(f"benchmark: failed — {benchmark['reason']}")
+    else:
+        rate = f"{benchmark['tokens_per_second']} tok/s" if benchmark["tokens_per_second"] else "rate unreported"
+        print(f"benchmark: {benchmark['latency_seconds']}s for one request, {rate}")
+        if benchmark.get("served_other_model"):
+            print(f"  WARNING: the endpoint answered as {benchmark['served_model']!r}, not {result['model']!r}")
+    estimate = result["estimate"]
+    if estimate["known"]:
+        print(f"estimated full scan: {_duration(estimate['wall_clock_seconds'])}")
+        print(f"  {estimate['basis']}")
+    else:
+        print(f"estimated full scan: unknown — {estimate['reason']}")
+
+
+def _duration(seconds: float) -> str:
+    minutes, remainder = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
 
 
 if __name__ == "__main__":

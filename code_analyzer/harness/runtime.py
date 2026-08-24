@@ -12,6 +12,7 @@ import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, is_dataclass
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +30,7 @@ from .cordis import (
 SDK_MODULE = "deepseek_harness"
 # The initialize call names the cordis route the scan declared.
 DEFAULT_PROVIDER = PROVIDER_ID
+SDK_DISTRIBUTION = "deepseek-harness-sdk"
 INSTALL_HINT = (
     "install the agent runtime with `pip install deepseek-harness-sdk`, or set [llm] enabled = false "
     "to scan with the native analyzers only"
@@ -146,7 +148,19 @@ def harness_available() -> bool:
 
 
 def sdk_version() -> str:
-    return str(getattr(_sdk(), "__version__", "") or "unknown")
+    """What the manifest records as the runtime that produced the evidence.
+
+    The SDK module exposes no ``__version__``, so the installed distribution's
+    metadata is the fallback -- otherwise every run's evidence would say
+    "unknown" while the version was sitting one import away.
+    """
+    declared = str(getattr(_sdk(), "__version__", "") or "")
+    if declared:
+        return declared
+    try:
+        return metadata.version(SDK_DISTRIBUTION)
+    except metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def api_key(settings: dict[str, Any]) -> str | None:
