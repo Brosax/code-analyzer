@@ -195,7 +195,10 @@ def test_verdicts_land_on_their_candidates_and_metrics_recompute(
 
     assert block["status"] == "completed" and block["exit_code"] == 0
     assert block["validated"] == 2 and block["unscheduled"] == 0 and block["failed"] == 0
-    assert block["model"] == config["llm"]["model"] and block["skill_version"] == "1.0.0"
+    # The contract is that the block records the skill that ran, not that the
+    # skill is at any particular version.
+    assert block["model"] == config["llm"]["model"]
+    assert block["skill_version"] == load_skill(VALIDATOR).skill_version
     assert block["path"] == "audit/assessment.json"
     assessment = load_assessment(run_dir)
     assert assessment is not None
@@ -205,7 +208,8 @@ def test_verdicts_land_on_their_candidates_and_metrics_recompute(
     assert verdict["label"] == "CONFIRMED" and verdict["confidence"] == 0.9
     assert verdict["decisive_line"] == {"file": "parser.c", "line": 6}
     assert verdict["validator_saw_static"] is True
-    assert verdict["model"] == config["llm"]["model"] and verdict["skill_version"] == "1.0.0"
+    assert verdict["model"] == config["llm"]["model"]
+    assert verdict["skill_version"] == load_skill(VALIDATOR).skill_version
     assert verdict["rationale_artifact"] == f"llm/sessions/{VALIDATOR}/{llm_only}/response.json"
     assert (run_dir / verdict["rationale_artifact"]).is_file()
     assert verdict["remediation"].startswith("Check len")
