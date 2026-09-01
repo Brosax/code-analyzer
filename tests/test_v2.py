@@ -62,6 +62,91 @@ def test_splint_csv_validation_rejects_empty_wrong_delimiter_and_truncation(tmp_
     assert splint._validate_csv(report)[0]
 
 
+# Splint 3.1.2's own header and its own stdout for the same two warnings.  The
+# earlier fixtures wrote a hand-made ``file,line,message`` CSV, which is why the
+# parser read the ordinal column as the message for years without a red test.
+_SPLINT_CSV = (
+    "Warning, Flag Code, Flag Name, Priority, File, Line, Column, Warning Text, Additional Text\n"
+    '1,63,usereleased,1,bad.c,9,8,"Dead storage p passed as out parameter to free: p",'
+    '"Memory is used after it has been released."\n'
+    '2,201,boundswrite,1,bad.c,5,3,"Possible out-of-bounds store: strcpy(buf, in)\n'
+    'Unable to resolve constraint:\n'
+    'requires maxRead(in @ bad.c:5:15) <= 7","A memory write may write beyond the buffer."\n'
+)
+_SPLINT_STDOUT = (
+    "bad.c: (in function copy)\n"
+    "bad.c:9:8: Dead storage p passed as out parameter to free: p\n"
+    "  Memory is used after it has been released. (Use -usereleased to inhibit warning)\n"
+    "bad.c:5:3: Possible out-of-bounds store: strcpy(buf, in)\n"
+    "    Unable to resolve constraint:\n"
+    "    requires maxRead(in @ bad.c:5:15) <= 7\n"
+)
+
+
+def _splint_only_manifest() -> dict[str, object]:
+    return {
+        "run_id": "run", "started_at": "now", "finished_at": "later", "status": "complete",
+        "source_options": {"include": ["**/*"], "exclude": []},
+        "tools": {"splint": {
+            "requested": True, "status": "completed",
+            "units": [{"id": "one"}], "valid_reports": 1,
+        }},
+    }
+
+
+def _splint_review(tmp_path: Path, *, csv_text: str, stdout_text: str) -> dict:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "bad.c").write_text("int bad;\n", encoding="utf-8")
+    unit = tmp_path / "run" / "tools" / "splint" / "one"
+    unit.mkdir(parents=True)
+    (unit / "report.csv").write_text(csv_text, encoding="utf-8")
+    (unit / "stdout.raw").write_text(stdout_text, encoding="utf-8")
+    (unit / "stderr.raw").write_text("Finished checking --- 2 code warnings\n", encoding="utf-8")
+    return build_review(source, tmp_path / "run", _splint_only_manifest(), [{"path": "bad.c"}])
+
+
+def _splint_findings(summary: dict) -> list[dict]:
+    return [item for item in summary["findings"] if item["tool"] == "splint"]
+
+
+def test_splint_csv_findings_carry_the_warning_text_and_the_flag_name(tmp_path: Path) -> None:
+    findings = _splint_findings(_splint_review(tmp_path, csv_text=_SPLINT_CSV, stdout_text=_SPLINT_STDOUT))
+
+    # Two warnings, reported once: the CSV and stdout describe the same two.
+    assert len(findings) == 2, [item["message"] for item in findings]
+    by_rule = {item["rule_id"]: item for item in findings}
+    assert set(by_rule) == {"usereleased", "boundswrite"}
+    released = by_rule["usereleased"]
+    assert released["message"] == (
+        "Dead storage p passed as out parameter to free: p "
+        "Memory is used after it has been released."
+    )
+    assert (released["file"], released["line"], released["column"]) == ("bad.c", "9", "8")
+    assert released["source_artifact"] == "tools/splint/one/report.csv"
+    # A constraint warning wraps over several CSV lines and must still read as
+    # one message, the way the text parser renders it.
+    assert "\n" not in by_rule["boundswrite"]["message"]
+    assert by_rule["boundswrite"]["message"].startswith("Possible out-of-bounds store")
+
+
+def test_splint_falls_back_to_the_logs_when_the_csv_holds_no_warning(tmp_path: Path) -> None:
+    header = _SPLINT_CSV.splitlines()[0] + "\n"
+
+    summary = _splint_review(
+        tmp_path, csv_text=header,
+        stdout_text=_SPLINT_STDOUT + "bad.c:1: Cannot find include file <missing.h>\n",
+    )
+
+    findings = _splint_findings(summary)
+    assert len(findings) == 2, [item["message"] for item in findings]
+    # The warnings are on stdout; attributing them to stderr.raw -- which holds
+    # only the summary table -- points an auditor at a file without them.
+    assert {item["source_artifact"] for item in findings} == {"tools/splint/one/stdout.raw"}
+    include = [item for item in summary["diagnostics"] if item["tool"] == "splint"]
+    assert [item["source_artifact"] for item in include] == ["tools/splint/one/stdout.raw"]
+
+
 def test_splint_auto_build_scope_records_inventory_files_not_in_database(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

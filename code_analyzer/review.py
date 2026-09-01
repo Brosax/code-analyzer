@@ -626,6 +626,7 @@ def _parse_splint_units(source: Path, run_dir: Path, tool: dict[str, Any]) -> tu
     findings: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     for unit in tool.get("units", []):
+        csv_findings: list[dict[str, Any]] = []
         directory = run_dir / "tools" / "splint" / unit["id"]
         report = directory / "report.csv"
         context = _evidence_context("splint", unit, tool)
@@ -648,7 +649,7 @@ def _parse_splint_units(source: Path, run_dir: Path, tool: dict[str, Any]) -> tu
                     file_value = _first(values, "file", "filename", "path", "source")
                     line = _first(values, "line", "linenumber", "line number")
                     column = _first(values, "column", "col")
-                    message = _first(values, "message", "warning", "description", "text")
+                    message = _splint_csv_message(values)
                     if not message and len(row) >= 3:
                         file_value, line, message = row[0], row[1], ",".join(row[2:])
                     if not message:
@@ -664,21 +665,52 @@ def _parse_splint_units(source: Path, run_dir: Path, tool: dict[str, Any]) -> tu
                             "category": _diagnostic_category(message), "fatal": _is_fatal(message),
                         })
                     else:
-                        findings.append({
-                            **common, "original_severity": "unknown", "rule_id": _first(values, "rule", "rule_id") or "splint-warning",
+                        # "Flag Name" is Splint's own rule identity (usereleased,
+                        # boundswrite); without it every row collapses onto one
+                        # opaque rule_id and the fingerprints stop distinguishing.
+                        csv_findings.append({
+                            **common, "original_severity": "unknown",
+                            "rule_id": _first(values, "flag name", "rule", "rule_id") or "splint-warning",
                             "cwe": _extract_cwe(message),
                         })
-        log_artifact = None
-        text_parts = []
+        findings.extend(csv_findings)
+        # Splint reports the same warnings twice -- once as CSV rows, once as
+        # text on stdout -- so taking findings from both files reports every
+        # warning twice.  The CSV is the structured one and wins; the logs are
+        # still read, because a parse error or a missing include is only ever
+        # reported there, and because a run whose CSV never got written must
+        # not lose its evidence.  Each stream keeps its own artifact: they are
+        # two files, and a finding must point at the one it came from.
         for name in ("stdout.raw", "stderr.raw"):
             path = directory / name
-            if path.is_file():
-                log_artifact = path.relative_to(run_dir).as_posix()
-                text_parts.append(path.read_text(encoding="utf-8", errors="replace"))
-        log_findings, log_diagnostics = _parse_splint_text("\n".join(text_parts), log_artifact or "", context)
-        findings.extend(log_findings)
-        diagnostics.extend(log_diagnostics)
+            if not path.is_file():
+                continue
+            log_findings, log_diagnostics = _parse_splint_text(
+                path.read_text(encoding="utf-8", errors="replace"),
+                path.relative_to(run_dir).as_posix(), context,
+            )
+            if not csv_findings:
+                findings.extend(log_findings)
+            diagnostics.extend(log_diagnostics)
     return findings, diagnostics
+
+
+def _splint_csv_message(values: dict[str, str]) -> str:
+    """Splint's warning text, not its row number.
+
+    The real header is ``Warning, Flag Code, Flag Name, Priority, File, Line,
+    Column, Warning Text, Additional Text``: "Warning" is the ordinal, and
+    reading it as the message files findings whose entire text is "1", "2",
+    "3".  The columns are matched most-specific first so a hand-written
+    ``file,line,message`` CSV keeps working.
+    """
+    message = _first(values, "warning text", "message", "description", "text")
+    extra = _first(values, "additional text")
+    if message and extra and extra not in message:
+        message = f"{message} {extra}"
+    # A constraint warning spans several CSV lines; the text parser renders the
+    # same warning on one, and the two must not read as different findings.
+    return " ".join(message.split())
 
 
 _SPLINT_LOCATION = re.compile(r"^(\S.*?):(\d+)(?::(\d+))?:\s+(.+)$")
