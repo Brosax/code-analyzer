@@ -11,7 +11,11 @@ of paying for them again.
 Opt-in twice, exactly like ``live_tools``: the ``live_llm`` marker selects the
 module and CODE_ANALYZER_LIVE_LLM=1 arms it, so a bare ``pytest`` run never
 reaches a GPU host.  Set CODE_ANALYZER_LIVE_LLM_PROFILE to probe a provider
-other than the built-in default.
+other than the built-in default, and CODE_ANALYZER_LIVE_LLM_CONFIG to point at
+a TOML file for whatever the profile cannot carry -- the served context window
+above all, since a provider that serves a smaller window than ``[llm]
+context_window`` declares truncates prompts silently and ``llm-doctor`` rightly
+refuses the run.
 
     CODE_ANALYZER_LIVE_LLM=1 python3 -m pytest -m live_llm
 
@@ -53,6 +57,21 @@ def _profile() -> str:
     return os.environ.get("CODE_ANALYZER_LIVE_LLM_PROFILE") or DEFAULT_PROFILE
 
 
+def _config_path() -> Path | None:
+    """The operator's provider settings, if this host needs any."""
+    configured = os.environ.get("CODE_ANALYZER_LIVE_LLM_CONFIG")
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    assert path.is_file(), f"CODE_ANALYZER_LIVE_LLM_CONFIG does not name a file: {path}"
+    return path
+
+
+def _config_argv() -> tuple[object, ...]:
+    path = _config_path()
+    return ("--config", path) if path is not None else ()
+
+
 def _tree(root: Path) -> Path:
     source = root / "source"
     (source / "src").mkdir(parents=True)
@@ -89,6 +108,7 @@ def _summary(run_dir: Path) -> dict:
 def _analyze(source: Path, output_root: Path) -> tuple[int, Path]:
     completed = run_cli(
         "analyze", source,
+        *_config_argv(),
         "--output-root", output_root,
         "--no-compile-db",
         "--tool", "cppcheck",
@@ -122,12 +142,17 @@ def live_scan(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 def test_the_provider_answers_the_doctor_probe(tmp_path: Path) -> None:
     source = _tree(tmp_path)
-    config = load_config(source, None, {"llm": {"profile": _profile()}})
+    config = load_config(source, _config_path(), {"llm": {"profile": _profile()}})
 
     result = probe_llm(config, source)
 
     assert result["runtime"]["available"], result["runtime"]
-    assert result["models"]["ok"], result["models"]["reason"]
+    assert result["models"]["reachable"], result["models"]["reason"]
+    assert result["models"]["model_present"], result["models"]["reason"]
+    # A served window smaller than the configured one truncates prompts in
+    # silence, so the probe refuses the run: the fix is the operator's config,
+    # which is what CODE_ANALYZER_LIVE_LLM_CONFIG is for.
+    assert result["context_window"]["ok"], result["context_window"]["reason"]
     assert result["benchmark"]["ok"], result["benchmark"]["reason"]
     # The mis-route this command exists to catch: an endpoint that answers, but
     # with something other than what it was asked for.
@@ -202,6 +227,7 @@ def test_the_validator_files_a_verdict_without_touching_the_evidence(live_scan: 
 
     completed = run_cli(
         "assess", run_dir,
+        *_config_argv(),
         "--llm-profile", _profile(),
         "--max-candidates", "1",
         timeout=ASSESS_TIMEOUT,
