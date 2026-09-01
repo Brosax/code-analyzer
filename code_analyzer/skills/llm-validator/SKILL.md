@@ -1,7 +1,7 @@
 ---
 name: llm-validator
 description: Second-layer reviewer. Judges one correlated candidate — the static and LLM findings that name the same lines — against the source and its callers, and returns one verdict with its reasoning.
-skill_version: 1.1.0
+skill_version: 1.2.0
 engine: llm
 role: validator
 allowed-tools:
@@ -118,6 +118,9 @@ fence, no comments, no trailing commas. Your reply must begin with `{`.
 - `confidence` — a number in `[0.0, 1.0]`.
 - `decisive_line` — an object with `file` (path as given in the unit header or
   as you read it, relative to the scanned tree) and `line` (1-based integer).
+  Write the line as a bare JSON number: `"line": 15`, never `"line": "15"`. A
+  quoted number is a string, the field type is checked strictly, and the whole
+  verdict is discarded — the reasoning behind it with it.
 - `rationale` — at most 900 characters, no newlines required.
 - `remediation` — optional, at most 200 characters.
 
