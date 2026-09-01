@@ -416,6 +416,24 @@ LLM 层默认**关闭**：一次可能耗时数小时的扫描，绝不能是 `a
 | `llm-firmware-concurrency` | ISR 竞态、`volatile`、原子性、RTOS 同步、看门狗、MMIO、DMA、超时、复位 |
 | `llm-logic` | 闭合四类：`state-machine` / `inverted-condition` / `dead-code` / `unreachable-branch` |
 
+### 12.0 选 provider profile
+
+内置三个 profile，各自只提供 `endpoint` / `model` / `api_key_env` 三个默认值，任何显式设置
+的同名键都优先于它：
+
+| profile | 端点 | 模型 | 源码离开本机 |
+|---|---|---|---|
+| `gpu-host`（默认） | SSH 隧道后的本机 `11435` | `qwen3.8:27b` | 否 |
+| `gpu-host-uncensored` | 同上 | `qwen3_8_uncensored:latest` | 否 |
+| `openrouter` | `openrouter.ai/api/v1` | `stealth/ox-alpha` | **是** |
+
+`gpu-host-uncensored` 是同一台机器上换一个未做安全对齐的模型。被扫描的源码按定义就是
+「漏洞形状」的——一个写全的缓冲区溢出正是 memory-safety scanner 要看的东西——对齐模型
+可能以拒答回应，而拒答在解析层就是一份不可解析的响应，整个单元作废。用哪个模型评审代码
+是操作者的决定，每次运行的 `manifest.json` 都记录了实际用的是哪一个。
+
+其它 provider 用 `--llm-endpoint` / `--llm-model` 直接指定即可，不需要新 profile。
+
 ### 12.1 先体检，再扫描
 
 ```bash

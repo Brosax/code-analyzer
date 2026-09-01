@@ -53,6 +53,31 @@ def test_the_default_profile_is_the_operator_gpu_host(tmp_path: Path) -> None:
     assert third_party_warning(llm) is None
 
 
+@pytest.mark.parametrize("name", sorted(PROFILES))
+def test_every_profile_supplies_the_three_keys_it_owns(name: str, tmp_path: Path) -> None:
+    path = _write(tmp_path / f"{name}.toml", f'[llm]\nprofile = "{name}"\n')
+
+    loaded = load_config_with_sources(tmp_path, path)
+    llm = loaded.config["llm"]
+
+    assert set(PROFILES[name]) == {"endpoint", "api_key_env", "model"}
+    assert {key: llm[key] for key in PROFILES[name]} == PROFILES[name]
+    assert all(loaded.sources[f"llm.{key}"] == f"profile:{name}" for key in PROFILES[name])
+
+
+def test_the_uncensored_profile_is_the_same_local_host_with_another_model() -> None:
+    # A refusal reaches the parser as an unparseable response, so an operator
+    # scanning exploit-shaped code may want a model that will not refuse.  It
+    # is the same box over the same tunnel: no third-party warning is due, and
+    # emitting one would train the operator to ignore the real ones.
+    uncensored = PROFILES["gpu-host-uncensored"]
+
+    assert uncensored["endpoint"] == GPU_HOST["endpoint"]
+    assert uncensored["model"] != GPU_HOST["model"]
+    assert uncensored["api_key_env"] == ""
+    assert third_party_warning({"profile": "gpu-host-uncensored", **uncensored}) is None
+
+
 def test_a_profile_supplies_the_defaults_it_owns(tmp_path: Path) -> None:
     path = _write(tmp_path / "openrouter.toml", '[llm]\nprofile = "openrouter"\n')
 

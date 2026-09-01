@@ -23,6 +23,18 @@ PROFILES: dict[str, dict[str, str]] = {
         "model": "qwen3.8:27b",
         "api_key_env": "",
     },
+    # The same GPU host, serving a model without the safety tuning.  Scanned
+    # source is exploit-shaped by construction -- a buffer overflow written out
+    # in full is what a memory-safety scanner is for -- and an aligned model
+    # can answer a finding with a refusal, which reaches the parser as an
+    # unparseable response and costs the unit.  A separate profile rather than
+    # a new default: which model judges the code is the operator's call, and it
+    # is recorded in every manifest.
+    "gpu-host-uncensored": {
+        "endpoint": "http://127.0.0.1:11435/v1",
+        "model": "qwen3_8_uncensored:latest",
+        "api_key_env": "",
+    },
     "openrouter": {
         "endpoint": "https://openrouter.ai/api/v1",
         "model": "stealth/ox-alpha",
@@ -35,7 +47,7 @@ DEFAULT_PROFILE = "gpu-host"
 PROFILE_KEYS: tuple[str, ...] = ("endpoint", "api_key_env", "model")
 
 # Profiles that keep the scanned source on operator-controlled infrastructure.
-LOCAL_PROFILES = frozenset({"gpu-host"})
+LOCAL_PROFILES = frozenset({"gpu-host", "gpu-host-uncensored"})
 
 
 def apply_profile(llm: dict[str, Any], sources: dict[str, str]) -> None:
