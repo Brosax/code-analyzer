@@ -233,12 +233,19 @@ export instead of discarding every safe artifact.
 python3 -m pip install -e '.[dev]'
 python3 -m pytest
 CODE_ANALYZER_LIVE_TOOLS=1 python3 -m pytest -m live_tools
+CODE_ANALYZER_LIVE_LLM=1 python3 -m pytest -m live_llm
 ```
 
 The dashboard JavaScript syntax check additionally needs `node` on `PATH`;
 without it that one test is skipped. The `live_tools` tests require both the
 `-m live_tools` marker selection and `CODE_ANALYZER_LIVE_TOOLS=1`, so they
-never run by accident. The `tfm_full` acceptance profile is manual, requires
+never run by accident. The `live_llm` tests are armed the same way and need a
+reachable provider: they prove what a scripted fake cannot — that the endpoint
+answers, that a real reply survives the finding schema, that the provider's own
+token counters reach the ledger, that a second scan is served entirely from the
+cache, and that a verdict never touches the evidence layer. Once armed they
+fail rather than skip when the provider is unreachable, because a live run that
+quietly skips is how a broken provider stays undetected. The `tfm_full` acceptance profile is manual, requires
 `CODE_ANALYZER_TFM_FULL=1`, and is intentionally excluded from a normal test
 run; see [docs/tfm_full.md](docs/tfm_full.md).
 
