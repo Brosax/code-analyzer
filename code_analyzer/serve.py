@@ -30,23 +30,13 @@ from .analysis import AnalysisEvent, AnalysisRequest, CancellationToken, run_ana
 from .errors import UserError
 from .events import RUN_DIRECTORY_PHASE
 from .persist import json_bytes
-from .status import EXIT_INTERRUPTED
+from .status import EXIT_INTERRUPTED, NODE_STATES, PHASE_NODES
 
 BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 EVENTS_FILENAME = "events.jsonl"
 POLL_SECONDS = 0.5
 
-# Every word the status ladder can produce, projected onto the four the live
-# page draws.  The projection is a view; nothing persists the four-state form.
-NODE_STATES: dict[str, str] = {
-    "completed": "success", "complete": "success",
-    "partial": "failed", "timed_out": "failed", "failed": "failed", "interrupted": "failed",
-    "incompatible": "failed", "missing": "failed",
-    "running": "running", "pending": "pending",
-    "unscheduled": "pending", "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
-}
-PHASE_NODES: tuple[str, ...] = ("discovery", "review", "audit", "export", "dashboard")
 
 
 def graph(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -315,6 +305,7 @@ button[disabled]{opacity:.5;cursor:default}
 (() => {
   const $ = id => document.getElementById(id);
   const line = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = String(text); return n; };
+  // Twin of STATE_GLYPHS in status.py; keep the two in step.
   const glyph = { success: "✓", failed: "✕", running: "●", pending: "○" };
   let progress = 0, ended = false;
   const drawGraph = async () => {

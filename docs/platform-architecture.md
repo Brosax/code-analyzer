@@ -767,7 +767,7 @@ line_span)` 键。没有行号的 finding（splint 的 `<Location unknown>`）�
 
 ---
 
-## 14. Web UI 架构 — EXISTS（离线）/ NEW（实时）✅ 已交付（P1，`serve`）
+## 14. UI 架构（两个前端共享一套节点词汇） — EXISTS（离线）/ NEW（实时）✅ 已交付（P1，`serve`）
 
 ### 14.1 离线 dashboard：五条契约冻结，文件可追加
 
@@ -819,7 +819,40 @@ Code Review · run 2026-08-21T13:02:11Z-ab12cd34ef56
 - 运行结束后页面链接到已写好的 `index.html`
 - token 数永远附带 `TOKEN_ACCOUNTING` 说明
 - 双语：沿用 `html_report.py:357-486` 的 `I18N` 表结构
-- 10 词梯子 → 4 态投影：`completed`→✓；`partial`/`timed_out`/`failed`/`interrupted`→✕（悬停显示原词）；`running`→●；`unscheduled`/`not_requested`/`missing`/`incompatible`/`not_applicable`→○（悬停显示原词）
+- 10 词梯子 → 4 态投影：`completed`→✓；`partial`/`timed_out`/`failed`/`interrupted`→✕（悬停显示原词）；`running`→●；`unscheduled`/`not_requested`/`not_applicable`/`disabled`→○（悬停显示原词）
+  （实现期订正：初稿把 `missing`/`incompatible` 归入 ○。实现将其归入 ✕ 且更正确——
+  工具缺失或版本不兼容意味着**拿不出证据**，不是还在排队；见 `status.NODE_STATES`）
+
+### 14.3 TUI 实时流程视图
+
+同一张图的第二个前端。§14.2 的原型当初只指派给 `serve`，但需要盯着扫描的人多数
+时候就坐在跑扫描的那个终端前。四条实现期决定：
+
+1. **词汇下沉。** `NODE_STATES` / `PHASE_NODES` / 新增的 `STATE_GLYPHS` 移到
+   `status.py`（本就是状态梯子模块，只依赖 stdlib），`serve` 再导出。TUI 绝不
+   import `serve`——后者在模块导入时就拉起 `http.server`，让终端界面依赖 web
+   服务器模块是本末倒置。
+2. **TUI 折叠事件，`serve` 投影 manifest。** 不是重复，是必需：运行期
+   `manifest.json` 刻意粗粒度——`runner._running_state` 把 `unit_counts` 清零，
+   `llm_scan.running()` 的 `scanners` 是空字典，于是 `graph(manifest)` 会把六个
+   scanner 塌成一个 `llm` 节点。逐 scanner 的实时视图只能来自事件流。运行结束后
+   反过来，所以结果页仍读 manifest。
+3. **计数器：分子靠数，分母才解析。** 分子是终态 `unit` 事件的整数计数；分母是从
+   `progress` 阶段自由文本里刮出来的**提示**，只单向 `max` 增长，提示没来就显示
+   "已完成 N 单元"而不编造分母。结构上更干净的方案——给 `AnalysisEvent` 加
+   `index`/`total` 字段——**被否决**：`tests/test_events.py:104` 钉死了 JSONL 的
+   键集合，改它会同时破坏 `serve._event_dict` 与 §6 的契约。文本耦合由
+   `tests/test_flow.py` 的端到端用例兜底：producer 改措辞会让测试变红，而不是让
+   面板悄悄显示一个横杠。
+4. **`audit` 不入流程图。** `runner.py` 写 `audit/assessment.json` 时不发任何事件，
+   画出来会整场 `pending` 然后突然变绿。`serve` 的 audit 节点今天正是这个毛病
+   （其 JS 监听的 `e.phase === "audit"` 从未触发）。修法是给 runner 补三条事件，
+   属于另一件事。
+
+模型在 `code_analyzer/flow.py`，纯逻辑、零 UI 依赖，像 `serve.graph` 一样单测
+（`tests/test_flow.py` 有一条测试专门断言 import 它不会拉进 textual / rich / http）。
+渲染在 `tui.py`：一个 `Static`、一个 5Hz 定时器、逐段构造的 `rich.text.Text`
+——**绝不用标记字符串**，因为被扫描文件名会进入这些行。
 
 ---
 

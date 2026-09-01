@@ -70,6 +70,20 @@ validated snapshot. The interface never generates a compile database, invokes
 CMake, or installs tools. It requires a TTY and at least 80×24 cells; a non-TTY
 no-argument invocation prints help and exits `2`.
 
+During a scan the form gives way to a live flow of the run: discovery fans out
+to every analyzer and LLM scanner and converges on review, export and the
+report, drawn with the same four states and glyphs the dashboard and `serve`
+use. Static analysis and the LLM scanners run concurrently, so more than one
+lane really is in flight at once. Each row carries the method actually in use —
+Cppcheck's build-aware pass versus its source-only fallback, a Flawfinder
+shard, the translation unit Splint is on, the unit and risk tier a scanner is
+reading — plus unit counters that stay unknown rather than invented when a
+producer has not announced its plan. Two columns at 120 columns or wider, one
+below that, where the flow collapses to a summary that never hides a running
+node; `F2` hides it entirely and gives the log its rows back.
+`CODE_ANALYZER_NO_ANIMATION=1` and `TERM=dumb` freeze the animation without
+hiding anything, exactly as they do for the CLI spinner.
+
 During a scan, `Ctrl+C` requests cooperative cancellation. Running process
 groups receive the same bounded TERM/KILL cleanup as the CLI; an existing run
 directory is retained with an `interrupted` manifest and exit code `130`.

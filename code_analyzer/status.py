@@ -11,6 +11,22 @@ EXIT_PARTIAL = 10
 EXIT_FAILED = 20
 EXIT_INTERRUPTED = 130
 
+# Every word the status ladder can produce, projected onto the four states a
+# UI draws.  The projection is a view; nothing persists the four-state form.
+# Both front ends read it from here: `serve` projects manifest.json, the TUI
+# folds the event stream, and they must not disagree about what a word means.
+NODE_STATES: dict[str, str] = {
+    "completed": "success", "complete": "success",
+    "partial": "failed", "timed_out": "failed", "failed": "failed", "interrupted": "failed",
+    "incompatible": "failed", "missing": "failed",
+    "running": "running", "pending": "pending",
+    "unscheduled": "pending", "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
+}
+PHASE_NODES: tuple[str, ...] = ("discovery", "review", "audit", "export", "dashboard")
+# The twin of the `glyph` object in serve.py's inline page script; a change
+# here without a change there makes the two front ends draw different runs.
+STATE_GLYPHS: dict[str, str] = {"success": "✓", "failed": "✕", "running": "●", "pending": "○"}
+
 
 def aggregate_units(units: list[dict[str, Any]], applicable: bool = True) -> str:
     if not applicable or not units:

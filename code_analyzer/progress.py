@@ -7,8 +7,12 @@ import threading
 import time
 from typing import TextIO
 
-_BRAILLE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-_ASCII_FRAMES = ("|", "/", "-", "\\")
+BRAILLE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ASCII_FRAMES = ("|", "/", "-", "\\")
+# The CLI spinner and the TUI's flow panel spin with the same frames on
+# purpose: one product, one idle animation.
+_BRAILLE_FRAMES = BRAILLE_FRAMES
+_ASCII_FRAMES = ASCII_FRAMES
 
 
 class ProgressDisplay:
@@ -105,10 +109,24 @@ class ProgressDisplay:
             self._drawn = False
 
 
-def _supports_animation(stream: TextIO) -> bool:
+def animation_disabled_by_env() -> bool:
+    """Has the operator, or the terminal, asked for no motion?
+
+    Split out of ``_supports_animation`` so the TUI can honour the same
+    switches: its stream is always a TTY (the CLI refuses a non-TTY session),
+    so the ``isatty`` half below is the CLI's alone -- and importing it there
+    would silently disable the animation under ``run_test``, where stdout is
+    not a terminal, leaving it untestable.
+    """
     if os.environ.get("CODE_ANALYZER_NO_ANIMATION", "").strip().lower() in {"1", "true", "yes", "on"}:
-        return False
+        return True
     if os.environ.get("TERM", "").strip().lower() == "dumb":
+        return True
+    return os.environ.get("TEXTUAL_ANIMATIONS", "").strip().lower() == "none"
+
+
+def _supports_animation(stream: TextIO) -> bool:
+    if animation_disabled_by_env():
         return False
     try:
         return bool(stream.isatty())

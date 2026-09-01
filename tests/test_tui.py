@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from code_analyzer.analysis import AnalysisRequest, CancellationToken, run_analysis
+from code_analyzer.analysis import (
+    AnalysisEvent,
+    AnalysisRequest,
+    CancellationToken,
+    run_analysis,
+)
 from code_analyzer.cli import main
 from code_analyzer.config import (
     DEFAULTS,
@@ -16,6 +21,7 @@ from code_analyzer.config import (
     load_config_with_sources,
     save_config_snapshot,
 )
+from code_analyzer.progress import BRAILLE_FRAMES
 from code_analyzer.tui import AnalyzerApp, TuiOutcome
 
 
@@ -113,6 +119,134 @@ def test_headless_tui_has_single_basic_form_and_preserves_hidden_config(tmp_path
         async with small.run_test(size=(79, 23)) as pilot:
             await pilot.pause()
             assert small.small and small.has_class("too-small")
+
+    asyncio.run(exercise())
+
+
+def _running(app: AnalyzerApp) -> None:
+    """Put the app into the running state the way a confirmed run does."""
+    app.running = True
+    app._reset_run_display()
+    app.add_class("running")
+
+
+def _panel(app: AnalyzerApp) -> str:
+    """What the flow panel is handed, as plain text.
+
+    The assertion boundary is the Text this app builds, not Textual's private
+    render state: markup in a scanned path must survive as characters, which
+    is a property of building the Text segment by segment.
+    """
+    frame = app._flow_frame if app._flow_animated else -1
+    return app._flow_text(app.flow.rows(capacity=app._flow_capacity, now=0.0, frame=frame)).plain
+
+
+def _feed(app: AnalyzerApp, *events: AnalysisEvent) -> None:
+    for event in events:
+        app._analysis_event(event)
+    app._repaint_flow()
+
+
+def test_the_flow_panel_and_the_log_share_the_minimum_terminal(tmp_path: Path) -> None:
+    """80x24 is the floor, and both halves have to survive it."""
+
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(
+                app,
+                AnalysisEvent("discovery", "finished", "inventory ready: 8 files", progress=0.1),
+                AnalysisEvent("tool", "started", "cppcheck starting", tool="cppcheck"),
+            )
+            await pilot.pause()
+            flow = app.query_one("#run-flow")
+            log = app.query_one("#run-log")
+            assert flow.display and log.display
+            assert flow.region.y + flow.region.height <= 24
+            assert log.region.height > 0
+            assert log.region.y >= flow.region.y + flow.region.height  # 窄终端：上下堆叠
+            assert app._flow_capacity == 7
+
+    asyncio.run(exercise())
+
+
+def test_a_wide_terminal_puts_the_flow_beside_the_log(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            flow = app.query_one("#run-flow").region
+            log = app.query_one("#run-log").region
+            assert log.x >= flow.x + flow.width  # 宽终端：左右并排
+            assert app._flow_capacity == 16
+
+    asyncio.run(exercise())
+
+
+def test_f2_gives_the_log_its_rows_back(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            _running(app)
+            await pilot.pause()
+            before = app.query_one("#run-log").region.height
+            await pilot.press("f2")
+            await pilot.pause()
+            assert not app.query_one("#run-flow").display
+            assert app.query_one("#run-log").region.height > before
+
+    asyncio.run(exercise())
+
+
+def test_the_animation_honours_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The switch the CLI has always honoured and the TUI used to ignore.
+
+    Frozen is not blank: the panel still repaints on every event, it just
+    stops moving between them.
+    """
+    monkeypatch.setenv("CODE_ANALYZER_NO_ANIMATION", "1")
+
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            assert app._flow_animated is False
+            _running(app)
+            await pilot.pause()
+            first = _panel(app)
+            assert "○" in first
+            assert not set(first) & set(BRAILLE_FRAMES)
+            _feed(app, AnalysisEvent("tool", "started", "cppcheck starting", tool="cppcheck"))
+            await pilot.pause()
+            second = _panel(app)
+            assert second != first and "●" in second
+            # Ticking must not animate it either: only events may change it.
+            app._tick_flow()
+            assert _panel(app) == second
+
+    asyncio.run(exercise())
+
+
+def test_an_untrusted_path_reaches_the_panel_as_text(tmp_path: Path) -> None:
+    """Rich markup in a scanned file name must render, not style."""
+
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(app, AnalysisEvent(
+                "unit", "started", "scanning [bold red]evil[/].c (high)",
+                tool="cppcheck", unit="[bold red]evil[/].c",
+            ))
+            await pilot.pause()
+            plain = _panel(app)
+            assert "[bold red]evil[/].c" in plain
+            assert "\x1b" not in plain
 
     asyncio.run(exercise())
 

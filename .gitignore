@@ -13,3 +13,5 @@ datas/
 plugin_version/
 trusted-firmware-m/
 .claude/worktrees/
+*.swp
+*.swo

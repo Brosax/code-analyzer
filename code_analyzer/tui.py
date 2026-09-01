@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -19,6 +20,7 @@ from textual.containers import (
     Vertical,
     VerticalScroll,
 )
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -50,8 +52,9 @@ from .config import (
     validate_config,
 )
 from .errors import UserError
+from .flow import WIDE_BREAKPOINT, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
-from .progress import single_line
+from .progress import animation_disabled_by_env, single_line
 from .tools import TOOL_NAMES
 
 TUI_FIELDS = (
@@ -66,8 +69,12 @@ TUI_FIELDS = (
     "llm.enabled",
 )
 
-# 两栏布局的最小终端宽度；低于该值回落为单栏。
-WIDE_BREAKPOINT = 120
+
+# Node state -> colour, and the three-step ramp the spine cell walks so a dot
+# appears to travel down the fan-out without any character changing.
+_STATE_STYLES = {"success": "green", "failed": "red", "running": "bold cyan", "pending": "dim"}
+_SPINE_STYLES = ("bold cyan", "cyan", "dim cyan")
+_LABEL_WIDTH = 24
 
 GRADING_NOTE = (
     "所有新报告固定采用 NXP i.MX RT700 AVA Test Plan 第 7 章的 "
@@ -172,6 +179,7 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("ctrl+c", "cancel_or_exit", "取消/退出", priority=True),
         Binding("escape", "escape", "返回", priority=True),
         Binding("f1", "grading_info", "分级说明"),
+        Binding("f2", "toggle_flow", "流程图"),
     ]
     CSS = """
     Screen { background: $surface; }
@@ -201,8 +209,15 @@ class AnalyzerApp(App[TuiOutcome]):
     .running #running { display: block; }
     #run-heading { height: 1; text-style: bold; }
     #run-details { height: 1; color: $text-muted; }
-    #run-progress { height: 1; margin-bottom: 1; }
+    #run-progress { height: 1; }
+    #run-body { height: 1fr; layout: vertical; }
+    #run-flow { height: auto; border: round $accent; background: $surface-darken-1;
+                padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #run-log { height: 1fr; border: round $primary; background: $surface-darken-1; }
+    .wide #run-body { layout: horizontal; }
+    .wide #run-flow { width: 58; height: 1fr; margin-right: 1; }
+    .wide #run-log { width: 1fr; }
+    .flow-hidden #run-flow { display: none; }
     #run-stop-hint { height: 1; color: $warning; }
     #result { display: none; height: 1fr; padding: 1 2; }
     .completed #workspace, .completed #status-line { display: none; }
@@ -247,6 +262,13 @@ class AnalyzerApp(App[TuiOutcome]):
         self._log_lock = threading.Lock()
         self._log_overflowed = False
         self._run_started_at: float | None = None
+        self._last_preflight: PreflightResult | None = None
+        self.flow: RunFlow | None = None
+        self._flow_frame = 0
+        self._flow_dirty = True
+        self._flow_capacity = 7
+        # The CLI honours these switches and the TUI used to ignore them.
+        self._flow_animated = not animation_disabled_by_env()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -283,7 +305,9 @@ class AnalyzerApp(App[TuiOutcome]):
             yield Static("正在运行…", id="run-heading")
             yield Static("阶段：准备 · 工具/单元：— · 已运行：00:00", id="run-details")
             yield ProgressBar(total=100, id="run-progress")
-            yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
+            with Vertical(id="run-body"):
+                yield Static("", id="run-flow")
+                yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
             yield Static("Ctrl+C 请求安全停止；将停止调度并回收当前进程组。", id="run-stop-hint")
         with Vertical(id="result"):
             yield Static("", id="result-status")
@@ -340,6 +364,9 @@ class AnalyzerApp(App[TuiOutcome]):
         self.set_timer(0.2, self._mark_clean)
         self.set_interval(0.1, self._flush_log_queue)
         self.set_interval(1.0, self._update_elapsed)
+        # 5 Hz over one Static: an order of magnitude under the log drain
+        # above, and the only thing in the app that animates.
+        self.set_interval(0.2, self._tick_flow)
 
     def _mark_clean(self) -> None:
         self.dirty = False
@@ -350,12 +377,21 @@ class AnalyzerApp(App[TuiOutcome]):
         self.small = width < 80 or height < 24
         self.set_class(self.small, "too-small")
         self.set_class(width >= WIDE_BREAKPOINT, "wide")
+        capacity_ = capacity(width, height)
+        if capacity_ != self._flow_capacity:
+            self._flow_capacity = capacity_
+            self._flow_dirty = True
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         tip = getattr(event.widget, "tooltip", None)
         if tip and not self.running:
             prefix = "● 未保存修改 · " if self.dirty else ""
             self.query_one("#status-line", Static).update(f"{prefix}{tip}")
+
+    def action_toggle_flow(self) -> None:
+        """Give the log its rows back on a small terminal."""
+        self.toggle_class("flow-hidden")
+        self._flow_dirty = True
 
     def action_grading_info(self) -> None:
         self.push_screen(InfoScreen("评分分级说明", GRADING_NOTE))
@@ -527,6 +563,9 @@ class AnalyzerApp(App[TuiOutcome]):
             self.call_from_thread(self._preflight_done, source, config, result, for_run)
 
     def _preflight_done(self, source: Path, config: dict[str, Any], result: PreflightResult, for_run: bool) -> None:
+        # Lets the discovery row say "318 文件 · compile-db 212 条" before the
+        # first event has been emitted.
+        self._last_preflight = result
         lines = [f"源码文件：{result.inventory_files if result.inventory_files is not None else '—'}"]
         if result.compile_database:
             lines.append(f"Compile DB：{result.compile_database['path'] or '未发现（降级上下文）'}")
@@ -623,15 +662,68 @@ class AnalyzerApp(App[TuiOutcome]):
             self.call_from_thread(self._analysis_event, event)
 
     def _analysis_event(self, event: AnalysisEvent) -> None:
-        context = event.tool or "—"
-        if event.unit:
-            context += "/" + event.unit
-        self.query_one("#run-heading", Static).update(single_line(event.message))
-        self.query_one("#run-details", Static).update(
-            f"阶段：{event.phase} · 工具/单元：{context} · 已运行：{self._elapsed_text()}"
-        )
+        # Repainting here would redraw once per event; during the LLM phase
+        # that is a burst of hundreds. The timer coalesces them instead.
+        if self.flow is not None and self.flow.apply(event):
+            self._flow_dirty = True
         if event.progress is not None:
             self.query_one("#run-progress", ProgressBar).update(progress=max(1, event.progress * 100))
+
+    def _tick_flow(self) -> None:
+        if not self.running or not self.is_mounted:
+            return
+        if self._flow_animated:
+            self._flow_frame += 1
+        elif not self._flow_dirty:
+            return
+        self._flow_dirty = False
+        self._repaint_flow()
+
+    def _repaint_flow(self) -> None:
+        """Redraw the panel, or quietly do nothing if it is not there.
+
+        A 5 Hz timer outlives the widget tree during teardown, and a panel is
+        decorative: it must never be the reason a scan dies.
+        """
+        if self.flow is None or not self.is_mounted:
+            return
+        try:
+            heading = self.query_one("#run-heading", Static)
+            details = self.query_one("#run-details", Static)
+            panel = self.query_one("#run-flow", Static)
+        except NoMatches:
+            return
+        # Wall clock, not monotonic: node clocks are derived from
+        # AnalysisEvent.timestamp, which is time.time().
+        now = time.time()
+        headline = self.flow.headline(now)
+        heading.update(headline.title)
+        details.update(headline.detail)
+        frame = self._flow_frame if self._flow_animated else -1
+        rows = self.flow.rows(capacity=self._flow_capacity, now=now, frame=frame)
+        panel.border_title = f"扫描流程 · {self.flow.run_name}" if self.flow.run_name else "扫描流程"
+        panel.update(self._flow_text(rows))
+
+    def _flow_text(self, rows: list[Any]) -> Text:
+        """Built segment by segment, never from markup.
+
+        Scanned file names reach these rows, so a path literally named
+        ``[bold red]x[/]`` must render as itself rather than as a style.
+        """
+        text = Text(no_wrap=True, overflow="ellipsis")
+        for index, row in enumerate(rows):
+            if index:
+                text.append("\n")
+            if row.spine:
+                text.append(row.spine + " ", style=_SPINE_STYLES[row.pulse % len(_SPINE_STYLES)])
+            else:
+                text.append("  ")
+            if row.glyph:
+                text.append(row.glyph + " ", style=_STATE_STYLES[row.state])
+            text.append(row.label.ljust(_LABEL_WIDTH) if row.detail else row.label)
+            if row.detail:
+                text.append(" " + row.detail, style="dim")
+        return text
 
     def _queue_log_event(self, event: AnalysisEvent) -> None:
         line = self._format_log_event(event)
@@ -675,9 +767,13 @@ class AnalyzerApp(App[TuiOutcome]):
             self._log_overflowed = False
         self.query_one("#run-log", RichLog).clear()
         self._run_started_at = time.monotonic()
+        self.flow = RunFlow(self.config, preflight=self._last_preflight)
+        self._flow_frame = 0
+        self._flow_dirty = True
         self.query_one("#run-heading", Static).update("正在启动扫描…")
-        self.query_one("#run-details", Static).update("阶段：准备 · 工具/单元：— · 已运行：00:00")
-        self.query_one("#run-stop-hint", Static).update("Ctrl+C 请求安全停止；将停止调度并回收当前进程组。")
+        self.query_one("#run-details", Static).update("0% · 已运行 00:00")
+        self.query_one("#run-stop-hint", Static).update("Ctrl+C 请求安全停止 · F2 隐藏流程图")
+        self._repaint_flow()
 
     def _elapsed_text(self) -> str:
         elapsed = 0 if self._run_started_at is None else max(0, int(time.monotonic() - self._run_started_at))
@@ -686,15 +782,22 @@ class AnalyzerApp(App[TuiOutcome]):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
     def _update_elapsed(self) -> None:
+        """The clock lives in the model, not in the rendered string.
+
+        This used to read the widget back and re-split its own text on
+        " · 已运行："; any change to the line silently stopped the clock.
+        """
         if not self.running or not self.is_mounted:
             return
-        details = self.query_one("#run-details", Static)
-        prefix = str(details.render()).rsplit(" · 已运行：", 1)[0]
-        details.update(f"{prefix} · 已运行：{self._elapsed_text()}")
+        self._flow_dirty = True
+        if not self._flow_animated:
+            self._repaint_flow()
 
     def _analysis_done(self, result: AnalysisResult) -> None:
         self._flush_log_queue()
-        self._update_elapsed()
+        # The ticker stops with the run, so paint the terminal states once more
+        # before it does; otherwise the panel keeps its second-to-last frame.
+        self._repaint_flow()
         self.running = False
         self.remove_class("running")
         self._set_controls_disabled(False)
@@ -738,6 +841,8 @@ class AnalyzerApp(App[TuiOutcome]):
     def _cancel_confirmed(self, confirmed: bool) -> None:
         if confirmed and self.cancel_token:
             self.cancel_token.cancel()
+            if self.flow is not None:
+                self.flow.mark_stopping()
             self.query_one("#run-heading", Static).update("正在安全停止…")
             self.query_one("#run-stop-hint", Static).update("已请求安全停止；正在等待当前进程终止并回收，请勿强制退出。")
             self._queue_log_event(AnalysisEvent("analysis", "stopping", "已请求安全停止；正在终止并回收当前进程"))
