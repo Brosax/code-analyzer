@@ -535,6 +535,13 @@ memory-safety 与 undefined-behavior 是**同一次重切**的两半：前者按
 不合格的单条 finding 被丢弃并计入 `malformed`，不合格的整个响应使该单元
 `valid_report=False`。
 
+**唯一的类型例外是行号**（`line_range` 条目与 verdict 的 `decisive_line.line`）：
+纯数字字符串 `"7"` 按 `7` 接受。实现期修正——2026-09-01 用两个不同模型实测，
+两次都判对了缺陷、又都因为把行号写成带引号的字符串而整条作废（一次 56 秒、
+5 次 provider 请求）。把「必须写裸数字」写进 skill 只治好了其中一个模型，
+所以处理点必须在解析器。`"7"` 与 `7` 是同一个值的两种写法；浮点、布尔与
+非数字字符串仍然拒绝——那些不是写法不同，是值不同。
+
 `SubagentResult.stopReason` 的取值 `'completed' | 'aborted' | 'error' |
 'max-tokens' | 'refusal'` 需映射到既有的单元状态词汇
 （`completed` / `partial` / `timed_out` / `failed` / `interrupted`）。

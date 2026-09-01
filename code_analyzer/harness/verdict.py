@@ -19,6 +19,7 @@ from .schema import (
     _candidates,
     _drop_trailing_commas,
     _text,
+    line_number,
 )
 
 VERDICT_SCHEMA_VERSION = 1
@@ -100,8 +101,8 @@ def _validate(value: dict[str, Any], candidate_id: str) -> tuple[dict[str, Any] 
     if not isinstance(decisive, dict):
         return None, "decisive_line must be an object with file and line"
     file = _text(decisive.get("file")).strip()
-    line = decisive.get("line")
-    if not file or not isinstance(line, int) or isinstance(line, bool) or not 1 <= line <= MAX_LINE:
+    line = line_number(decisive.get("line"))
+    if not file or line is None or not 1 <= line <= MAX_LINE:
         return None, "decisive_line must name a file and a 1-based line"
     rationale = _text(value.get("rationale")).strip()
     if not rationale:

@@ -322,6 +322,29 @@ def _validate(item: Any) -> tuple[dict[str, Any], str | None]:
     return finding, None
 
 
+def line_number(value: Any) -> int | None:
+    """A 1-based line number, whether the model quoted it or not.
+
+    ``"7"`` and ``7`` are one value in two spellings, and models quote
+    numbers.  Rejecting the quoted form threw away whole verdicts: on
+    2026-09-01 two different models each traced a real defect correctly and
+    each lost the result to a pair of quote marks -- 56 seconds and five
+    provider requests, for punctuation.  Telling the skill not to do it fixed
+    one model and not the other, so the parser is where it has to be handled.
+
+    This is the only spelling the parser forgives.  Floats, booleans and
+    non-numeric strings stay rejected: those are not another spelling of a
+    line number, they are a different value.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _line_range(item: dict[str, Any]) -> tuple[tuple[int, int] | None, str | None]:
     value = item.get("line_range")
     if value is None and item.get("line_start") is not None:
@@ -334,9 +357,10 @@ def _line_range(item: dict[str, Any]) -> tuple[tuple[int, int] | None, str | Non
         return None, "line_range must be a two-element array"
     numbers: list[int] = []
     for entry in value:
-        if isinstance(entry, bool) or not isinstance(entry, int):
+        number = line_number(entry)
+        if number is None:
             return None, "line_range entries must be integers"
-        numbers.append(entry)
+        numbers.append(number)
     start, end = numbers
     if start < 1 or end < start or end > MAX_LINE:
         return None, f"line_range [{start}, {end}] is not an ordered 1-based range"

@@ -576,7 +576,6 @@ def test_extra_keys_are_dropped_not_fatal() -> None:
         ({"severity": "catastrophic"}, "severity"),
         ({"line_range": [121, 118]}, "line_range"),
         ({"line_range": [0, 4]}, "line_range"),
-        ({"line_range": ["118", "121"]}, "line_range"),
         ({"line_range": [118.0, 121.0]}, "line_range"),
         ({"line_range": [1, 2, 3]}, "line_range"),
         ({"line_range": [1, 10_000_001]}, "line_range"),
@@ -591,6 +590,29 @@ def test_malformed_findings_are_dropped_and_reported(overrides: dict, marker: st
     assert len(errors) == 1
     assert errors[0].startswith("finding[0]: ") and marker in errors[0]
     assert not schema.response_unparsed(errors)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ([118, 121], [118, 121]),
+        (["118", "121"], [118, 121]),
+        (["118", 121], [118, 121]),
+        ([" 118 ", "121"], [118, 121]),
+    ],
+)
+def test_a_quoted_line_number_is_the_same_line(value: list, expected: list) -> None:
+    """Models quote numbers, and "118" is not a different line from 118.
+
+    Two models each lost a correct verdict to this on 2026-09-01; telling the
+    skill not to quote fixed one of them.  Only the digits-only spelling is
+    forgiven -- the negative cases above it still reject floats and prose.
+    """
+    findings, errors = schema.parse_findings(body(line_range=value))
+
+    assert errors == []
+    assert findings[0]["line_range"] == expected
+    assert findings[0]["line"] == expected[0]
 
 
 def test_one_bad_finding_does_not_cost_the_good_ones() -> None:

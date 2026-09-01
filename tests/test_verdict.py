@@ -15,6 +15,28 @@ GOOD = {
 }
 
 
+def test_a_quoted_decisive_line_is_the_same_line() -> None:
+    """The spelling the parser forgives, and the ones it does not.
+
+    Two models on 2026-09-01 filed correct verdicts with "line": "7" and lost
+    them; a float or prose is still a different value, not a spelling.
+    """
+    verdict, reason = parse_verdict(
+        json.dumps({**GOOD, "decisive_line": {"file": "a.c", "line": " 15 "}}),
+        candidate_id="MEM-001",
+    )
+
+    assert reason is None
+    assert verdict["decisive_line"] == {"file": "a.c", "line": 15}
+
+    for bad in (9.0, "nine", "9.0", True, ""):
+        _rejected, why = parse_verdict(
+            json.dumps({**GOOD, "decisive_line": {"file": "a.c", "line": bad}}),
+            candidate_id="MEM-001",
+        )
+        assert why == "decisive_line must name a file and a 1-based line", bad
+
+
 def test_the_skills_own_example_round_trips() -> None:
     body = load_skill(VALIDATOR_SKILL).body
     example = re.search(r"```json\s*(\{.*?\})\s*```", body, re.S).group(1)
