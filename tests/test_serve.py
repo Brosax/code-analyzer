@@ -93,3 +93,23 @@ def test_view_only_mode_streams_the_file_and_refuses_cancel(tmp_path: Path) -> N
     finally:
         stop.set()
         thread.join(5)
+
+
+def test_the_control_endpoint_reaches_the_run_control_and_names_what_it_refuses() -> None:
+    from code_analyzer.analysis import CancellationToken
+    from code_analyzer.control import RunControl
+    from code_analyzer.serve import LiveRun
+
+    assert LiveRun(None).apply_control({"action": "pause"}) == (False, "view-only")
+    control = RunControl(CancellationToken(), llm_jobs=2)
+    live = LiveRun(None, cancellation=control.cancellation, control=control)
+    assert live.apply_control({"action": "pause", "lane": "llm"}) == (True, "") and control.paused("llm")
+    assert live.apply_control({"action": "resume", "lane": "llm"}) == (True, "") and not control.paused("llm")
+    assert live.apply_control({"action": "jobs", "lane": "llm", "value": 3}) == (True, "") and control.jobs("llm") == 3
+    assert live.apply_control({"action": "jobs", "lane": "llm", "value": "many"}) == (False, "jobs needs an integer value")
+    assert live.apply_control({"action": "skip"}) == (False, "skip needs a producer name")
+    assert live.apply_control({"action": "retry", "units": ["a.c:f"]}) == (True, "") and control.drain_retries("llm") == ["a.c:f"]
+    assert live.apply_control({"action": "retry"}) == (True, "") and control.drain_retries("llm") is None
+    assert live.apply_control({"action": "decide", "id": "nope", "answer": "apply"}) == (False, "no such pending decision")
+    assert live.apply_control({"action": "dance"}) == (False, "unknown action dance")
+    assert live.apply_control({"action": "pause", "lane": "warp"}) == (False, "unknown lane warp")

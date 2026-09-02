@@ -583,6 +583,12 @@ code-analyzer analyze ./project --llm --llm-profile gpu-host
 
 ### 12.3 续扫与验证
 
+运行**中**，TUI 的 `r` 键（或 `serve` 页面的"重试 LLM"）把未得到模型回答的单元——
+断路器或预算未调度的、传输/提供方失败的——作为新一轮在本次运行内重跑，断路器重新
+合上，`llm/plan.json` 记一条 `decided_by: "operator"` 的轮次。运行**结束后**同样的
+单元交给 `llm-resume`。
+
+
 ```bash
 code-analyzer llm-resume ./reports/<run>     # 补扫 unscheduled / interrupted 的单元
 code-analyzer assess     ./reports/<run>     # 第二层 validator 对关联候选逐个判定

@@ -189,6 +189,9 @@ class LiveRun:
                 control.set_jobs(lane, int(body.get("value")), "serve")
             except (TypeError, ValueError):
                 return False, "jobs needs an integer value"
+        elif action == "retry":
+            units = body.get("units")
+            control.request_retry("llm", [str(item) for item in units] if isinstance(units, list) else None, "serve")
         elif action == "decide":
             answer = str(body.get("answer") or "reject")
             selected = tuple(int(item) for item in body.get("selected") or [])
@@ -389,7 +392,7 @@ button[disabled]{opacity:.5;cursor:default}
 <div class="bar"><div class="track"><div class="fill" id="fill"></div></div><span id="pct">0%</span>
 <button id="cancel" disabled>取消 / Cancel</button><a id="report" hidden href="#">index.html</a></div>
 <div class="bar" id="controls" hidden><button id="pause-llm">暂停 LLM</button><button id="pause-static">暂停静态</button>
-<button id="jobs-down">并发 −</button><span id="jobs">并发 -</span><button id="jobs-up">并发 +</button><span class="muted small" id="control-state"></span></div>
+<button id="jobs-down">并发 −</button><span id="jobs">并发 -</span><button id="jobs-up">并发 +</button><button id="retry-llm">重试 LLM</button><span class="muted small" id="control-state"></span></div>
 <div class="log" id="decision" hidden></div>
 <h2>DAG</h2><div class="dag" id="dag"></div>
 <h2>Events</h2><div class="log" id="log"></div>
@@ -421,6 +424,7 @@ button[disabled]{opacity:.5;cursor:default}
   $("pause-llm").onclick = () => post({ action: lanes && lanes.llm.paused ? "resume" : "pause", lane: "llm" }).then(pollState);
   $("pause-static").onclick = () => post({ action: lanes && lanes.static.paused ? "resume" : "pause", lane: "static" }).then(pollState);
   $("jobs-up").onclick = () => post({ action: "jobs", lane: "llm", value: (lanes ? lanes.llm.jobs : 1) + 1 }).then(pollState);
+  $("retry-llm").onclick = () => post({ action: "retry" }).then(pollState);
   $("jobs-down").onclick = () => post({ action: "jobs", lane: "llm", value: Math.max(1, (lanes ? lanes.llm.jobs : 1) - 1) }).then(pollState);
   const pollState = async () => {
     const r = await fetch("/state"); if (!r.ok) return; const s = await r.json();
