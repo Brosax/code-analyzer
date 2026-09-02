@@ -756,7 +756,7 @@ def test_the_tree_is_the_verified_spine_in_boot_order(tmp_path: Path, settings) 
     assert route["api"] == "openai-completions" and route["reasoning"] == "off"
     # Ollama ignores max_completion_tokens; the completion budget is only a
     # budget if the cap really reaches the server.
-    assert route["compat"] == {"maxTokensField": "max_tokens"}
+    assert route["compat"] == {"maxTokensField": "max_tokens", "supportsDeveloperRole": False}
     [model] = route["models"]
     assert model["id"] == "qwen3.6-27b" and model["contextWindow"] == 32768 and model["maxTokens"] == 800
     # "off" carrying "none" is what Ollama's /v1 honours; the other levels are

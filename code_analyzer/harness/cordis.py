@@ -380,7 +380,12 @@ def _spine(settings: dict[str, Any], session_root: Path) -> list[dict[str, Any]]
                 # pi-ai sends the newer max_completion_tokens unless told
                 # otherwise; Ollama honours only max_tokens and otherwise
                 # generates unbounded (verified: 2495 tokens past a 1200 cap).
-                "compat": {"maxTokensField": "max_tokens"},
+                # The system prompt goes as role "system", not OpenAI's newer
+                # "developer": every OpenAI-compatible endpoint accepts the
+                # former, and a GLM served through a relay answered the latter
+                # with HTTP 400 "角色信息不正确" on 27 of 30 requests (verified
+                # 2026-09-02 through a logging proxy).
+                "compat": {"maxTokensField": "max_tokens", "supportsDeveloperRole": False},
                 "models": [entry],
             }}},
         },
