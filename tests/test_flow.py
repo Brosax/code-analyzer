@@ -56,7 +56,8 @@ def test_the_skeleton_comes_from_the_config_and_starts_pending() -> None:
     # in a different place depending on which front end is looking.
     assert producers == [name for name in PRODUCER_ORDER if name in set(producers)]
     assert all(node.state == "pending" for node in flow.nodes.values())
-    assert "audit" not in flow.nodes
+    # The correlation step emits events now, so it is drawn like every other phase.
+    assert "audit" in flow.nodes
 
 
 def test_a_disabled_phase_says_so_instead_of_waiting_forever() -> None:
@@ -78,7 +79,7 @@ def test_the_llm_lane_is_absent_when_the_layer_is_off() -> None:
 @pytest.mark.parametrize(
     "status,state",
     [
-        ("completed", "success"), ("partial", "failed"), ("timed_out", "failed"),
+        ("completed", "success"), ("partial", "partial"), ("timed_out", "failed"),
         ("failed", "failed"), ("interrupted", "failed"),
         # A tool that is absent or too old produced no evidence; that is a
         # failure to deliver, not a step still waiting its turn.
@@ -121,7 +122,10 @@ def test_counters_count_units_and_only_parse_the_denominator() -> None:
     assert (node.done, node.total) == (3, None)
     assert node.counted == "已完成 3 单元"
 
-    flow.apply(_event("progress", "running", "tool 1/3 cppcheck: unit 3/4 fallback: scanning 8 files"))
+    flow.apply(_event(
+        "unit", "started", "scanning 8 files", tool="cppcheck", unit="fallback",
+        data={"index": 3, "total": 4, "label": "fallback"},
+    ))
     assert (node.done, node.total) == (3, 4)
     assert node.counted == "单元 3/4"
 
@@ -134,8 +138,8 @@ def test_counters_count_units_and_only_parse_the_denominator() -> None:
 def test_a_denominator_hint_only_ever_ratchets_up() -> None:
     flow = RunFlow(_config())
 
-    flow.apply(_event("progress", "running", "tool 1/3 splint: unit 1/57 src/a.c: scanning"))
-    flow.apply(_event("progress", "running", "tool 1/3 splint: unit 2/9 src/b.c: scanning"))
+    flow.apply(_event("unit", "started", "scanning", tool="splint", unit="u1", data={"index": 1, "total": 57, "label": "src/a.c"}))
+    flow.apply(_event("unit", "started", "scanning", tool="splint", unit="u2", data={"index": 2, "total": 9, "label": "src/b.c"}))
 
     assert flow.nodes["splint"].total == 57
 
@@ -148,7 +152,7 @@ def test_heartbeats_never_move_a_counter() -> None:
         flow.apply(_event(
             "unit", "heartbeat",
             "heartbeat; elapsed 12.3s; total budget remaining 900.1s; prompt tokens spent 41234",
-            tool="llm-security", unit="u1",
+            tool="llm-security", unit="u1", data={"elapsed": 12.3, "prompt_tokens_estimated": 41234},
         ))
 
     node = flow.nodes["llm-security"]
@@ -176,7 +180,7 @@ def test_an_interrupted_run_settles_every_node_that_was_still_running() -> None:
     flow.apply(_event("analysis", "interrupted", "run interrupted", progress=1.0))
 
     assert flow.nodes["cppcheck"].state == "failed"
-    assert flow.nodes["report"].state == "failed"
+    assert flow.nodes["dashboard"].state == "failed"
 
 
 def test_the_llm_phase_settles_the_scanners_it_left_running() -> None:
@@ -238,9 +242,12 @@ def test_the_method_is_what_the_row_shows() -> None:
 
 def test_a_finished_scanner_reports_its_findings() -> None:
     flow = RunFlow(_config(llm__enabled=True))
-    flow.apply(_event("progress", "running", "llm: planned 2 scan units for 6 scanner(s)"))
+    flow.apply(_event("llm", "planned", "planned 2 scan units for 6 scanner(s)", data={"units": 2, "scanners": 6, "tasks": 12}))
     for index in range(2):
-        flow.apply(_event("unit", "completed", "completed; 4 finding(s)", tool="llm-security", unit=f"u{index}"))
+        flow.apply(_event(
+            "unit", "completed", "completed; 4 finding(s)", tool="llm-security", unit=f"u{index}",
+            data={"index": index + 1, "total": 12, "finding_count": 4},
+        ))
 
     row = _row(flow, "llm-security")
     assert flow.nodes["llm-security"].state == "success"
@@ -251,7 +258,7 @@ def test_the_token_budget_never_appears_without_its_caveat() -> None:
     flow = RunFlow(_config(llm__enabled=True))
     flow.apply(_event(
         "unit", "heartbeat", "heartbeat; elapsed 1.0s; prompt tokens spent 41234",
-        tool="llm-security", unit="u1",
+        tool="llm-security", unit="u1", data={"prompt_tokens_estimated": 41234},
     ))
 
     detail = flow.headline(now=0.0).detail
@@ -274,7 +281,10 @@ def test_untrusted_paths_cannot_reach_a_row_intact() -> None:
         "unit", "started", "scanning src/\x1b[2Jevil\nname.c (high)",
         tool="llm-security", unit="src/\x1b[2Jevil\nname.c",
     ))
-    flow.apply(_event("progress", "running", "tool 1/3 cppcheck: unit 1/2 \x1b[2Jfallback: scanning"))
+    flow.apply(_event(
+        "unit", "started", "scanning", tool="cppcheck", unit="fallback",
+        data={"index": 1, "total": 2, "label": "\x1b[2Jfallback"},
+    ))
 
     for row in _rows(flow):
         for field in (row.label, row.detail, row.glyph, row.spine):
@@ -322,7 +332,8 @@ def test_a_real_run_reaches_full_counters(tmp_path: Path) -> None:
     assert flow.nodes["discovery"].detail.startswith("1 文件")
     assert flow.percent == 1.0
     assert flow.run_name == result.report_directory.name
-    assert flow.nodes["report"].state == "success"
+    assert flow.nodes["dashboard"].state == "success"
+    assert flow.nodes["audit"].state == "success"
 
 
 def test_the_flow_module_never_imports_a_ui(tmp_path: Path) -> None:

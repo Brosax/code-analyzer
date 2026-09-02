@@ -38,7 +38,7 @@ def test_graph_is_a_projection_of_the_manifest_and_nothing_else() -> None:
     assert ("discovery", "cppcheck") in edges and ("llm-memory-safety", "review") in edges
     assert ("review", "audit") in edges and ("export", "dashboard") in edges
     # Every status word the ladder can produce projects onto exactly four states.
-    assert set(NODE_STATES.values()) == {"success", "failed", "running", "pending"}
+    assert set(NODE_STATES.values()) == {"success", "partial", "failed", "running", "pending"}
     for word in ("completed", "partial", "timed_out", "failed", "interrupted", "unscheduled",
                  "not_requested", "missing", "incompatible", "not_applicable", "running"):
         assert word in NODE_STATES

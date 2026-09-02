@@ -28,9 +28,9 @@ from urllib.parse import urlsplit
 
 from .analysis import AnalysisEvent, AnalysisRequest, CancellationToken, run_analysis
 from .errors import UserError
-from .events import RUN_DIRECTORY_PHASE
+from .events import RUN_DIRECTORY_PHASE, clean_data
 from .persist import json_bytes
-from .status import EXIT_INTERRUPTED, NODE_STATES, PHASE_NODES
+from .status import EXIT_INTERRUPTED, NODE_STATES, PHASE_NODES, STATE_GLYPHS
 
 BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -106,22 +106,41 @@ class LiveRun:
         with self._lock:
             self.report_directory = report_directory
 
-    def events_since(self, index: int) -> tuple[list[dict[str, Any]], int]:
-        """Events from the file when it exists, else from the in-process buffer."""
+    def events_since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        """Events after ``cursor``, from the file when it exists, else from the buffer.
+
+        The cursor is a byte offset into ``events.jsonl`` once the file exists,
+        so each poll reads only the tail (a real run's log runs to hundreds of
+        megabytes).  Before the file exists it is ``-(n + 1)`` for ``n`` events
+        already served from the in-process buffer; the switch-over skips those
+        ``n`` lines of the file, which are the same events.
+        """
         with self._lock:
             directory = self.report_directory
             buffered = list(self._buffer)
         path = directory / EVENTS_FILENAME if directory is not None else None
         if path is not None and path.is_file():
-            lines = path.read_text(encoding="utf-8").splitlines()
+            offset = cursor if cursor >= 0 else 0
+            skip = -(cursor + 1) if cursor < 0 else 0
             events = []
-            for line in lines[index:]:
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            return events, len(lines)
-        return buffered[index:], len(buffered)
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                while True:
+                    line = stream.readline()
+                    if not line or not line.endswith(b"\n"):
+                        # A partial last line belongs to the next poll.
+                        break
+                    offset += len(line)
+                    if skip:
+                        skip -= 1
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            return events, offset
+        served = -(cursor + 1) if cursor < 0 else 0
+        return buffered[served:], -(len(buffered) + 1)
 
     def manifest(self) -> dict[str, Any] | None:
         directory = self.report_directory
@@ -142,7 +161,8 @@ class LiveRun:
 
 def _event_dict(event: AnalysisEvent) -> dict[str, Any]:
     return {"phase": event.phase, "status": event.status, "message": event.message, "tool": event.tool,
-            "unit": event.unit, "progress": event.progress, "timestamp": event.timestamp, "stream": event.stream}
+            "unit": event.unit, "progress": event.progress, "timestamp": event.timestamp, "stream": event.stream,
+            "data": clean_data(event.data)}
 
 
 def make_handler(run: LiveRun, page: str) -> type[BaseHTTPRequestHandler]:
@@ -192,10 +212,10 @@ def make_handler(run: LiveRun, page: str) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            index = 0
+            index = -1
             try:
                 while True:
-                    events, index = run.events_since(index) if index == 0 else run.events_since(index)
+                    events, index = run.events_since(index)
                     for event in events:
                         self.wfile.write(b"data: " + json_bytes(event).replace(b"\n", b" ") + b"\n\n")
                     self.wfile.flush()
@@ -237,7 +257,7 @@ def serve(
         raise UserError("serve needs a report directory or --analyze SOURCE")
     cancellation = CancellationToken() if analyze is not None else None
     run = LiveRun(report_directory, cancellation=cancellation)
-    server = ThreadingHTTPServer((BIND_HOST, port), make_handler(run, PAGE))
+    server = ThreadingHTTPServer((BIND_HOST, port), make_handler(run, page()))
     server.daemon_threads = True
     bound_port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, name="code-analyzer-serve", daemon=True)
@@ -273,12 +293,17 @@ def serve(
         server.server_close()
 
 
+def page() -> str:
+    """The live page with the shared state glyphs injected, so the two front ends agree."""
+    return PAGE.replace("__STATE_GLYPHS__", json.dumps(STATE_GLYPHS, ensure_ascii=False))
+
+
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>code-analyzer · live</title>
 <style>
 :root{color-scheme:light dark;--bg:#f3efe7;--surface:#fdfcf9;--ink:#221d15;--muted:#6d6659;--line:#d9d2c2;
---ok:#24855d;--bad:#b23a1e;--run:#a57b00;--pend:#8a8478;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+--ok:#24855d;--part:#c26a1b;--bad:#b23a1e;--run:#a57b00;--pend:#8a8478;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(prefers-color-scheme:dark){:root{--bg:#17140f;--surface:#201c15;--ink:#efe9dc;--muted:#a89e8c;--line:#3a342a}}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:1.2rem 1.4rem}
@@ -290,7 +315,7 @@ button{font:inherit;padding:.3rem .8rem;border:1px solid var(--line);background:
 button[disabled]{opacity:.5;cursor:default}
 .dag{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.6rem}
 .node{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--pend);border-radius:4px;padding:.5rem .7rem;font-family:var(--mono);font-size:.82rem}
-.node.success{border-left-color:var(--ok)}.node.failed{border-left-color:var(--bad)}.node.running{border-left-color:var(--run)}
+.node.success{border-left-color:var(--ok)}.node.partial{border-left-color:var(--part)}.node.failed{border-left-color:var(--bad)}.node.running{border-left-color:var(--run)}
 .node b{display:block;font-weight:600}.node span{color:var(--muted)}
 .log{background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:.6rem .8rem;max-height:22rem;overflow:auto;font-family:var(--mono);font-size:.8rem;white-space:pre-wrap}
 .muted{color:var(--muted)}.small{font-size:.8rem}a{color:inherit}
@@ -305,8 +330,8 @@ button[disabled]{opacity:.5;cursor:default}
 (() => {
   const $ = id => document.getElementById(id);
   const line = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = String(text); return n; };
-  // Twin of STATE_GLYPHS in status.py; keep the two in step.
-  const glyph = { success: "✓", failed: "✕", running: "●", pending: "○" };
+  // Injected from status.STATE_GLYPHS by serve.page(): one vocabulary for both front ends.
+  const glyph = __STATE_GLYPHS__;
   let progress = 0, ended = false;
   const drawGraph = async () => {
     const r = await fetch("/graph"); if (!r.ok) return;
@@ -337,7 +362,7 @@ button[disabled]{opacity:.5;cursor:default}
     const when = e.timestamp ? new Date(e.timestamp * 1000).toISOString().slice(11, 19) : "";
     log.append(line("div", "", when + "  " + e.phase + "/" + e.status + (e.tool ? "  " + e.tool : "") + (e.unit ? "/" + e.unit : "") + "  " + e.message));
     log.scrollTop = log.scrollHeight;
-    if (e.phase === "tool" || e.phase === "llm" || e.phase === "unit" || e.phase === "review" || e.phase === "audit" || e.phase === "export") drawGraph();
+    if (["tool", "llm", "unit", "units", "review", "audit", "export", "report", "build_context"].includes(e.phase)) drawGraph();
   };
   es.addEventListener("end", () => { ended = true; es.close(); $("cancel").disabled = true; drawGraph(); pollState(); });
   drawGraph(); pollState(); setInterval(() => { if (!ended) { drawGraph(); pollState(); } }, 3000);

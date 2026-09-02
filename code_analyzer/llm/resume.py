@@ -152,7 +152,7 @@ def run_resume(
                 prompts=prompts,
                 cache=_Cache(config, run_dir),
                 progress=progress,
-                unit_event=lambda *_args: None,
+                unit_event=lambda *_args, **_kwargs: None,
                 output_event=None,
                 cancelled=cancelled,
                 open_runtime=open_runtime,

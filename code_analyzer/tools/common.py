@@ -8,6 +8,11 @@ from typing import Any
 
 from ..events import EVENTS_FILE
 
+# Where the runner's narrative log lives, relative to the run directory; the
+# writer is runlog.RunLogger, named here so the artifact index can skip it
+# without importing the writer.
+RUN_LOG_FILE = "logs/runner.log"
+
 # The vocabulary of analyzer *diagnostics* -- lines that say the tool could not
 # do its job, as opposed to findings about the code.  Shared by the review
 # layer (which files them apart from findings) and the adapters (which use
@@ -133,12 +138,14 @@ def artifact_index(
     """Index evidence files under a report directory.
 
     Skips the manifest and writer temporaries (both the runner's and the
-    recovery command's), the run-level event log (still being appended to
-    after the final index is taken, so its hash could never be verified) and
-    the per-unit analyzer scratch directories (cppcheck ``build/``, splint
-    ``tmp/``), which are caches, not evidence.  The optional cache avoids
-    re-hashing files whose size and mtime are unchanged between successive
-    index rebuilds within one run.
+    recovery command's), the two run-level logs (``events.jsonl`` and
+    ``logs/runner.log`` are still being appended to after the final index is
+    taken -- the last line of each is the run's own verdict -- so their hash
+    could never be verified) and the per-unit analyzer scratch directories
+    (cppcheck ``build/``, splint ``tmp/``), which are caches, not evidence.
+    Both logs still travel in the shareable export, as of the moment it was
+    made.  The optional cache avoids re-hashing files whose size and mtime are
+    unchanged between successive index rebuilds within one run.
     """
     result = []
     for path in sorted(run_dir.rglob("*")):
@@ -147,7 +154,7 @@ def artifact_index(
         if path.name in {"manifest.json", ".manifest.json.tmp"} or path.name.startswith(".recover-"):
             continue
         relative = path.relative_to(run_dir)
-        if relative.as_posix() == EVENTS_FILE:
+        if relative.as_posix() in {EVENTS_FILE, RUN_LOG_FILE}:
             continue
         parts = relative.parts
         if len(parts) >= 5 and parts[0] == "tools" and parts[3] in {"build", "tmp"}:

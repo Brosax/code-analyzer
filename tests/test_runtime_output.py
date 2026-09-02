@@ -133,7 +133,7 @@ def test_adapters_apply_fixed_live_output_filters(tmp_path: Path) -> None:
     flaw_events: list[tuple[str, str]] = []
     flawfinder.run(
         str(flaw), source, flaw_run, inventory, config,
-        unit_event=lambda _unit, status, message, _value: flaw_events.append((status, message)),
+        unit_event=lambda _unit, status, message, _value, **_kwargs: flaw_events.append((status, message)),
         output_event=lambda unit, stream, line: flaw_output.append((unit, stream, line)),
     )
     assert [(stream, line) for _, stream, line in flaw_output] == [("stderr", "flaw diagnostic")]

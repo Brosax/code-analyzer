@@ -11,21 +11,27 @@ EXIT_PARTIAL = 10
 EXIT_FAILED = 20
 EXIT_INTERRUPTED = 130
 
-# Every word the status ladder can produce, projected onto the four states a
-# UI draws.  The projection is a view; nothing persists the four-state form.
+# Every word the status ladder can produce, projected onto the five states a
+# UI draws.  The projection is a view; nothing persists the five-state form.
 # Both front ends read it from here: `serve` projects manifest.json, the TUI
 # folds the event stream, and they must not disagree about what a word means.
+# "partial" is its own state on purpose: a tool that ran but analysed only
+# some of its units is neither a success nor a failure, and drawing it as
+# either hides the one thing the operator needs to know.
 NODE_STATES: dict[str, str] = {
     "completed": "success", "complete": "success",
-    "partial": "failed", "timed_out": "failed", "failed": "failed", "interrupted": "failed",
+    "partial": "partial",
+    "timed_out": "failed", "failed": "failed", "interrupted": "failed",
     "incompatible": "failed", "missing": "failed",
-    "running": "running", "pending": "pending",
-    "unscheduled": "pending", "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
+    "running": "running", "paused": "running", "pending": "pending",
+    "unscheduled": "pending", "skipped": "pending",
+    "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
 }
+STATES: tuple[str, ...] = ("success", "partial", "failed", "running", "pending")
 PHASE_NODES: tuple[str, ...] = ("discovery", "review", "audit", "export", "dashboard")
-# The twin of the `glyph` object in serve.py's inline page script; a change
-# here without a change there makes the two front ends draw different runs.
-STATE_GLYPHS: dict[str, str] = {"success": "✓", "failed": "✕", "running": "●", "pending": "○"}
+# serve.py injects this object into its page script, so the two front ends
+# cannot draw different glyphs for one state.
+STATE_GLYPHS: dict[str, str] = {"success": "✓", "partial": "◐", "failed": "✕", "running": "●", "pending": "○"}
 
 
 def aggregate_units(units: list[dict[str, Any]], applicable: bool = True) -> str:

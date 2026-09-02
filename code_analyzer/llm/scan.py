@@ -74,9 +74,10 @@ def run(
     progress: Callable[[str], None] | None = None,
     *,
     cancelled: Callable[[], bool] | None = None,
-    unit_event: Callable[[str, str, str, str, float | None], None] | None = None,
+    unit_event: Callable[..., None] | None = None,
     output_event: Callable[[str, str, str, str], None] | None = None,
     open_runtime: OpenRuntime | None = None,
+    phase_event: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Run every selected scanner over every planned unit.
 
@@ -105,6 +106,13 @@ def run(
     units = list(plan["units"])
     prompts = _write_units(source, run_dir, plan, units, scanners)
     progress(f"llm: planned {len(units)} scan units for {len(scanners)} scanner(s)")
+    if phase_event is not None:
+        phase_event("planned", f"planned {len(units)} scan units for {len(scanners)} scanner(s)", {
+            "units": len(units), "scanners": len(scanners), "tasks": len(units) * len(scanners),
+            "jobs": int(settings["jobs"]), "model": str(settings.get("model") or ""),
+            "endpoint": str(settings.get("endpoint") or ""),
+            "tiers": dict((plan.get("risk") or {}).get("tiers") or {}) or None,
+        })
 
     with skills_directory() as skill_dir:
         # The runtime's own session log.  Left to its default it would be
@@ -135,7 +143,7 @@ def run(
             cancelled=cancelled,
             open_runtime=open_runtime,
         )
-        records, rounds = _rounds(state, plan, units, scanners, config, progress)
+        records, rounds = _rounds(state, plan, units, scanners, config, progress, phase_event)
 
     write_json(
         run_dir.joinpath(*replan.PLAN_PATH),
@@ -237,6 +245,7 @@ def _rounds(
     scanners: list[str],
     config: dict[str, Any],
     progress: Callable[[str], None],
+    phase_event: Callable[..., None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Round 0, then at most ``max_replan_rounds`` bounded follow-ups.
 
@@ -273,6 +282,11 @@ def _rounds(
             rounds.append(entry)
             break
         progress(f"llm: replan round {index}: {action['action']} on {len(follow_up)} unit(s)")
+        if phase_event is not None:
+            phase_event("replan", f"replan round {index}: {action['action']} on {len(follow_up)} unit(s)", {
+                "round": index, "action": action["action"], "targets": len(follow_up),
+                "rationale": str(action.get("rationale") or "")[:300],
+            })
         state.round_index = index
         records.extend(state.execute_all(follow_up))
         state.round_index = 0
@@ -555,6 +569,11 @@ class _Phase:
         self.total = 0
         self._cancel = threading.Event()
         self._ledger = threading.Lock()
+        # Units that never ran, announced once per (producer, status, reason)
+        # rather than once each: a budget that runs out with 250 000 tasks
+        # left is one fact, not 250 000 rows.
+        self._batches: dict[tuple[str, str, str], dict[str, int]] = {}
+        self._batched = 0
 
     # --- scheduling ---------------------------------------------------------
 
@@ -595,10 +614,12 @@ class _Phase:
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
         # A task with no record is one the pool never ran: interrupted, never lost.
-        return [
+        records = [
             completed.get(task[0]) or self._unstarted(task, "interrupted", "run interrupted")
             for task in tasks
         ]
+        self.flush_batches()
+        return records
 
     def execute(self, task: Task) -> dict[str, Any]:
         index, producer, unit = task
@@ -622,10 +643,10 @@ class _Phase:
         cached = self.cache.load(key)
         if cached is None:
             self.cache.miss()
-        self.progress(f"llm {index}/{self.total} {producer} {unit['path']}: {'cached' if cached else 'scanning'}")
         self.unit_event(
-            producer, unit_id, "started", f"scanning {unit['path']} ({unit['risk_tier']})",
+            producer, unit_id, "started", f"{'cached' if cached else 'scanning'} ({unit['risk_tier']})",
             (index - 1) / max(1, self.total),
+            data={**self._facts(index, unit), "cached": cached is not None},
         )
         stop = threading.Event()
         beat = threading.Thread(
@@ -795,11 +816,30 @@ class _Phase:
             return None
 
         def forward(event: dict[str, Any]) -> None:
-            kind = str(event.get("type", "event"))
-            text = str(event.get("text") or event.get("message") or event.get("name") or "")
+            kind, data = _unwrap_notification(event)
+            if kind == "assistant/chunk":
+                chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
+                if chunk.get("type") != "text" or not chunk.get("text"):
+                    return
+                text = str(chunk["text"])[:2000]
+            elif kind.startswith("tool/call"):
+                text = f"tool {data.get('name') or data.get('tool') or ''}".strip()
+            elif kind == "llm/retry":
+                failure = data.get("failure") if isinstance(data.get("failure"), dict) else {}
+                text = f"retry {data.get('retry')}/{data.get('maxRetries')}: {failure.get('code')} {failure.get('message')}"
+            else:
+                # Turn and step boundaries, usage chunks, status pings: the
+                # session log keeps them; the live pane has nothing to show.
+                return
             self.output_event(producer, unit_id, "agent", f"{kind}: {text}".strip())
 
         return forward
+
+    def _facts(self, index: int, unit: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "index": index, "total": self.total, "path": unit["path"], "tier": unit["risk_tier"],
+            "attempt": self.round_index + 1,
+        }
 
     def _heartbeat(self, stop: threading.Event, index: int, producer: str, unit: dict[str, Any]) -> None:
         started = time.monotonic()
@@ -810,8 +850,11 @@ class _Phase:
                 f"heartbeat; elapsed {elapsed:.1f}s; total budget remaining {remaining:.1f}s; "
                 f"prompt tokens spent {self.prompt_spent}"
             )
-            self.progress(f"llm {index}/{self.total} {producer} {unit['path']}: {message}")
-            self.unit_event(producer, unit["unit_id"], "heartbeat", message, None)
+            self.unit_event(producer, unit["unit_id"], "heartbeat", message, None, data={
+                **self._facts(index, unit), "elapsed": round(elapsed, 1),
+                "remaining_budget_seconds": round(remaining, 1), "prompt_tokens_estimated": self.prompt_spent,
+                "measured": dict(self.measured),
+            })
 
     def _decorate(self, record: dict[str, Any], task: Task, skill: Skill) -> dict[str, Any]:
         _index, producer, unit = task
@@ -850,9 +893,54 @@ class _Phase:
         index, producer, unit = task
         status = record["status"]
         detail = record.get("reason") or f"{record.get('finding_count', 0)} finding(s)"
-        self.progress(f"llm {index}/{self.total} {producer} {unit['path']}: {status}; {detail}")
-        self.unit_event(producer, record["id"], status, f"{status}; {detail}", index / max(1, self.total))
+        if "artifacts" in record and not record["artifacts"] and status in {"unscheduled", "interrupted"}:
+            self._tally(producer, status, str(record.get("reason") or ""), index)
+            return record
+        self.unit_event(producer, record["id"], status, f"{status}; {detail}", index / max(1, self.total), data={
+            **self._facts(index, unit), "reason": record.get("reason"),
+            "finish_reason": record.get("finish_reason") or None,
+            "finding_count": record.get("finding_count", 0), "malformed_count": record.get("malformed_count", 0),
+            "valid_report": record.get("valid_report"),
+        })
         return record
+
+    def _tally(self, producer: str, status: str, reason: str, index: int) -> None:
+        with self._ledger:
+            batch = self._batches.setdefault(
+                (producer, status, reason), {"count": 0, "first_index": index, "last_index": index}
+            )
+            batch["count"] += 1
+            batch["first_index"] = min(batch["first_index"], index)
+            batch["last_index"] = max(batch["last_index"], index)
+            self._batched += 1
+            due = self._batched % 500 == 0
+        if due:
+            # Liveness: a long avalanche still shows movement every 500 units.
+            self.flush_batches()
+
+    def flush_batches(self) -> None:
+        with self._ledger:
+            batches, self._batches = self._batches, {}
+        for (producer, status, reason), batch in batches.items():
+            self.unit_event(
+                producer, None, status, f"{batch['count']} unit(s) {status}: {reason}",
+                batch["last_index"] / max(1, self.total),
+                data={**batch, "reason": reason, "total": self.total}, phase="units",
+            )
+
+
+def _unwrap_notification(notification: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The event type and data one SDK notification carries.
+
+    A ``session.event`` notification wraps the event under ``payload.event``;
+    anything already reduced to an event is read directly.
+    """
+    payload = notification.get("payload")
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if not isinstance(event, dict):
+        event = notification
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return str(event.get("type", "") or ""), data
 
 
 def _provider_stop(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:

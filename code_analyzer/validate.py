@@ -139,7 +139,7 @@ def run_assess(
                 prompts=prompts,
                 cache=_Cache(config, run_dir),
                 progress=progress,
-                unit_event=lambda _producer, _unit, _status, _message, _value: None,
+                unit_event=lambda *_args, **_kwargs: None,
                 output_event=None,
                 cancelled=cancelled,
                 open_runtime=open_runtime,

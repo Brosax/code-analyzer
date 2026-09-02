@@ -54,7 +54,8 @@ from .config import (
 from .errors import UserError
 from .flow import WIDE_BREAKPOINT, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
-from .progress import animation_disabled_by_env, single_line
+from .progress import animation_disabled_by_env
+from .runlog import format_line
 from .tools import TOOL_NAMES
 
 TUI_FIELDS = (
@@ -72,7 +73,7 @@ TUI_FIELDS = (
 
 # Node state -> colour, and the three-step ramp the spine cell walks so a dot
 # appears to travel down the fan-out without any character changing.
-_STATE_STYLES = {"success": "green", "failed": "red", "running": "bold cyan", "pending": "dim"}
+_STATE_STYLES = {"success": "green", "partial": "yellow", "failed": "red", "running": "bold cyan", "pending": "dim"}
 _SPINE_STYLES = ("bold cyan", "cyan", "dim cyan")
 _LABEL_WIDTH = 24
 
@@ -744,11 +745,12 @@ class AnalyzerApp(App[TuiOutcome]):
 
     @staticmethod
     def _format_log_event(event: AnalysisEvent) -> str:
-        clock = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
-        tool = event.tool or event.phase
-        unit = event.unit or "-"
-        stream = event.stream or "status"
-        return f"{clock} [{tool}/{unit}][{stream}] {single_line(event.message)}"
+        # The same line logs/runner.log gets, with the operator's clock; an
+        # analyzer's raw output keeps the short stream form.
+        if event.phase == "output":
+            clock = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+            return f"{clock}  {event.tool or event.phase}/{event.unit or '-'}  [{event.stream or 'stdout'}]  {format_line(event, local=True).split('  ', 6)[-1]}"
+        return format_line(event, local=True)
 
     def _flush_log_queue(self) -> None:
         lines: list[str] = []

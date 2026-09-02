@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
-from .analysis import AnalysisEvent, CancellationToken, EventSink
+from .analysis import (
+    AnalysisEvent,
+    CancellationToken,
+    EventSink,
+    finished_data,
+    started_data,
+)
 from .audit import (
     assessment_summary,
     build_assessment,
@@ -25,6 +31,7 @@ from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
 from .doctor import verify_canary
 from .errors import UserError
+from .events import fan_out
 from .html_report import render
 from .inventory import discover, git_state, source_slug
 from .llm import scan as llm_scan
@@ -32,6 +39,7 @@ from .persist import json_bytes
 from .persist import write_json as _write_json
 from .progress import ProgressDisplay
 from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_review
+from .runlog import RunLogger
 from .sanitize import ExportError, export_shareable
 from .sarif import build_sarif, write_sarif
 from .status import overall
@@ -99,7 +107,8 @@ class _Window:
         self._lock = threading.Lock()
 
     def event(
-        self, side: int, fraction: float | None, phase: str, status: str, message: str, **fields: Any
+        self, side: int, fraction: float | None, phase: str, status: str, message: str,
+        *, data: dict[str, Any] | None = None, **fields: Any,
     ) -> None:
         """Advance one side and announce it; a None fraction reports no work."""
         with self._lock:
@@ -115,7 +124,7 @@ class _Window:
                 value = round(WINDOW_START + (WINDOW_END - WINDOW_START) * sum(
                     weight * done for weight, done in zip(self._weights, self._done, strict=True)
                 ), 6)
-            self._emit(phase, status, message, value=value, **fields)
+            self._emit(phase, status, message, value=value, data=data, **fields)
 
     def finish(self, side: int) -> None:
         """This side has no work left; the next event carries its whole share.
@@ -168,13 +177,28 @@ def analyze(
     source: Path, config: dict[str, Any], *, event_sink: EventSink | None = None
 ) -> tuple[int, Path]:
     """Terminal entry point: progress strings to stderr, structured events to the sink."""
-    sink = event_sink or (lambda _event: None)
-    sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0))
-    with ProgressDisplay(sys.stderr) as display:
-        exit_code, run_dir = _analyze(source, config, display.emit, event_sink=event_sink)
-    status = "interrupted" if exit_code == 130 else "finished"
-    sink(AnalysisEvent("analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0))
+    started = time.monotonic()
+    with RunLogger(config["run"]["log_level"]) as run_log:
+        sink = fan_out(event_sink, run_log)
+        sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0, data=started_data()))
+        with ProgressDisplay(sys.stderr) as display:
+            exit_code, run_dir = _analyze(
+                source, config, display.emit, event_sink=sink, live_events=event_sink is not None,
+            )
+        status = "interrupted" if exit_code == 130 else "finished"
+        sink(AnalysisEvent(
+            "analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0,
+            data=finished_data(_read_manifest(run_dir), exit_code, time.monotonic() - started),
+        ))
     return exit_code, run_dir
+
+
+def _read_manifest(run_dir: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _analyze(
@@ -184,9 +208,12 @@ def _analyze(
     *,
     cancellation: CancellationToken | None = None,
     event_sink: EventSink | None = None,
+    live_events: bool | None = None,
 ) -> tuple[int, Path]:
     cancellation = cancellation or CancellationToken()
-    live_events = event_sink is not None
+    # Whether a front end is listening for the analyzers' raw output lines;
+    # the log sinks alone do not want them.
+    live_events = (event_sink is not None) if live_events is None else live_events
     event_sink = event_sink or (lambda _event: None)
 
     def event(
@@ -198,9 +225,10 @@ def _analyze(
         unit: str | None = None,
         stream: str | None = None,
         value: float | None = None,
+        data: dict[str, Any] | None = None,
     ) -> None:
         event_sink(AnalysisEvent(
-            phase, status, message, tool=tool, unit=unit, stream=stream, progress=value
+            phase, status, message, tool=tool, unit=unit, stream=stream, progress=value, data=data
         ))
 
     source = source.expanduser().resolve()
@@ -228,8 +256,13 @@ def _analyze(
     if cancellation.cancelled:
         raise AnalysisCancelled()
     if compile_path is None and config["build"]["compile_database_mode"] == "auto":
+        hint = shlex.join(["code-analyzer", "compile-db", str(source)])
         progress("no valid compile database found; continuing with reduced build context")
-        progress("next step: " + shlex.join(["code-analyzer", "compile-db", str(source)]))
+        progress("next step: " + hint)
+        event(
+            "discovery", "info", "no valid compile database found; continuing with reduced build context",
+            data={"hint": hint, "degraded": degraded},
+        )
     try:
         output_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -301,8 +334,12 @@ def _analyze(
         "artifacts": [],
     }
     _save_manifest(run_dir, manifest)
-    _log(run_dir, f"run {run_id} started; {len(inventory)} source files")
-    event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=WINDOW_START)
+    event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=WINDOW_START, data={
+        "run_id": run_id, "files": len(inventory),
+        "c_files": sum(1 for item in inventory if Path(item["path"]).suffix.lower() == ".c"),
+        "compile_db_entries": len(filtered_db), "compile_db_path": str(compile_path) if compile_path else None,
+        "degraded": degraded,
+    })
 
     # From here to the join below, two threads publish into one manifest: the
     # static side owns manifest["tools"], the LLM side owns manifest["llm"].
@@ -346,9 +383,11 @@ def _analyze(
                 with manifest_lock:
                     manifest["tools"][name] = _preflight_state("missing", inventory, name, f"executable not found: {executable}")
                     save_manifest()
-                _log(run_dir, f"{name}: missing executable {executable}")
                 progress(f"{tool_prefix}: missing executable")
-                window.event(STATIC, finished_fraction, "tool", "missing", f"executable not found: {executable}", tool=name)
+                window.event(
+                    STATIC, finished_fraction, "tool", "missing", f"executable not found: {executable}",
+                    tool=name, data={"executable": executable},
+                )
                 continue
             incompatibility = _incompatibility(name, resolved)
             if incompatibility:
@@ -357,27 +396,39 @@ def _analyze(
                     manifest["tools"][name]["executable"] = resolved
                     manifest["tools"][name]["version"] = _version(name, resolved)
                     save_manifest()
-                _log(run_dir, f"{name}: incompatible: {incompatibility}")
                 progress(f"{tool_prefix}: incompatible")
-                window.event(STATIC, finished_fraction, "tool", "incompatible", incompatibility, tool=name)
+                window.event(
+                    STATIC, finished_fraction, "tool", "incompatible", incompatibility,
+                    tool=name, data={"executable": resolved, "version": manifest["tools"][name].get("version")},
+                )
                 continue
-            _log(run_dir, f"{name}: starting {resolved}")
             progress(f"{tool_prefix}: starting")
             version = _version(name, resolved)
+            tool_started = time.monotonic()
             # Persisted before the event so that whoever reacts to `tool started`
             # already finds the placeholder on disk.
             with manifest_lock:
                 manifest["tools"][name] = _running_state(inventory, name, resolved, version)
                 save_manifest()
-            window.event(STATIC, started_fraction, "tool", "started", f"{name} starting", tool=name)
+            window.event(STATIC, started_fraction, "tool", "started", f"{name} starting", tool=name, data={
+                "executable": resolved, "version": version,
+                "settings": {key: value for key, value in config["tools"][name].items() if key != "executable"},
+            })
             def unit_progress(message: str, prefix: str = tool_prefix, tool_name: str = name) -> None:
                 progress(f"{prefix}: {message}")
             def structured_unit(
-                unit: str, status: str, message: str, value: float | None,
-                tool_name: str = name, index: int = tool_index,
+                unit: str | None, status: str, message: str, value: float | None,
+                data: dict[str, Any] | None = None, *, phase: str = "unit",
+                tool_name: str = name, index: int = tool_index, prefix: str = tool_prefix,
             ) -> None:
                 fraction = None if value is None else (index - 1 + value) / tool_count
-                window.event(STATIC, fraction, "unit", status, message, tool=tool_name, unit=unit)
+                window.event(STATIC, fraction, phase, status, message, tool=tool_name, unit=unit, data=data)
+                # The CLI's line is derived here, in the wording it always had,
+                # so the adapters emit each fact once.
+                if phase == "units":
+                    progress(f"{prefix}: {message}")
+                elif data and "index" in data and status != "info":
+                    progress(f"{prefix}: unit {data['index']}/{data['total']} {data.get('label', unit)}: {message}")
             def streamed_output(unit: str, stream: str, message: str, tool_name: str = name) -> None:
                 event("output", "running", message, tool=tool_name, unit=unit, stream=stream)
             context = RunContext(
@@ -399,11 +450,11 @@ def _analyze(
                 manifest["tools"][name] = result
                 save_manifest()
             interrupted = result["status"] == "interrupted"
-            _log(run_dir, f"{name}: {result['status']}")
             progress(f"{tool_prefix}: finished with status {result['status']}")
             window.event(
                 STATIC, finished_fraction, "tool", result["status"],
                 f"{name} finished with status {result['status']}", tool=name,
+                data=_tool_summary(result, resolved, version, time.monotonic() - tool_started),
             )
         # A run with no requested tools still has to hand the static weight on,
         # or the window could never reach its end.
@@ -411,33 +462,51 @@ def _analyze(
 
     def run_llm() -> None:
         progress("llm: starting semantic scan")
+        llm_settings = config["llm"]
+        llm_started = time.monotonic()
         with manifest_lock:
-            manifest["llm"] = llm_scan.running(config["llm"])
+            manifest["llm"] = llm_scan.running(llm_settings)
             save_manifest()
-        window.event(LLM, 0.0, "llm", "started", "starting LLM semantic scan")
-        def llm_unit(producer: str, unit: str, status: str, message: str, value: float | None) -> None:
-            window.event(LLM, value, "unit", status, message, tool=producer, unit=unit)
+        window.event(LLM, 0.0, "llm", "started", "starting LLM semantic scan", data={
+            "model": llm_settings.get("model"), "endpoint": llm_settings.get("endpoint"),
+            "jobs": llm_settings.get("jobs"), "scanners": list(llm_settings.get("scanners") or []),
+        })
+        def llm_unit(
+            producer: str, unit: str | None, status: str, message: str, value: float | None,
+            data: dict[str, Any] | None = None, *, phase: str = "unit",
+        ) -> None:
+            window.event(LLM, value, phase, status, message, tool=producer, unit=unit, data=data)
+            if phase == "units":
+                progress(f"llm {producer}: {message}")
+            elif data and "index" in data:
+                progress(f"llm {data['index']}/{data['total']} {producer} {data.get('path', unit)}: {message}")
+        def llm_phase(status: str, message: str, data: dict[str, Any] | None = None) -> None:
+            window.event(LLM, None, "llm", status, message, data=data)
         def llm_output(producer: str, unit: str, stream: str, message: str) -> None:
             event("output", "running", message, tool=producer, unit=unit, stream=stream)
         try:
             record = llm_scan.run(
                 source, run_dir, inventory, config, progress,
-                cancelled=cancellation.is_cancelled, unit_event=llm_unit,
+                cancelled=cancellation.is_cancelled, unit_event=llm_unit, phase_event=llm_phase,
                 output_event=llm_output if live_events else None,
             )
         except InterruptedError:
-            record = llm_scan.failed(config["llm"], "run interrupted")
+            record = llm_scan.failed(llm_settings, "run interrupted")
             record["status"] = "interrupted"
         except Exception as exc:
-            record = llm_scan.failed(config["llm"], f"llm phase failure: {exc}")
+            record = llm_scan.failed(llm_settings, f"llm phase failure: {exc}")
         with manifest_lock:
             manifest["llm"] = record
             save_manifest()
-        _log(run_dir, f"llm: {record['status']}")
         progress(f"llm: finished with status {record['status']}")
         window.event(
             LLM, 1.0, "llm", record["status"],
             f"LLM scan finished with status {record['status']}",
+            data={
+                "duration_seconds": round(time.monotonic() - llm_started, 3), "reason": record.get("reason"),
+                "planned_units": record.get("planned_units"), "unit_counts": record.get("unit_counts"),
+                "budget": record.get("budget"), "cache": record.get("cache"),
+            },
         )
 
     # The two sides share only the manifest, the event sink and the
@@ -475,7 +544,10 @@ def _analyze(
         "changed": sorted(path for path in before_by_path.keys() & after_by_path.keys() if before_by_path[path] != after_by_path[path]),
     }
     stable = not any(changes.values())
-    event("stability", "finished", "source is stable" if stable else "source changed during analysis", value=0.85)
+    event(
+        "stability", "finished", "source is stable" if stable else "source changed during analysis", value=0.85,
+        data={"stable": stable, "changes": {key: len(value) for key, value in changes.items()}},
+    )
     manifest["source_inventory"]["stable"] = stable
     manifest["source_inventory"]["changes"] = changes
     # Compute the intended final state before deriving and exporting reports,
@@ -500,9 +572,8 @@ def _analyze(
             manifest["review"].update({"status": "failed", "error": str(exc)})
             if exit_code in {0, 1}:
                 manifest["status"], manifest["exit_code"] = "partial", 10
-            _log(run_dir, f"review derivation failed: {exc}")
             progress("review derivation failed; native evidence was retained")
-            event("review", "failed", str(exc), value=0.92)
+            event("review", "failed", str(exc), value=0.92, data={"error": str(exc)})
         else:
             review_status = review_summary.get("report_integrity", {}).get("status", "complete")
             manifest["review"].update({
@@ -513,23 +584,34 @@ def _analyze(
             if review_status == "partial" and manifest["exit_code"] in {0, 1}:
                 manifest["status"], manifest["exit_code"] = "partial", 10
                 manifest["gate"]["triggered"] = False
-            _log(run_dir, f"review completed; {review_summary['total_findings']} findings")
-            event("review", "finished", f"review completed; {review_summary['total_findings']} findings", value=0.92)
+            event(
+                "review", "finished", f"review completed; {review_summary['total_findings']} findings", value=0.92,
+                data={
+                    "findings": review_summary["total_findings"], "diagnostics": review_summary["total_diagnostics"],
+                    "integrity": review_status,
+                },
+            )
             # Deterministic and zero-model, so it belongs on the spine: the
             # static-only / llm-only / both split is available without assess.
             try:
                 write_sarif(run_dir, build_sarif(review_summary, manifest))
             except Exception as exc:
-                _log(run_dir, f"SARIF export failed: {exc}")
+                event("sarif", "failed", f"SARIF export failed: {exc}", data={"error": str(exc)})
+            else:
+                event("sarif", "finished", "SARIF written", data={"artifact": "review/summary.sarif"})
+            event("audit", "started", "correlating findings across producers")
             try:
                 assessment = build_assessment(review_summary)
                 write_assessment(run_dir, assessment)
             except Exception as exc:
                 manifest["audit"] = {"status": "failed", "error": str(exc), "path": None}
-                _log(run_dir, f"correlation failed: {exc}")
+                event("audit", "failed", f"correlation failed: {exc}", data={"error": str(exc)})
             else:
                 manifest["audit"] = {**assessment_summary(assessment), "error": None}
-                _log(run_dir, f"correlation completed; {manifest['audit']['candidates']} candidates")
+                event(
+                    "audit", "finished", f"correlation completed; {manifest['audit']['candidates']} candidates",
+                    data={"candidates": manifest["audit"]["candidates"], "artifact": "audit/assessment.json"},
+                )
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     gate_includes_llm = bool(config["review"]["gate_includes_llm"])
@@ -551,12 +633,11 @@ def _analyze(
             )
         except (ExportError, OSError, ValueError, json.JSONDecodeError) as exc:
             manifest["export"].update({"status": "failed", "archive": None, "error": str(exc)})
-            _log(run_dir, f"shareable export failed: {exc}")
             status, exit_code = overall(manifest["tools"], stable, "failed", manifest["review"]["status"])
             manifest["status"], manifest["exit_code"] = status, exit_code
             manifest["gate"]["triggered"] = False
             progress("shareable export failed; private evidence was retained")
-            event("export", "failed", str(exc), value=0.98)
+            event("export", "failed", str(exc), value=0.98, data={"error": str(exc)})
         else:
             status, exit_code = overall(
                 manifest["tools"], stable, manifest["export"]["status"], manifest["review"]["status"]
@@ -567,20 +648,25 @@ def _analyze(
                 manifest["gate"]["triggered"] = False
             manifest["status"], manifest["exit_code"] = status, exit_code
             export_message = f"shareable export {manifest['export']['status']}"
-            _log(run_dir, export_message)
             progress(export_message)
-            event("export", "finished", export_message, value=0.98)
+            event("export", "finished", export_message, value=0.98, data={
+                "status": manifest["export"]["status"], "archive": manifest["export"].get("archive"),
+                "omitted": len(manifest["export"].get("omitted_artifacts") or []),
+            })
     elif exit_code == 130 and config["run"]["shareable_export"]:
         manifest["export"].update({"status": "failed", "archive": None, "error": "run interrupted"})
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
+    event("report", "started", "rendering the offline dashboard")
     (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
     manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     save_manifest()
+    event("report", "finished", "index.html written", data={
+        "artifact": "index.html", "size": (run_dir / "index.html").stat().st_size,
+    })
     try:
         _update_latest(run_dir.parent, manifest)
     except OSError as exc:
-        _log(run_dir, f"latest.json publication failed: {exc}")
         if manifest["exit_code"] in {0, 1}:
             manifest["status"], manifest["exit_code"] = "partial", 10
             manifest["gate"]["triggered"] = False
@@ -589,6 +675,9 @@ def _analyze(
         manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
         save_manifest()
         progress("latest.json publication failed; unique run evidence was retained")
+        event("publish", "failed", f"latest.json publication failed: {exc}", data={"error": str(exc)})
+    else:
+        event("publish", "finished", "latest.json updated", data={"path": str(run_dir.parent / "latest.json")})
     progress(f"run finished: status {manifest['status']}, exit code {manifest['exit_code']}")
     return int(manifest["exit_code"]), run_dir
 
@@ -631,10 +720,13 @@ def _finish_interrupted(
         _update_latest(run_dir.parent, manifest)
     except OSError as exc:
         manifest["publication_error"] = str(exc)
-        _log(run_dir, f"latest.json publication failed: {exc}")
+        event("publish", "failed", f"latest.json publication failed: {exc}", data={"error": str(exc)})
         _save_manifest(run_dir, manifest)
     progress("run finished: status interrupted, exit code 130")
-    event("analysis", "interrupted", "run safely stopped; partial evidence retained", value=1.0)
+    event(
+        "analysis", "interrupted", "run safely stopped; partial evidence retained", value=1.0,
+        data=finished_data(manifest, 130, None),
+    )
     return 130, run_dir
 
 
@@ -682,9 +774,26 @@ def _save_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     temporary.replace(target)
 
 
-def _log(run_dir: Path, message: str) -> None:
-    with (run_dir / "logs" / "runner.log").open("a", encoding="utf-8") as stream:
-        stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " " + message + "\n")
+def _tool_summary(result: dict[str, Any], executable: str, version: str | None, duration: float) -> dict[str, Any]:
+    """What the tool's terminal event carries: the roll-up a reader wants first."""
+    units = result.get("units") or []
+    reasons: dict[str, int] = {}
+    missing: dict[str, int] = {}
+    for unit in units:
+        cls = unit.get("failure_class")
+        if cls:
+            reasons[cls] = reasons.get(cls, 0) + 1
+        for name in (unit.get("diagnosis") or {}).get("missing_includes") or []:
+            missing[name] = missing.get(name, 0) + 1
+    top_missing = sorted(missing.items(), key=lambda item: (-item[1], item[0]))[:8]
+    return {
+        "duration_seconds": round(duration, 3), "executable": executable, "version": version,
+        "reason": result.get("reason"), "unit_counts": result.get("unit_counts"),
+        "coverage": result.get("coverage"),
+        "top_reasons": {key: reasons[key] for key in sorted(reasons, key=lambda key: -reasons[key])} or None,
+        "top_missing": [f"{name}×{count}" for name, count in top_missing] or None,
+        "distinct_missing": len(missing) or None,
+    }
 
 
 def _inventory_digest(inventory: list[dict[str, Any]]) -> str:

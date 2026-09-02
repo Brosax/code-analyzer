@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..compile_db import splint_flags
 from ..process import run_process
+from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
 from .common import attach_artifacts, is_diagnostic, output_room, unit_outcome
@@ -115,7 +116,7 @@ def run(
     output_event: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
-    unit_event = unit_event or (lambda _unit, _status, _message, _progress: None)
+    unit_event = unit_event or (lambda *_args, **_kwargs: None)
     c_files = [item["path"] for item in inventory if Path(item["path"]).suffix.lower() == ".c"]
     by_file: dict[str, list[dict[str, Any]]] = {}
     for entry in filtered_db:
@@ -167,15 +168,15 @@ def run(
     def is_cancelled() -> bool:
         return cancel.is_set() or (cancelled is not None and cancelled())
 
+    total = max(1, len(plans))
+
     def execute(plan: Plan) -> tuple[int, dict[str, Any], list[str]]:
         index, unit_id, relative, flags, evidence_context = plan
         if is_cancelled():
-            unit_event(unit_id, "interrupted", "run interrupted", index / max(1, len(plans)))
+            # Announced once for the whole batch after the pool drains.
             return index, _unstarted(unit_id, relative, "interrupted", "run interrupted", evidence_context), []
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            progress(f"unit {index}/{len(plans)} {relative}: unscheduled (budget exhausted)")
-            unit_event(unit_id, "unscheduled", "total budget exhausted", index / max(1, len(plans)))
             return index, _unstarted(unit_id, relative, "unscheduled", "total budget exhausted", evidence_context), []
         directory = run_dir / "tools" / "splint" / unit_id
         directory.mkdir(parents=True, exist_ok=True)
@@ -183,27 +184,29 @@ def run(
         tmp.mkdir(exist_ok=True)
         stdout, stderr, report = directory / "stdout.raw", directory / "stderr.raw", directory / "report.csv"
         unit_timeout = min(per_tu, max(0.001, remaining))
-        progress(f"unit {index}/{len(plans)} {relative}: scanning")
-        unit_event(unit_id, "started", f"scanning {relative}", (index - 1) / max(1, len(plans)))
         argv = [
             executable, "+nof", *options, "+unixlib", "+showsummary", "+its4mostrisky", "+its4veryrisky",
             "+its4risky", "+its4moderate", "+its4low", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report),
             *flags, "./" + relative,
         ]
+        facts = {"index": index, "total": total, "label": relative, "path": relative}
+        unit_event(unit_id, "started", "scanning", (index - 1) / total, data={
+            **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3),
+            "attempt": 1, "evidence_context": evidence_context,
+        })
 
         def beat(elapsed: float) -> None:
             total_remaining = max(0.0, deadline - time.monotonic())
-            message = (
-                f"unit {index}/{len(plans)} {relative}: heartbeat; elapsed {elapsed:.1f}s; "
-                f"unit timeout {unit_timeout:.1f}s; total budget remaining {total_remaining:.1f}s"
-            )
-            progress(message)
             unit_event(
                 unit_id,
                 "heartbeat",
                 f"heartbeat; elapsed {elapsed:.1f}s; unit timeout {unit_timeout:.1f}s; "
                 f"total budget remaining {total_remaining:.1f}s",
                 None,
+                data={
+                    **facts, "elapsed": round(elapsed, 1), "timeout_seconds": round(unit_timeout, 1),
+                    "remaining_budget_seconds": round(total_remaining, 1),
+                },
             )
 
         process = run_process(
@@ -249,8 +252,13 @@ def run(
             "diagnosis": diagnosis,
         }
         attach_artifacts(unit, directory, run_dir)
-        progress(f"unit {index}/{len(plans)} {relative}: {state} in {process.duration_seconds:.2f}s")
-        unit_event(unit_id, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(plans)))
+        unit_event(unit_id, state, f"{state} in {process.duration_seconds:.2f}s", index / total, data={
+            **facts, "duration_seconds": process.duration_seconds, "exit_code": process.exit_code,
+            "reason": reason, "failure_class": failure_class, "missing_includes": missing[:MAX_NAMED_INCLUDES],
+            "analysis_reached": unit["analysis_reached"], "valid_report": valid, "attempt": 1,
+            "csv_recovered_rows": recovered, "dir": str(directory.relative_to(run_dir)),
+            "error_excerpt": error_excerpt(text) if state != "completed" else None,
+        })
         return index, unit, csv_cells
 
     completed: dict[int, tuple[dict[str, Any], list[str]]] = {}
@@ -306,6 +314,7 @@ def run(
             credit_headers(headers, header_forms, cells)
         if unit.get("analysis_reached"):
             reached_files.add(relative)
+    announce_batches(unit_event, plans_by_index={plan[0]: plan for plan in plans}, units=units, total=total)
 
     attempted_files = {unit["input_files"][0] for unit in units if "process" in unit}
     excluded_count = len(not_in_build) if scope == "build" else 0
@@ -339,6 +348,28 @@ def run(
         },
         "unit_counts": counts(units),
     }
+
+
+def announce_batches(
+    unit_event: Callable[..., None], *, plans_by_index: Mapping[int, Plan], units: Sequence[Mapping[str, Any]],
+    total: int,
+) -> None:
+    """One event per (state, reason) for the units that never ran.
+
+    A budget that runs out with a thousand units left used to emit a thousand
+    rows; the manifest still records every unit, the stream records the fact.
+    """
+    batches: dict[tuple[str, str], list[int]] = {}
+    for index, unit in enumerate(units, 1):
+        if "process" in unit or unit.get("status") not in {"unscheduled", "interrupted"}:
+            continue
+        batches.setdefault((str(unit["status"]), str(unit.get("reason") or "")), []).append(index)
+    for (state, reason), indexes in batches.items():
+        unit_event(
+            None, state, f"{len(indexes)} unit(s) {state}: {reason}", max(indexes) / max(1, total),
+            data={"count": len(indexes), "reason": reason, "first_index": min(indexes), "last_index": max(indexes), "total": total},
+            phase="units",
+        )
 
 
 def _unstarted(unit_id: str, relative: str, state: str, reason: str, evidence_context: str = "source-only") -> dict[str, Any]:

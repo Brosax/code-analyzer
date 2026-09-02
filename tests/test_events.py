@@ -101,9 +101,10 @@ def test_headless_run_writes_ordered_events_log_into_the_run_directory(tmp_path:
 
     assert result.exit_code == 0 and result.report_directory is not None
     records = _lines(result.report_directory / EVENTS_FILE)
-    assert set(records[0]) == {"phase", "status", "message", "tool", "unit", "progress", "timestamp", "stream"}
-    # The headless service also echoes progress strings; they carry no ordering contract.
-    structured = [item for item in records if item["phase"] != "progress"]
+    assert set(records[0]) == {"phase", "status", "message", "tool", "unit", "progress", "timestamp", "stream", "data"}
+    # Progress strings are the CLI's channel; the headless service never echoes them.
+    assert "progress" not in {item["phase"] for item in records}
+    structured = list(records)
     keys = [(item["phase"], item["status"]) for item in structured]
     # The first two fire before the run directory exists; they are buffered, not lost.
     assert keys[:2] == [("analysis", "started"), ("discovery", "started")]

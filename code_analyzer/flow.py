@@ -14,19 +14,18 @@ decides how to paint them, so this module is unit-tested the way
 
 Two rules the design leans on:
 
-* **Count units, parse only the denominator.**  The numerator is an integer
-  incremented on terminal ``unit`` events; the total is a *hint* scraped from
-  the ``progress`` phase's free text and only ever ratcheted upwards.  A hint
-  that never arrives leaves the total unknown and the row says "已完成 7 单元"
-  instead of inventing "7/12".
+* **Count units; read the denominator from the event's data.**  The numerator
+  is an integer incremented on terminal ``unit`` events; the total is the
+  ``data["total"]`` a producer announces and is only ever ratcheted upwards.
+  A total that never arrives leaves the denominator unknown and the row says
+  "已完成 7 单元" instead of inventing "7/12".
 * **Untrusted text is cleaned on the way in, not on the way out.**  Scanned
-  file names and analyzer output reach these rows; every string lifted from a
-  message goes through ``single_line`` and a length cap at ingestion, so no
+  file names and analyzer output reach these rows; every string lifted from an
+  event goes through ``single_line`` and a length cap at ingestion, so no
   renderer can be the one that forgets.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,32 +44,25 @@ SPINE_RAMP = 3
 TAIL_NODES: tuple[tuple[str, str], ...] = (
     ("stability", "稳定"),
     ("review", "审查"),
+    ("audit", "关联"),
     ("export", "导出"),
-    ("report", "报告"),
+    ("dashboard", "报告"),
 )
-# `audit` is missing on purpose: runner.py writes audit/assessment.json without
-# emitting a single event, so an audit node would sit pending for the whole run
-# and then snap to done.  Drawing a node we have no signal for is worse than
-# not drawing it.
-
-_INVENTORY = re.compile(r"^inventory ready: (?P<files>\d+) files(?:; compile database entries: (?P<db>\d+))?$")
-_STATIC = re.compile(r"^tool \d+/\d+ (?P<tool>\S+): unit (?P<i>\d+)/(?P<n>\d+) (?P<unit>.+?): (?P<detail>.*)$")
-_LLM_PLAN = re.compile(r"^llm: planned (?P<units>\d+) scan units for (?P<scanners>\d+) scanner\(s\)$")
-_LLM_TASK = re.compile(r"^llm (?P<i>\d+)/(?P<n>\d+) (?P<producer>\S+) (?P<path>.+?): (?P<detail>.*)$")
-_FINDINGS = re.compile(r"(?P<count>\d+) finding\(s\)")
-_TIER = re.compile(r"^scanning (?P<path>.+?) \((?P<tier>\w+)\)$")
-_TOKENS = re.compile(r"prompt tokens spent (?P<spent>\d+)")
-_DEGRADED = "no valid compile database found"
+# The node ids are the ones `serve.graph` uses (`status.PHASE_NODES`), so the
+# two front ends draw one run; only the labels are the TUI's.
 
 # Statuses that say "this unit is alive", not "this unit moved".  Pinned as
 # carrying no progress value by tests/test_events.py.
-_LIVENESS = frozenset({"heartbeat", "info", "started"})
+_LIVENESS = frozenset({"heartbeat", "info", "started", "step"})
 
 # Phase events speak started/finished/failed; the status ladder speaks
 # running/completed/failed.  Translating first keeps one projection table
 # instead of two, and a phase word that fell through NODE_STATES used to leave
 # a finished node drawn as pending.
 _PHASE_WORDS = {"started": "running", "finished": "completed", "failed": "failed"}
+
+# Batched statuses that mean "never ran" as opposed to "ran and ended".
+_NEVER_RAN = frozenset({"unscheduled", "skipped"})
 
 
 @dataclass(frozen=True)
@@ -105,12 +97,16 @@ class Node:
     done: int = 0
     total: int | None = None
     failures: int = 0
+    unscheduled: int = 0
+    excluded: int = 0
     findings: int | None = None
     started_at: float | None = None
     finished_at: float | None = None
     last_seen: float | None = None
     order: int = 0
     in_flight: dict[str, str] = field(default_factory=dict)
+    # Why units ended the way they did: failure class (or status word) -> count.
+    reasons: dict[str, int] = field(default_factory=dict)
 
     @property
     def counted(self) -> str:
@@ -136,6 +132,10 @@ def _clean(value: Any) -> str:
     return single_line(str(value))[:MAX_DETAIL]
 
 
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class RunFlow:
     """Every node of one run, and what the last event did to it."""
 
@@ -159,6 +159,7 @@ class RunFlow:
             self._add(node_id, "phase", label)
         if not review.get("enabled", True):
             self._disable("review")
+            self._disable("audit")
         if not run.get("shareable_export", True):
             self._disable("export")
         self.percent = 0.0
@@ -169,6 +170,7 @@ class RunFlow:
         self.llm_planned: int | None = None
         self.llm_scanners: int | None = None
         self.llm_done = 0
+        self.llm_unscheduled = 0
         self.llm_total: int | None = None
         self.tokens_spent = 0
         self.token_budget = int(llm.get("total_prompt_tokens") or 0) if llm.get("enabled") else 0
@@ -214,8 +216,8 @@ class RunFlow:
     def apply(self, event: AnalysisEvent) -> bool:
         """Fold one event in.  True when the drawn view would change.
 
-        ``output`` is 91% of a real run's traffic and is rejected on the first
-        line: it never reaches a regex, a counter or a node.
+        ``output`` is most of a real run's traffic and is rejected on the
+        first line: it never reaches a counter or a node.
         """
         if event.phase == "output":
             return False
@@ -234,6 +236,9 @@ class RunFlow:
         if event.status == "started":
             self.started_at = event.timestamp
             return
+        if event.status == "stopping":
+            self.stopping = True
+            return
         self.finished = True
         state = "failed" if event.status == "interrupted" else "success"
         for node in self.nodes.values():
@@ -241,7 +246,7 @@ class RunFlow:
                 node.state = state
                 node.status = event.status
                 node.finished_at = event.timestamp
-        report = self.nodes.get("report")
+        report = self.nodes.get("dashboard")
         if report is not None and report.status in {"pending", "running"}:
             report.state = state
             report.status = event.status
@@ -253,13 +258,24 @@ class RunFlow:
 
     def _on_discovery(self, event: AnalysisEvent) -> None:
         node = self.nodes["discovery"]
+        data = event.data or {}
         if event.status == "started":
             self._start(node, event)
             return
+        if event.status == "info":
+            if data.get("degraded") or "compile database" in event.message:
+                node.method = "降级上下文"
+            return
         self._finish(node, event)
-        match = _INVENTORY.match(_clean(event.message))
-        if match and not node.detail:
-            node.detail = f"{match['files']} 文件"
+        files = _count(data.get("files"))
+        if files is not None:
+            parts = [f"{files} 文件"]
+            entries = _count(data.get("compile_db_entries"))
+            if entries:
+                parts.append(f"compile-db {entries} 条")
+            elif data.get("compile_db_path") is None:
+                parts.append("无 compile-db")
+            node.detail = " · ".join(parts)
 
     def _on_tool(self, event: AnalysisEvent) -> None:
         node = self.nodes.get(str(event.tool or ""))
@@ -270,9 +286,26 @@ class RunFlow:
             return
         self._finish(node, event)
         node.in_flight.clear()
+        data = event.data or {}
+        if data.get("reason") and not node.detail:
+            node.detail = _clean(data["reason"])
 
     def _on_llm(self, event: AnalysisEvent) -> None:
         if event.status == "started":
+            return
+        data = event.data or {}
+        if event.status == "planned":
+            units, tasks = _count(data.get("units")), _count(data.get("tasks"))
+            if units is not None:
+                self.llm_planned = units
+                for node in self.nodes.values():
+                    if node.kind == "llm":
+                        node.total = max(node.total or 0, units)
+            self.llm_scanners = _count(data.get("scanners"))
+            if tasks is not None:
+                self.llm_total = max(self.llm_total or 0, tasks)
+            return
+        if event.status in {"replan", "breaker_open"}:
             return
         # The phase's own terminal word settles every scanner still running;
         # a scanner that finished its own units has already settled itself.
@@ -286,32 +319,74 @@ class RunFlow:
         if node is None:
             return
         unit = _clean(event.unit or "")
+        data = event.data or {}
         node.last_seen = event.timestamp
         # Any unit event is proof the producer is working, including a
         # terminal one that arrives before its own "started" was folded in.
         if node.state == "pending":
             self._start(node, event)
+        total = _count(data.get("total"))
+        if total is not None:
+            # A static tool's total is its own; an LLM task index runs over
+            # every scanner, so it feeds the phase total and the per-scanner
+            # denominator comes from the plan (`llm/planned`).
+            if node.kind == "llm":
+                self.llm_total = max(self.llm_total or 0, total)
+            else:
+                node.total = max(node.total or 0, total)
         if event.status in _LIVENESS:
             if event.status == "started":
                 token = self._unit_token(node, unit, event)
                 node.in_flight[unit] = token
-                if node.kind == "llm":
-                    # The start message carries the risk tier, which the
-                    # progress line does not; keep the richer wording.
-                    node.method = token
-            self._absorb_tokens(event)
+                node.method = token
+            elif event.status == "step" and unit in node.in_flight:
+                node.in_flight[unit] = self._unit_token(node, unit, event) + " · " + _clean(event.message)
+            self._absorb_tokens(data)
             return
         node.in_flight.pop(unit, None)
         node.done += 1
         if event.status != "completed":
             node.failures += 1
-        found = _FINDINGS.search(_clean(event.message))
-        if found:
-            node.findings = (node.findings or 0) + int(found["count"])
+            self._remember_reason(node, str(data.get("failure_class") or event.status), 1)
+        found = data.get("findings") if data.get("findings") is not None else data.get("finding_count")
+        if _count(found) is not None:
+            node.findings = (node.findings or 0) + int(found)
+        node.detail = _clean(event.message)
         if node.kind == "llm":
             self.llm_done += 1
             if node.total is not None and node.done >= node.total and not node.failures:
                 self._settle(node, "completed", event.timestamp)
+
+    def _on_units(self, event: AnalysisEvent) -> None:
+        """A batch of units that never ran (or, for flawfinder, files it never saw)."""
+        node = self.nodes.get(str(event.tool or ""))
+        if node is None:
+            return
+        data = event.data or {}
+        count = _count(data.get("count")) or 0
+        node.last_seen = event.timestamp
+        if event.status == "info":
+            if data.get("reason") == "encoding":
+                node.excluded += count
+            return
+        if node.state == "pending":
+            self._start(node, event)
+        total = _count(data.get("total"))
+        if total is not None:
+            if node.kind == "llm":
+                self.llm_total = max(self.llm_total or 0, total)
+            else:
+                node.total = max(node.total or 0, total)
+        if event.status in _NEVER_RAN:
+            node.unscheduled += count
+            if node.kind == "llm":
+                self.llm_unscheduled += count
+        else:
+            node.done += count
+            node.failures += count
+            if node.kind == "llm":
+                self.llm_done += count
+        self._remember_reason(node, str(data.get("reason") or event.status), count)
 
     def _on_stability(self, event: AnalysisEvent) -> None:
         self._phase_event("stability", event)
@@ -319,53 +394,14 @@ class RunFlow:
     def _on_review(self, event: AnalysisEvent) -> None:
         self._phase_event("review", event)
 
+    def _on_audit(self, event: AnalysisEvent) -> None:
+        self._phase_event("audit", event)
+
     def _on_export(self, event: AnalysisEvent) -> None:
         self._phase_event("export", event)
 
-    def _on_progress(self, event: AnalysisEvent) -> None:
-        """The only free-text surface, and only for denominators and method.
-
-        Producers publish counters as prose (``unit 3/5``) and structure as
-        events; the structured half has no counters, so the totals have to come
-        from here.  An end-to-end test folds a real run through this method, so
-        a producer that rewords its progress line fails a test instead of
-        quietly showing a dash.
-        """
-        message = _clean(event.message)
-        inventory = _INVENTORY.match(message)
-        if inventory:
-            node = self.nodes["discovery"]
-            parts = [f"{inventory['files']} 文件"]
-            if inventory["db"]:
-                parts.append(f"compile-db {inventory['db']} 条")
-            node.detail = " · ".join(parts)
-            return
-        if _DEGRADED in message:
-            self.nodes["discovery"].method = "降级上下文"
-            return
-        static = _STATIC.match(message)
-        if static:
-            node = self.nodes.get(static["tool"])
-            if node is not None:
-                node.total = max(node.total or 0, int(static["n"]))
-                node.method = _clean(static["unit"])
-                node.detail = _clean(static["detail"])
-            return
-        plan = _LLM_PLAN.match(message)
-        if plan:
-            self.llm_planned = int(plan["units"])
-            self.llm_scanners = int(plan["scanners"])
-            for node in self.nodes.values():
-                if node.kind == "llm":
-                    node.total = max(node.total or 0, self.llm_planned)
-            return
-        task = _LLM_TASK.match(message)
-        if task:
-            self.llm_total = max(self.llm_total or 0, int(task["n"]))
-            node = self.nodes.get(task["producer"])
-            if node is not None:
-                node.method = _clean(task["path"])
-                node.detail = _clean(task["detail"])
+    def _on_report(self, event: AnalysisEvent) -> None:
+        self._phase_event("dashboard", event)
 
     # --- helpers ------------------------------------------------------------
 
@@ -398,23 +434,33 @@ class RunFlow:
             # to say; its counters and findings are.
             node.detail = ""
 
+    @staticmethod
+    def _remember_reason(node: Node, reason: str, count: int) -> None:
+        key = _clean(reason)[:80] or "unknown"
+        if key in node.reasons or len(node.reasons) < 20:
+            node.reasons[key] = node.reasons.get(key, 0) + count
+
     def _unit_token(self, node: Node, unit: str, event: AnalysisEvent) -> str:
         """What this unit says about the *method* being used.
 
         For cppcheck the unit id is the method outright -- ``compile-db`` is the
-        build-aware pass, ``fallback`` the source-only one -- and for the LLM
-        the risk tier travels in the start message.
+        build-aware pass, ``fallback`` the source-only one -- for splint it is
+        the translation unit's path, and for the LLM the path plus risk tier.
         """
+        data = event.data or {}
         if node.kind == "llm":
-            match = _TIER.match(_clean(event.message))
-            if match:
-                return f"{match['path']} ({match['tier']})"
-        return unit
+            path, tier = data.get("path"), data.get("tier")
+            if path:
+                return _clean(f"{path} ({tier})" if tier else path)
+            message = _clean(event.message)
+            return message[len("scanning "):] if message.startswith("scanning ") else message
+        label = data.get("label")
+        return _clean(label) if label else unit
 
-    def _absorb_tokens(self, event: AnalysisEvent) -> None:
-        match = _TOKENS.search(_clean(event.message))
-        if match:
-            self.tokens_spent = max(self.tokens_spent, int(match["spent"]))
+    def _absorb_tokens(self, data: dict[str, Any]) -> None:
+        spent = _count(data.get("prompt_tokens_estimated"))
+        if spent is not None:
+            self.tokens_spent = max(self.tokens_spent, spent)
 
     # --- rendering ----------------------------------------------------------
 
@@ -432,10 +478,13 @@ class RunFlow:
         parts = [f"{int(self.percent * 100)}%", f"已运行 {_clock(self.started_at, now)}"]
         static = [node for node in self.nodes.values() if node.kind == "static"]
         if static:
-            done = sum(1 for node in static if node.state in {"success", "failed"})
+            done = sum(1 for node in static if node.state in {"success", "partial", "failed"})
             parts.append(f"静态 {done}/{len(static)}")
         if self.llm_total:
-            parts.append(f"LLM {self.llm_done}/{self.llm_total}")
+            llm = f"LLM {self.llm_done}/{self.llm_total}"
+            if self.llm_unscheduled:
+                llm += f"（{self.llm_unscheduled} 未调度）"
+            parts.append(llm)
         if self.token_budget:
             parts.append(f"prompt {_thousands(self.tokens_spent)}/{_thousands(self.token_budget)}（估算：字符/4）")
         return Headline(title=_clean(title), detail=" · ".join(parts), percent=int(self.percent * 100))
@@ -464,7 +513,7 @@ class RunFlow:
         """Running nodes are never hidden -- they are why this panel exists."""
         if len(producers) <= room:
             return producers, []
-        rank = {"running": 0, "failed": 1, "success": 2, "pending": 3}
+        rank = {"running": 0, "failed": 1, "partial": 1, "success": 2, "pending": 3}
         ordered = sorted(producers, key=lambda node: (rank.get(node.state, 3), -(node.finished_at or 0), node.order))
         keep = ordered[: max(0, room - 1)]
         kept = {node.id for node in keep}
@@ -497,9 +546,9 @@ class RunFlow:
         if counted:
             parts.append(counted)
         if node.state == "running":
-            # The progress line names splint's translation unit by its source
-            # path; its structured unit id is a flattened path plus a hash and
-            # is unreadable. Where both exist, the readable one wins.
+            # The structured label names splint's translation unit by its
+            # source path and cppcheck's pass by its name; where a unit is in
+            # flight, that is what the row shows.
             token = node.method or next(iter(node.in_flight.values()), "")
             if token:
                 parts.append(token)
@@ -519,11 +568,15 @@ class RunFlow:
                 parts.append(node.detail)
             if node.failures:
                 parts.append(f"{node.failures} 失败")
+            if node.unscheduled:
+                parts.append(f"{node.unscheduled} 未调度")
+            if node.excluded:
+                parts.append(f"{node.excluded} 文件编码排除")
         return _clean(" · ".join(part for part in parts if part))
 
 
 def _summarise(nodes: list[Node]) -> str:
-    buckets = {"pending": "等待", "running": "运行", "success": "完成", "failed": "失败"}
+    buckets = {"pending": "等待", "running": "运行", "success": "完成", "partial": "部分", "failed": "失败"}
     counted = {key: sum(1 for node in nodes if node.state == key) for key in buckets}
     return " · ".join(f"{value} {buckets[key]}" for key, value in counted.items() if value)
 

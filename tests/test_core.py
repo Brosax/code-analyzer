@@ -129,7 +129,10 @@ def test_artifact_index_skips_caches_and_reuses_unchanged_hashes(tmp_path: Path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("data", encoding="utf-8")
     indexed = artifact_index(run_dir)
-    assert {item["path"] for item in indexed} == {"tools/cppcheck/compile-db/report.xml", "logs/runner.log"}
+    # runner.log is written to the run's last breath, so it cannot be hashed
+    # into a manifest that is saved before that breath; like events.jsonl it
+    # is a log, not evidence.
+    assert {item["path"] for item in indexed} == {"tools/cppcheck/compile-db/report.xml"}
     cache: dict[str, tuple[int, int, dict]] = {}
     artifact_index(run_dir, cache)
     for _size, _mtime_ns, item in cache.values():

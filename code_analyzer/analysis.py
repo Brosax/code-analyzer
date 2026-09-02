@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,17 @@ class AnalysisEvent:
     progress: float | None = None
     timestamp: float = field(default_factory=time.time)
     stream: str | None = None
+    # The structured half of the message: counters, paths, argv, reasons.
+    # Consumers read this; the message stays the human line.  ``None`` for an
+    # event that has nothing to add, so the JSONL row stays small.
+    data: dict[str, Any] | None = None
+
+
+def started_data() -> dict[str, Any]:
+    """What the first event of a run records: how it was invoked."""
+    from . import __version__
+
+    return {"argv": list(sys.argv), "cwd": str(Path.cwd()), "version": __version__}
 
 
 class CancellationToken:
@@ -70,18 +82,23 @@ def run_analysis(
     ``[run] events_file`` relocates it.
     """
     from .events import JsonlEventSink, events_file, fan_out
+    from .runlog import RunLogger
     from .runner import AnalysisCancelled, _analyze
 
     token = cancellation or CancellationToken()
-    with JsonlEventSink(events_file(request.config)) as log:
-        sink = fan_out(log, events)
-        sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0))
+    started = time.monotonic()
+    with JsonlEventSink(events_file(request.config)) as log, RunLogger(request.config["run"]["log_level"]) as run_log:
+        sink = fan_out(log, run_log, events)
+        sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0, data=started_data()))
         if token.cancelled:
             sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before start", progress=1.0))
             return AnalysisResult(130, None, None)
 
+        # Progress strings are the CLI's channel; the structured events carry
+        # the same facts, so the headless service does not echo them.  (The
+        # mirror used to double every unit row in events.jsonl.)
         def progress(message: str) -> None:
-            sink(AnalysisEvent("progress", "running", message))
+            return None
 
         try:
             exit_code, report_directory = _analyze(
@@ -101,5 +118,29 @@ def run_analysis(
         except (OSError, UnicodeError, json.JSONDecodeError):
             pass
         status = "interrupted" if exit_code == 130 else "finished"
-        sink(AnalysisEvent("analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0))
+        sink(AnalysisEvent(
+            "analysis", status, f"analysis finished with exit code {exit_code}", progress=1.0,
+            data=finished_data(manifest, exit_code, time.monotonic() - started),
+        ))
         return AnalysisResult(exit_code, report_directory, manifest)
+
+
+def finished_data(manifest: dict[str, Any] | None, exit_code: int, duration: float | None) -> dict[str, Any]:
+    """The last event of a run: its verdict, in the words the manifest uses."""
+    manifest = manifest or {}
+    tools = {
+        name: str(record.get("status", "")) for name, record in (manifest.get("tools") or {}).items()
+        if isinstance(record, dict) and record.get("requested")
+    }
+    llm = manifest.get("llm") or {}
+    review = manifest.get("review") or {}
+    export = manifest.get("export") or {}
+    return {
+        "status": manifest.get("status", "interrupted" if exit_code == 130 else "unknown"),
+        "exit_code": exit_code,
+        "duration_seconds": None if duration is None else round(duration, 3),
+        "tools": tools,
+        "llm": llm.get("status") if llm.get("requested") else None,
+        "review": review.get("findings") if review.get("status") in {"completed", "partial"} else review.get("status"),
+        "export": export.get("status") if export.get("enabled") else None,
+    }

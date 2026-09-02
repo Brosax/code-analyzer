@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..process import run_process
+from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
 from .common import attach_artifacts, output_room, unit_outcome
@@ -29,7 +30,7 @@ def run(
     output_event: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
-    unit_event = unit_event or (lambda _unit, _status, _message, _progress: None)
+    unit_event = unit_event or (lambda *_args, **_kwargs: None)
     tool_dir = run_dir / "tools" / "cppcheck"
     timeout = float(config["tools"]["cppcheck"]["timeout_seconds"])
     heartbeat_seconds = float(config["tools"]["cppcheck"]["heartbeat_seconds"])
@@ -46,9 +47,10 @@ def run(
     deadline = time.monotonic() + timeout
     for index, (name, pass_args, files) in enumerate(passes, 1):
         evidence_context = "build-aware" if name == "compile-db" else "source-only"
+        facts = {"index": index, "total": len(passes), "label": name, "files": len(files)}
         if cancelled is not None and cancelled():
             units.append({"id": name, "status": "interrupted", "input_files": files, "valid_report": False, "reason": "run interrupted", "evidence_context": evidence_context, "artifacts": []})
-            unit_event(name, "interrupted", "run interrupted", index / max(1, len(passes)))
+            unit_event(name, "interrupted", "run interrupted", index / max(1, len(passes)), data={**facts, "reason": "run interrupted"})
             for later_name, _, later_files in passes[index:]:
                 units.append({"id": later_name, "status": "interrupted", "input_files": later_files, "valid_report": False, "reason": "run interrupted", "evidence_context": "build-aware" if later_name == "compile-db" else "source-only", "artifacts": []})
             break
@@ -61,11 +63,8 @@ def run(
         stderr = directory / "stderr.raw"
         if time.monotonic() >= deadline:
             units.append({"id": name, "status": "unscheduled", "input_files": files, "valid_report": False, "reason": "total budget exhausted", "evidence_context": evidence_context, "artifacts": []})
-            progress(f"unit {index}/{len(passes)} {name}: unscheduled (budget exhausted)")
-            unit_event(name, "unscheduled", "total budget exhausted", index / max(1, len(passes)))
+            unit_event(name, "unscheduled", "unscheduled (budget exhausted)", index / max(1, len(passes)), data={**facts, "reason": "total budget exhausted"})
             continue
-        progress(f"unit {index}/{len(passes)} {name}: scanning {len(files)} files")
-        unit_event(name, "started", f"scanning {len(files)} files", (index - 1) / max(1, len(passes)))
         argv = [
             executable, "--enable=all", "--inconclusive", "--check-level=exhaustive", "--check-library",
             "--max-ctu-depth=10", "--xml", "--xml-version=2", f"--output-file={report}",
@@ -92,14 +91,18 @@ def run(
             file_list.write_text("".join(path + "\n" for path in files), encoding="utf-8")
             argv.append(f"--file-list={file_list}")
         unit_timeout = max(0.001, deadline - time.monotonic())
+        unit_event(name, "started", f"scanning {len(files)} files", (index - 1) / max(1, len(passes)), data={
+            **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3), "attempt": 1,
+            "evidence_context": evidence_context,
+        })
 
         def beat(
-            elapsed: float, unit: str = name, timeout: float = unit_timeout,
-            prefix: str = f"unit {index}/{len(passes)} {name}",
+            elapsed: float, unit: str = name, timeout: float = unit_timeout, unit_facts: dict[str, Any] = facts,
         ) -> None:
             message = f"heartbeat; elapsed {elapsed:.1f}s; unit timeout {timeout:.1f}s"
-            progress(f"{prefix}: {message}")
-            unit_event(unit, "heartbeat", message, None)
+            unit_event(unit, "heartbeat", message, None, data={
+                **unit_facts, "elapsed": round(elapsed, 1), "timeout_seconds": round(timeout, 1),
+            })
 
         process = run_process(
             argv, source, stdout, stderr, unit_timeout, grace,
@@ -124,8 +127,14 @@ def run(
         }
         attach_artifacts(unit, directory, run_dir)
         units.append(unit)
-        progress(f"unit {index}/{len(passes)} {name}: {state} in {process.duration_seconds:.2f}s")
-        unit_event(name, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(passes)))
+        diagnosis = unit["diagnosis"] or {}
+        unit_event(name, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(passes)), data={
+            **facts, "duration_seconds": process.duration_seconds, "exit_code": process.exit_code,
+            "reason": reason, "valid_report": valid, "attempt": 1, "findings": diagnosis.get("findings"),
+            "failure_class": diagnosis.get("category"), "diagnosis": diagnosis.get("counts"),
+            "dir": str(directory.relative_to(run_dir)),
+            "error_excerpt": error_excerpt(_combined_text(stdout, stderr)) if state != "completed" else None,
+        })
         if process.interrupted:
             for later_name, _, later_files in passes[len(units):]:
                 units.append({"id": later_name, "status": "interrupted", "input_files": later_files, "valid_report": False, "reason": "run interrupted", "evidence_context": "build-aware" if later_name == "compile-db" else "source-only", "artifacts": []})
@@ -180,6 +189,16 @@ def diagnose_report(path: Path) -> dict[str, Any]:
     elif counts_by_id["syntaxError"]:
         category = "parsing"
     return {"category": category, "findings": findings, "counts": counts_by_id}
+
+
+def _combined_text(*paths: Path) -> str:
+    result = []
+    for path in paths:
+        try:
+            result.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    return "\n".join(result)
 
 
 def _validate(path: Path) -> tuple[bool, str | None]:

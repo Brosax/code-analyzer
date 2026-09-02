@@ -26,14 +26,45 @@ EVENTS_FILE = "events.jsonl"
 RUN_DIRECTORY_PHASE = ("run", "created")
 
 
+MAX_DATA_STRING = 2000
+MAX_DATA_ITEMS = 200
+MAX_DATA_DEPTH = 3
+# Lists that are the evidence itself and must not be cut: an argv is only
+# meaningful whole.
+_UNCAPPED_LISTS = frozenset({"argv"})
+
+
 def event_record(event: AnalysisEvent) -> dict[str, Any]:
     """The JSON shape of one event, message filtered like terminal output.
 
     Messages embed analyzer output lines and scanned file names; the same
     control-character filter the progress display applies keeps a
-    ``tail -f`` of this file from rewriting the operator's terminal.
+    ``tail -f`` of this file from rewriting the operator's terminal.  The
+    ``data`` object gets the same treatment, leaf by leaf, plus size caps so
+    one event cannot carry a whole report.
     """
-    return {**asdict(event), "message": single_line(event.message)}
+    return {**asdict(event), "message": single_line(event.message), "data": clean_data(event.data)}
+
+
+def clean_data(value: Any, *, depth: int = 0, key: str = "") -> Any:
+    """Sanitise a data payload for the log: strings through single_line, sizes bounded."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return single_line(value)[:MAX_DATA_STRING]
+    if depth >= MAX_DATA_DEPTH:
+        return single_line(str(value))[:MAX_DATA_STRING]
+    if isinstance(value, dict):
+        return {str(k): clean_data(v, depth=depth + 1, key=str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = list(value) if key in _UNCAPPED_LISTS else list(value)[:MAX_DATA_ITEMS]
+        cleaned = [clean_data(item, depth=depth + 1) for item in items]
+        if key not in _UNCAPPED_LISTS and len(value) > MAX_DATA_ITEMS:
+            cleaned.append(f"…(+{len(value) - MAX_DATA_ITEMS})")
+        return cleaned
+    return single_line(str(value))[:MAX_DATA_STRING]
 
 
 class JsonlEventSink:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..process import run_process
+from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
 from .common import attach_artifacts, output_room, unit_outcome, utf8_validation
@@ -43,7 +44,7 @@ def run(
     output_event: Callable[[str, str, str], None] | None = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
-    unit_event = unit_event or (lambda _unit, _status, _message, _progress: None)
+    unit_event = unit_event or (lambda *_args, **_kwargs: None)
     files = [item["path"] for item in inventory]
     compatible: list[str] = []
     excluded: list[dict[str, Any]] = []
@@ -59,6 +60,13 @@ def run(
                 "reason": detail.get("reason"),
                 "category": "encoding",
             })
+    if excluded:
+        # Itemised once, up front: the files the lexical scan will never see,
+        # and why.  The tool's own reason names the count below.
+        unit_event(
+            None, "info", f"{len(excluded)} file(s) excluded: encoding", None,
+            data={"count": len(excluded), "reason": "encoding", "excluded": excluded[:20]}, phase="units",
+        )
     shards = shard_files(compatible)
     units: list[dict[str, Any]] = []
     deadline = time.monotonic() + float(config["tools"]["flawfinder"]["timeout_seconds"])
@@ -66,31 +74,33 @@ def run(
     grace = float(config["run"]["termination_grace_seconds"])
     for index, paths in enumerate(shards, 1):
         name = f"shard-{index:04d}"
+        facts = {"index": index, "total": len(shards), "label": name, "files": len(paths)}
         if cancelled is not None and cancelled():
             units.append({"id": name, "status": "interrupted", "input_files": paths, "valid_report": False, "reason": "run interrupted", "evidence_context": "source-only", "artifacts": []})
-            unit_event(name, "interrupted", "run interrupted", index / max(1, len(shards)))
+            unit_event(name, "interrupted", "run interrupted", index / max(1, len(shards)), data={**facts, "reason": "run interrupted"})
             break
         directory = run_dir / "tools" / "flawfinder" / name
         directory.mkdir(parents=True, exist_ok=True)
         stdout, stderr, report = directory / "stdout.raw", directory / "stderr.raw", directory / "report.sarif"
         if time.monotonic() >= deadline:
             units.append({"id": name, "status": "unscheduled", "input_files": paths, "valid_report": False, "reason": "total budget exhausted", "evidence_context": "source-only", "artifacts": []})
-            progress(f"unit {index}/{len(shards)} {name}: unscheduled (budget exhausted)")
-            unit_event(name, "unscheduled", "total budget exhausted", index / max(1, len(shards)))
+            unit_event(name, "unscheduled", "unscheduled (budget exhausted)", index / max(1, len(shards)), data={**facts, "reason": "total budget exhausted"})
             continue
-        progress(f"unit {index}/{len(shards)} {name}: scanning {len(paths)} files")
-        unit_event(name, "started", f"scanning {len(paths)} files", (index - 1) / max(1, len(shards)))
-        unit_event(name, "info", "机器输出已隐藏并保存至 report.sarif", None)
         argv = [executable, "--sarif", "--minlevel=0", "--neverignore", "--columns", "--omittime", "--quiet", "--", *paths]
         unit_timeout = max(0.001, deadline - time.monotonic())
+        unit_event(name, "started", f"scanning {len(paths)} files", (index - 1) / max(1, len(shards)), data={
+            **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3), "attempt": 1,
+            "evidence_context": "source-only",
+        })
+        unit_event(name, "info", "机器输出已隐藏并保存至 report.sarif", None)
 
         def beat(
-            elapsed: float, unit: str = name, timeout: float = unit_timeout,
-            prefix: str = f"unit {index}/{len(shards)} {name}",
+            elapsed: float, unit: str = name, timeout: float = unit_timeout, unit_facts: dict[str, Any] = facts,
         ) -> None:
             message = f"heartbeat; elapsed {elapsed:.1f}s; unit timeout {timeout:.1f}s"
-            progress(f"{prefix}: {message}")
-            unit_event(unit, "heartbeat", message, None)
+            unit_event(unit, "heartbeat", message, None, data={
+                **unit_facts, "elapsed": round(elapsed, 1), "timeout_seconds": round(timeout, 1),
+            })
 
         process = run_process(
             argv, source, stdout, stderr, unit_timeout, grace,
@@ -121,8 +131,11 @@ def run(
         }
         attach_artifacts(unit, directory, run_dir)
         units.append(unit)
-        progress(f"unit {index}/{len(shards)} {name}: {state} in {process.duration_seconds:.2f}s")
-        unit_event(name, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(shards)))
+        unit_event(name, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(shards)), data={
+            **facts, "duration_seconds": process.duration_seconds, "exit_code": process.exit_code,
+            "reason": reason, "valid_report": valid, "attempt": 1, "dir": str(directory.relative_to(run_dir)),
+            "error_excerpt": error_excerpt(stderr.read_text(encoding="utf-8", errors="replace")) if state != "completed" and stderr.is_file() else None,
+        })
         if process.interrupted:
             break
     if units and units[-1]["status"] == "interrupted":
@@ -138,6 +151,7 @@ def run(
     return {
         "requested": True, "status": status, "units": units,
         "valid_reports": sum(bool(unit.get("valid_report")) for unit in units),
+        "reason": f"{len(excluded)} file(s) excluded: encoding" if excluded else None,
         "excluded_files": excluded,
         "coverage": {
             "metric": "input_coverage", "total": len(files), "attempted": len(attempted),
