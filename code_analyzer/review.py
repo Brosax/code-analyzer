@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import re
@@ -17,6 +16,8 @@ from .grading import (
     reference_review_level,
 )
 from .tools import PRODUCER_ORDER, TOOL_NAMES, adapter, adapters
+from .tools.common import diagnostic_category, is_diagnostic, is_fatal
+from .tools.splint_csv import splint_rows
 
 REVIEW_SCHEMA_VERSION = 3
 SEVERITY_MAPPING_VERSION = 2
@@ -637,10 +638,12 @@ def _parse_splint_units(source: Path, run_dir: Path, tool: dict[str, Any]) -> tu
         if report.is_file():
             artifact = report.relative_to(run_dir).as_posix()
             try:
-                with report.open("r", encoding="utf-8", newline="") as stream:
-                    rows = list(csv.reader(stream, strict=True))
-            except (OSError, UnicodeError, csv.Error) as exc:
+                rows, _recovered, csv_error = splint_rows(report.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError) as exc:
                 diagnostics.append(_integrity_diagnostic("splint", unit, report, run_dir, f"Splint CSV parse failed: {exc}", context))
+                continue
+            if csv_error is not None:
+                diagnostics.append(_integrity_diagnostic("splint", unit, report, run_dir, f"Splint CSV parse failed: {csv_error}", context))
                 continue
             if rows:
                 header = [cell.strip().lower() for cell in rows[0]]
@@ -1026,17 +1029,10 @@ def _validate_flawfinder_report(path: Path) -> tuple[bool, str | None]:
 def _validate_splint_report(path: Path) -> tuple[bool, str | None]:
     try:
         text = path.read_text(encoding="utf-8")
-        if not text.strip() or "\x00" in text:
-            return False, "invalid Splint CSV: report is empty or contains NUL"
-        rows = [row for row in csv.reader(text.splitlines(), strict=True) if any(cell.strip() for cell in row)]
-    except (OSError, UnicodeError, csv.Error) as exc:
+    except (OSError, UnicodeError) as exc:
         return False, f"invalid Splint CSV: {exc}"
-    if not rows or len(rows[0]) < 2:
-        return False, "invalid Splint CSV: expected comma-separated columns"
-    width = len(rows[0])
-    if any(len(row) != width for row in rows):
-        return False, "invalid Splint CSV: inconsistent or truncated rows"
-    return True, None
+    _rows, _recovered, error = splint_rows(text)
+    return (True, None) if error is None else (False, error)
 
 
 def _validate_llm_report(path: Path) -> tuple[bool, str | None]:
@@ -1097,26 +1093,15 @@ def _sarif_raw_severity(result: dict[str, Any], rule: dict[str, Any]) -> tuple[s
 
 
 def _is_diagnostic(value: str) -> bool:
-    return bool(re.search(
-        r"parse.?error|syntax.?error|preprocess(?:or|ing)?(?:.?error)?|cannot (?:continue|parse)|internal.?(?:bug|error)|"
-        r"cannot (?:find|open|read).*include|include file .*not found|missing.?include|configuration.?error|"
-        r"unrecognized (?:option|flag|identifier)|unknown option|no valid configuration",
-        value, re.I,
-    ))
+    return is_diagnostic(value)
 
 
 def _is_fatal(value: str) -> bool:
-    return bool(re.search(r"fatal|parse.?error|syntax.?error|cannot (?:continue|parse)|internal.?(?:bug|error)", value, re.I))
+    return is_fatal(value)
 
 
 def _diagnostic_category(value: str) -> str:
-    if re.search(r"parse|syntax|cannot continue|internal|unrecognized identifier", value, re.I):
-        return "parsing"
-    if re.search(r"include", value, re.I):
-        return "include"
-    if re.search(r"preprocess|configuration|macro|option|flag", value, re.I):
-        return "configuration"
-    return "tool"
+    return diagnostic_category(value)
 
 
 def _extract_cwe(value: str) -> str:

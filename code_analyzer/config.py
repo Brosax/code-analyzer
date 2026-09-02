@@ -23,6 +23,9 @@ DEFAULTS: dict[str, Any] = {
         "shareable_export": True,
         "termination_grace_seconds": 5.0,
         "events_file": "",
+        # What logs/runner.log records.  "debug" adds every heartbeat and LLM
+        # step; the default keeps the log a narrative, not a trace.
+        "log_level": "info",
     },
     "source": {
         "include": ["**/*"],
@@ -41,6 +44,23 @@ DEFAULTS: dict[str, Any] = {
         "system_include": [],
         "define": [],
         "undefine": [],
+        # Build-context assistance: when Splint or Cppcheck's fallback pass
+        # fail to preprocess, diagnose the missing headers, infer a patch and
+        # re-run the failed units with it.  "propose" always asks; "auto"
+        # applies only a patch inferred by code and proven on a probe; "off"
+        # keeps the analyzer exactly as it was.
+        "assist": "propose",
+        "assist_rounds": 1,
+        "assist_probe_units": 12,
+        # Empty include-guarded headers for names that exist nowhere in the
+        # tree, offered per item and never checked by default.
+        "stub_headers": True,
+        # How long a proposal waits for the operator; 0 waits indefinitely.
+        "approval_timeout_seconds": 0.0,
+        # Per-path build context: [[build.overrides]] tables of
+        # {match, include, system_include, define, undefine}, matched by glob
+        # against the source-relative path of each translation unit.
+        "overrides": [],
     },
     "review": {
         "enabled": True,
@@ -85,6 +105,9 @@ DEFAULTS: dict[str, Any] = {
         # is an operator's explicit choice, never a surprise.
         "max_replan_rounds": 0,
         "replan_decider": "deterministic",
+        # Consecutive transport failures that open the circuit breaker and
+        # unschedule the rest of the phase; 0 disables the breaker.
+        "consecutive_failure_limit": 5,
     },
     "audit": {
         "enabled": False,
@@ -110,9 +133,23 @@ DEFAULTS: dict[str, Any] = {
             # inputs/effective-config.toml and must reload the same on any host.
             "jobs": 4,
             "heartbeat_seconds": 10.0,
+            # Typed Splint options, each verified against `splint -help`; the
+            # set is closed on purpose (README: arbitrary arguments are
+            # unavailable) and doubles as the allow-list a build-context
+            # proposal may pick from.
+            "mode": "strict",
+            "report_reserved_names": True,
+            "try_to_recover": False,
+            "skip_system_headers": False,
+            "system_dirs": [],
         },
     },
 }
+
+LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning")
+ASSIST_MODES: tuple[str, ...] = ("off", "propose", "auto")
+SPLINT_MODES: tuple[str, ...] = ("strict", "checks", "standard", "weak")
+OVERRIDE_KEYS: tuple[str, ...] = ("match", "include", "system_include", "define", "undefine")
 
 
 @dataclass(frozen=True)
@@ -139,6 +176,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("run.shareable_export", "bool", "生成可分享导出", "创建脱敏 ZIP 导出。"),
     FieldSpec("run.termination_grace_seconds", "float", "终止宽限（秒）", "发送 TERM 后等待 KILL 的时间。", minimum=0.001, advanced=True),
     FieldSpec("run.events_file", "path", "事件日志文件", "运行级 events.jsonl 的位置；留空则写入 <运行目录>/events.jsonl。", advanced=True),
+    FieldSpec("run.log_level", "choice", "日志级别", "logs/runner.log 的详细程度；debug 额外记录每次心跳与 LLM 分步事件。", choices=LOG_LEVELS, advanced=True),
     FieldSpec("source.include", "list", "包含规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.exclude", "list", "排除规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.follow_symlinks", "bool", "跟随符号链接", "扫描符号链接指向的文件。", advanced=True),
@@ -153,6 +191,12 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("build.system_include", "path_list", "System include 目录", "系统 include 搜索路径。", advanced=True),
     FieldSpec("build.define", "list", "宏定义", "传给分析器的 NAME 或 NAME=VALUE。"),
     FieldSpec("build.undefine", "list", "取消宏定义", "传给分析器的宏名称。", advanced=True),
+    FieldSpec("build.assist", "choice", "构建上下文辅助", "Splint/Cppcheck 预处理失败时推断缺失的 include/宏并重跑失败单元：off 关闭；propose 先询问再应用；auto 自动应用仅由代码推断且经探针验证的补丁。", choices=ASSIST_MODES),
+    FieldSpec("build.assist_rounds", "int", "辅助轮数", "最多进行几轮诊断→补丁→重跑；0 表示只诊断不重跑。", minimum=0, advanced=True),
+    FieldSpec("build.assist_probe_units", "int", "探针样本数", "应用补丁前先在多少个失败单元上试跑。", minimum=1, advanced=True),
+    FieldSpec("build.stub_headers", "bool", "允许桩头文件", "为源码树中不存在的头文件生成空的桩文件（写在报告目录内，逐项确认）。", advanced=True),
+    FieldSpec("build.approval_timeout_seconds", "float", "审批超时（秒）", "补丁等待操作者决定的时间；0 表示一直等待。", minimum=0.0, advanced=True),
+    FieldSpec("build.overrides", "table_list", "按路径覆盖", "[[build.overrides]] 表：match 为源码相对路径 glob，其余为该路径专用的 include/system_include/define/undefine。仅通过 TOML 编辑。", advanced=True),
     FieldSpec("review.enabled", "bool", "生成 Review", "派生非权威统一 findings。"),
     FieldSpec("review.fail_on", "choice", "失败阈值", "达到该严重性时退出 1。", choices=("none", "medium", "high", "critical")),
     FieldSpec("review.max_markdown_findings", "int", "Markdown 最大 findings", "限制 Markdown 报告长度。", minimum=1, advanced=True),
@@ -183,6 +227,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.lsp", "bool", "启用 LSP 导航", "为 agent 提供编译器级符号导航。", advanced=True),
     FieldSpec("llm.max_replan_rounds", "int", "重规划轮数上限", "0 表示只跑确定性的第 0 轮；每多一轮都在同一预算内。", minimum=0, advanced=True),
     FieldSpec("llm.replan_decider", "choice", "重规划决策者", "deterministic 为规则表；model 显式启用模型决策。", choices=("deterministic", "model"), advanced=True),
+    FieldSpec("llm.consecutive_failure_limit", "int", "断路器阈值", "连续多少个单元因传输错误失败后停止本阶段并释放预算；0 关闭断路器。", minimum=0, advanced=True),
     FieldSpec("review.gate_includes_llm", "bool", "门禁纳入 LLM 发现", "默认关闭：LLM 发现不影响退出码。开启后 LLM 发现与静态发现一同参与 fail_on 判定。", advanced=True),
     FieldSpec("audit.enabled", "bool", "启用 Audit 层", "关联与验证，产出非权威的 audit/assessment.json。"),
     FieldSpec("audit.validation_model", "string", "验证模型", "留空则沿用 [llm] model。", advanced=True),
@@ -203,6 +248,11 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("tools.splint.scope", "choice", "Splint 范围", "自动、build 覆盖范围或完整 inventory。", choices=("auto", "build", "inventory")),
     FieldSpec("tools.splint.jobs", "int", "Splint 并发数", "并发翻译单元数量。", minimum=1),
     FieldSpec("tools.splint.heartbeat_seconds", "float", "Splint 心跳", "长任务状态刷新间隔。", minimum=0.001, advanced=True),
+    FieldSpec("tools.splint.mode", "choice", "Splint 检查模式", "Splint 预定义模式：strict 最严格，weak 最宽松。", choices=SPLINT_MODES, advanced=True),
+    FieldSpec("tools.splint.report_reserved_names", "bool", "报告保留名冲突", "关闭后传 -isoreserved，不再报告以下划线开头等实现保留名。", advanced=True),
+    FieldSpec("tools.splint.try_to_recover", "bool", "解析错误后尝试恢复", "开启后传 +trytorecover。", advanced=True),
+    FieldSpec("tools.splint.skip_system_headers", "bool", "跳过系统头文件", "开启后传 -skipsysheaders。", advanced=True),
+    FieldSpec("tools.splint.system_dirs", "path_list", "系统目录", "传给 -systemdirs 的目录列表；留空沿用 Splint 默认 /usr/include。", advanced=True),
 )
 
 FIELD_BY_PATH = {field.path: field for field in FIELD_REGISTRY}
@@ -288,8 +338,21 @@ def _resolve_file_paths(data: dict[str, Any], base: Path) -> None:
     if build.get("compile_database"):
         build["compile_database"] = str(_absolute(build["compile_database"], base))
     for name in ("include", "system_include"):
-        if name in build:
-            build[name] = [str(_absolute(item, base)) for item in build[name]]
+        if isinstance(build.get(name), list):
+            build[name] = _absolute_items(build[name], base)
+    for override in build.get("overrides") or []:
+        if isinstance(override, dict):
+            for name in ("include", "system_include"):
+                if isinstance(override.get(name), list):
+                    override[name] = _absolute_items(override[name], base)
+    splint = data.get("tools", {}).get("splint", {})
+    if isinstance(splint.get("system_dirs"), list):
+        splint["system_dirs"] = _absolute_items(splint["system_dirs"], base)
+
+
+def _absolute_items(items: list[Any], base: Path) -> list[Any]:
+    """Absolutise the string items; anything else is left for validate_config to name."""
+    return [str(_absolute(item, base)) if isinstance(item, str) else item for item in items]
 
 
 def _absolute(value: os.PathLike[str] | str, base: Path) -> Path:
@@ -373,6 +436,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     _expect(run["shareable_export"], bool, "run.shareable_export")
     _number(run["termination_grace_seconds"], "run.termination_grace_seconds")
     _expect(run["events_file"], str, "run.events_file")
+    _expect(run["log_level"], str, "run.log_level")
+    if run["log_level"] not in LOG_LEVELS:
+        raise UserError("run.log_level must be debug, info, or warning")
     for key in ("include", "exclude"):
         _string_list(src[key], f"source.{key}")
     _expect(src["follow_symlinks"], bool, "source.follow_symlinks")
@@ -386,6 +452,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             _expect(build[key], str, f"build.{key}")
     for key in ("include", "system_include", "define", "undefine"):
         _string_list(build[key], f"build.{key}")
+    _expect(build["assist"], str, "build.assist")
+    if build["assist"] not in ASSIST_MODES:
+        raise UserError("build.assist must be off, propose, or auto")
+    _non_negative_int(build["assist_rounds"], "build.assist_rounds")
+    if build["assist_rounds"] > 2:
+        raise UserError("build.assist_rounds must be at most 2")
+    _positive_int(build["assist_probe_units"], "build.assist_probe_units")
+    _expect(build["stub_headers"], bool, "build.stub_headers")
+    _non_negative_number(build["approval_timeout_seconds"], "build.approval_timeout_seconds")
+    _validate_overrides(build["overrides"])
     _expect(review["enabled"], bool, "review.enabled")
     _expect(review["gate_includes_llm"], bool, "review.gate_includes_llm")
     _expect(review["fail_on"], str, "review.fail_on")
@@ -410,6 +486,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if splint["scope"] not in {"auto", "build", "inventory"}:
         raise UserError("tools.splint.scope must be auto, build, or inventory")
     _positive_int(splint["jobs"], "tools.splint.jobs")
+    _expect(splint["mode"], str, "tools.splint.mode")
+    if splint["mode"] not in SPLINT_MODES:
+        raise UserError("tools.splint.mode must be strict, checks, standard, or weak")
+    for key in ("report_reserved_names", "try_to_recover", "skip_system_headers"):
+        _expect(splint[key], bool, f"tools.splint.{key}")
+    _string_list(splint["system_dirs"], "tools.splint.system_dirs")
     run["output_root"] = str(_absolute(run["output_root"], Path.cwd()))
     if run["events_file"]:
         run["events_file"] = str(_absolute(run["events_file"], Path.cwd()))
@@ -417,7 +499,30 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         build["compile_database"] = str(_absolute(build["compile_database"], Path.cwd()))
     build["include"] = [str(_absolute(p, Path.cwd())) for p in build["include"]]
     build["system_include"] = [str(_absolute(p, Path.cwd())) for p in build["system_include"]]
+    for override in build["overrides"]:
+        for key in ("include", "system_include"):
+            if key in override:
+                override[key] = [str(_absolute(p, Path.cwd())) for p in override[key]]
+    splint["system_dirs"] = [str(_absolute(p, Path.cwd())) for p in splint["system_dirs"]]
     return config
+
+
+def _validate_overrides(value: Any) -> None:
+    if not isinstance(value, list):
+        raise UserError("build.overrides must be an array of tables")
+    for index, override in enumerate(value):
+        name = f"build.overrides[{index}]"
+        if not isinstance(override, dict):
+            raise UserError(f"{name} must be a table")
+        unknown = set(override) - set(OVERRIDE_KEYS)
+        if unknown:
+            raise UserError(f"unknown configuration key(s) in {name}: {', '.join(sorted(unknown))}")
+        match = override.get("match")
+        if not isinstance(match, str) or not match.strip():
+            raise UserError(f"{name}.match must be a non-empty glob")
+        for key in OVERRIDE_KEYS[1:]:
+            if key in override:
+                _string_list(override[key], f"{name}.{key}")
 
 
 def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
@@ -462,6 +567,7 @@ def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
     _expect(audit["validation_model"], str, "audit.validation_model")
     _positive_int(audit["validation_max_candidates"], "audit.validation_max_candidates")
     _positive_int(audit["validation_max_steps"], "audit.validation_max_steps")
+    _non_negative_int(llm["consecutive_failure_limit"], "llm.consecutive_failure_limit")
 
 
 def _validate_endpoint(endpoint: str) -> None:
@@ -503,6 +609,16 @@ def _positive_int(value: Any, name: str) -> None:
         raise UserError(f"{name} must be an integer greater than zero")
 
 
+def _non_negative_int(value: Any, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UserError(f"{name} must be an integer of zero or more")
+
+
+def _non_negative_number(value: Any, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise UserError(f"{name} must be a number of zero or more")
+
+
 def effective_toml(config: dict[str, Any]) -> str:
     """Serialize the supported config model deterministically."""
     lines = ["config_schema_version = 2", ""]
@@ -512,8 +628,23 @@ def effective_toml(config: dict[str, Any]) -> str:
             value = config[section][key]
             if value is None:
                 continue
+            if (section, key) == ("build", "overrides"):
+                if value:
+                    continue  # emitted below as [[build.overrides]] tables
+                # Explicit, so a snapshot cancels a lower layer's tables.
+                lines.append("overrides = []")
+                continue
             lines.append(f"{key} = {_toml_value(value)}")
         lines.append("")
+        if section == "build":
+            # Arrays of tables must follow the section's own keys, or TOML
+            # would file those keys under the last table instead.
+            for override in config["build"]["overrides"]:
+                lines.append("[[build.overrides]]")
+                for key in OVERRIDE_KEYS:
+                    if key in override:
+                        lines.append(f"{key} = {_toml_value(override[key])}")
+                lines.append("")
     for tool in TOOL_NAMES:
         lines.append(f"[tools.{tool}]")
         for key in DEFAULTS["tools"][tool]:
@@ -564,13 +695,17 @@ def persistent_config(config: dict[str, Any], base: Path | None = None) -> dict[
         "run.events_file",
         "build.compile_database",
     )
-    list_fields = ("build.include", "build.system_include")
+    list_fields = ("build.include", "build.system_include", "tools.splint.system_dirs")
     for name in path_fields:
         value = config_value(result, name)
         if value:
             set_config_value(result, name, _portable_path(value, base))
     for name in list_fields:
         set_config_value(result, name, [_portable_path(value, base) for value in config_value(result, name)])
+    for override in result["build"]["overrides"]:
+        for name in ("include", "system_include"):
+            if name in override:
+                override[name] = [_portable_path(value, base) for value in override[name]]
     return result
 
 

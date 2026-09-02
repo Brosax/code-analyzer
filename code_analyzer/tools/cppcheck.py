@@ -81,11 +81,12 @@ def run(
                 argv.append(f"--std={standard}")
             if build.get("cppcheck_platform"):
                 argv.append(f"--platform={build['cppcheck_platform']}")
-            for path in build["include"] + build["system_include"]:
+            includes, defines, undefines = override_union(build)
+            for path in includes:
                 argv.append(f"-I{path}")
-            for value in build["define"]:
+            for value in defines:
                 argv.append(f"-D{value}")
-            for value in build["undefine"]:
+            for value in undefines:
                 argv.append(f"-U{value}")
             file_list = run_dir / "inputs" / "cppcheck-fallback-files.txt"
             file_list.write_text("".join(path + "\n" for path in files), encoding="utf-8")
@@ -116,7 +117,11 @@ def run(
             process, valid, process.exit_code == 0 and valid, reason,
             f"unexpected exit status {process.exit_code}",
         )
-        unit = {"id": name, "status": state, "input_files": files, "valid_report": valid, "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context}
+        unit = {
+            "id": name, "status": state, "input_files": files, "valid_report": valid,
+            "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context,
+            "attempt": 1, "diagnosis": diagnose_report(report) if valid else None,
+        }
         attach_artifacts(unit, directory, run_dir)
         units.append(unit)
         progress(f"unit {index}/{len(passes)} {name}: {state} in {process.duration_seconds:.2f}s")
@@ -128,6 +133,53 @@ def run(
     attempted_files = {path for unit in units if "process" in unit for path in unit["input_files"]}
     analyzed_files = {path for unit in units if unit.get("valid_report") for path in unit["input_files"]}
     return _result(units, len(attempted_files), len(analyzed_files), len(inventory))
+
+
+def override_union(build: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """The global ``[build]`` lists plus every ``[[build.overrides]]`` entry, deduplicated.
+
+    Cppcheck's fallback pass is one invocation over every file, so a per-path
+    override cannot be applied per path here; the union is the honest
+    approximation, and the order keeps the global lists first.
+    """
+    includes = [*build["include"], *build["system_include"]]
+    defines = list(build["define"])
+    undefines = list(build["undefine"])
+    for override in build.get("overrides") or []:
+        includes.extend(override.get("include") or [])
+        includes.extend(override.get("system_include") or [])
+        defines.extend(override.get("define") or [])
+        undefines.extend(override.get("undefine") or [])
+    return list(dict.fromkeys(includes)), list(dict.fromkeys(defines)), list(dict.fromkeys(undefines))
+
+
+# Cppcheck's own ids for "I could not see the code": the counts a build-context
+# diagnosis reads instead of re-parsing a 50 MB report.
+DIAGNOSIS_IDS: tuple[str, ...] = ("missingInclude", "missingIncludeSystem", "preprocessorErrorDirective", "syntaxError")
+
+
+def diagnose_report(path: Path) -> dict[str, Any]:
+    """Count the diagnostic ids in a valid report, streaming."""
+    counts_by_id = {name: 0 for name in DIAGNOSIS_IDS}
+    findings = 0
+    try:
+        for _event, element in ET.iterparse(path, events=("end",)):
+            if element.tag == "error":
+                findings += 1
+                identity = element.get("id", "")
+                if identity in counts_by_id:
+                    counts_by_id[identity] += 1
+                element.clear()
+    except (OSError, ET.ParseError):
+        return {"category": None, "findings": findings, "counts": counts_by_id, "error": "report could not be re-read"}
+    category = None
+    if counts_by_id["missingInclude"] or counts_by_id["missingIncludeSystem"]:
+        category = "include"
+    elif counts_by_id["preprocessorErrorDirective"]:
+        category = "configuration"
+    elif counts_by_id["syntaxError"]:
+        category = "parsing"
+    return {"category": category, "findings": findings, "counts": counts_by_id}
 
 
 def _validate(path: Path) -> tuple[bool, str | None]:

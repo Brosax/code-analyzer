@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import fnmatch
 import hashlib
 import re
 import subprocess
@@ -14,9 +14,89 @@ from ..compile_db import splint_flags
 from ..process import run_process
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
-from .common import attach_artifacts, output_room, unit_outcome
+from .common import attach_artifacts, is_diagnostic, output_room, unit_outcome
+from .splint_csv import splint_rows
 
 Plan = tuple[int, str, str, list[str], str]
+
+# The predefined check modes Splint 3.1.2 answers to (`splint -help modes`).
+MODES: tuple[str, ...] = ("strict", "checks", "standard", "weak")
+
+# Why a unit did not analyse anything, in decision order.  A word, not a
+# sentence: the sentence is `explain_failure`, the word is what a re-run,
+# the flow panel and the build-context diagnosis branch on.  A unit the
+# runner killed (timed out, interrupted) carries no class: it did not fail
+# for an analysis reason, and its status word already says what happened.
+FAILURE_CLASSES: tuple[str, ...] = ("csv", "include", "configuration", "parsing", "tool")
+
+# `\s*`, not `\s+`: the log fallback joins wrapped lines with no space so a
+# header name split mid-word survives, and the wrap can fall right after
+# "include file".  The name still ends at the next space, `>` or quote.
+_MISSING_INCLUDE = re.compile(r"Cannot find include file\s*<?([^\s>\"]+)>?", re.I)
+_ERROR_DIRECTIVE = re.compile(r"#error\s+(.+)")
+# `(?!s)`: Splint's own hint, "(For help on parse errors, see ...)", follows
+# every parse error on the same line and must not count as a second one.
+_PARSE_ERROR = re.compile(r"parse error(?!s)", re.I)
+# Sentence-anchored: the hint under every reserved-name warning ("External
+# name is reserved for system use ...") would otherwise count it twice.
+_RESERVED_NAME = re.compile(r"\bName .+? is (?:in the implementation name space|reserved for)", re.I)
+_RESERVED_FLAGS = ("isoreserved", "isoreservedinternal")
+MAX_MISSING_INCLUDES = 200
+MAX_NAMED_INCLUDES = 20
+
+
+def option_flags(settings: Mapping[str, Any]) -> list[str]:
+    """The typed ``[tools.splint]`` options as Splint flags.
+
+    Every spelling here was checked against ``splint -help <flag>`` on 3.1.2.
+    The set is closed on purpose: README says arbitrary analyzer arguments are
+    unavailable, and a build-context proposal may only pick from this list.
+    """
+    mode = str(settings.get("mode") or "strict")
+    flags = [f"-{mode}"]
+    if settings.get("report_reserved_names", True) is False:
+        flags.append("-isoreserved")
+    if settings.get("try_to_recover"):
+        flags.append("+trytorecover")
+    if settings.get("skip_system_headers"):
+        flags.append("-skipsysheaders")
+    directories = [str(item) for item in settings.get("system_dirs") or []]
+    if directories:
+        flags.extend(["-systemdirs", ":".join(directories)])
+    return flags
+
+
+def matching_overrides(build: Mapping[str, Any], relative: str) -> list[dict[str, Any]]:
+    """The ``[[build.overrides]]`` entries whose ``match`` glob names this file."""
+    return [
+        dict(item) for item in build.get("overrides") or []
+        if isinstance(item, Mapping) and fnmatch.fnmatchcase(relative, str(item.get("match", "")))
+    ]
+
+
+def build_flags(build: Mapping[str, Any], relative: str | None = None) -> list[str]:
+    """The ``[build]`` flags a source-only translation unit receives.
+
+    The global lists come first; every matching override appends its own, in
+    the order the overrides are written, so a later override can add a more
+    specific directory after a general one.
+    """
+    include = list(build["include"])
+    system = list(build["system_include"])
+    define = list(build["define"])
+    undefine = list(build["undefine"])
+    if relative is not None:
+        for override in matching_overrides(build, relative):
+            include.extend(override.get("include") or [])
+            system.extend(override.get("system_include") or [])
+            define.extend(override.get("define") or [])
+            undefine.extend(override.get("undefine") or [])
+    return [
+        *(f"-I{x}" for x in include),
+        *(f"-I{x}" for x in system),
+        *(f"-D{x}" for x in define),
+        *(f"-U{x}" for x in undefine),
+    ]
 
 
 def run(
@@ -59,18 +139,17 @@ def run(
         )
 
     build = config["build"]
-    fallback_flags = [
-        *(f"-I{x}" for x in build["include"]),
-        *(f"-I{x}" for x in build["system_include"]),
-        *(f"-D{x}" for x in build["define"]),
-        *(f"-U{x}" for x in build["undefine"]),
-    ]
+    options = option_flags(settings)
     raw_plans: list[tuple[str, str, list[str], str]] = []
     for relative in selected:
         entries = by_file.get(relative)
-        configurations = [splint_flags(entry) for entry in entries] if entries else [list(fallback_flags)]
+        configurations = [splint_flags(entry) for entry in entries] if entries else [build_flags(build, relative)]
         for flags in configurations:
-            fingerprint = hashlib.sha256((relative + "\0" + "\0".join(flags)).encode()).hexdigest()[:12]
+            # The options are part of the identity: a re-run with a different
+            # mode or a reserved-name switch must land in its own directory.
+            fingerprint = hashlib.sha256(
+                (relative + "\0" + "\0".join([*options, *flags])).encode()
+            ).hexdigest()[:12]
             safe = relative.replace("/", "__").replace("\\", "__")
             safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in safe)
             raw_plans.append((
@@ -107,7 +186,7 @@ def run(
         progress(f"unit {index}/{len(plans)} {relative}: scanning")
         unit_event(unit_id, "started", f"scanning {relative}", (index - 1) / max(1, len(plans)))
         argv = [
-            executable, "+nof", "-strict", "+unixlib", "+showsummary", "+its4mostrisky", "+its4veryrisky",
+            executable, "+nof", *options, "+unixlib", "+showsummary", "+its4mostrisky", "+its4veryrisky",
             "+its4risky", "+its4moderate", "+its4low", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report),
             *flags, "./" + relative,
         ]
@@ -138,20 +217,36 @@ def run(
         )
         if output_budget is not None:
             output_budget.spend(process)
-        valid, csv_cells, reason = _validate_csv(report)
+        valid, rows, csv_cells, recovered, reason = _validate_csv(report)
         text = _combined_text(stdout, stderr)
         lowered = text.lower()
         finished = "finished checking" in lowered
         fatal = any(marker in lowered for marker in ("cannot continue", "internal bug"))
         fatal |= not finished and any(marker in lowered for marker in ("parse error", "preprocessing error"))
         normal = process.exit_code in {0, 1} and finished and valid and not fatal
+        diagnosis = diagnose(text, rows)
+        diagnosis["csv_recovered_rows"] = recovered
+        killed = process.timed_out or process.interrupted
+        failure_class = None if normal or killed else classify_failure(valid, reason, diagnosis, lowered)
+        diagnosis["category"] = failure_class
         state, reason = unit_outcome(
             process, valid, normal, reason,
-            "Splint did not reach Finished checking" if not finished else f"unexpected exit status {process.exit_code}",
+            explain_failure(failure_class, diagnosis, finished, process.exit_code),
         )
+        missing = diagnosis["missing_includes"]
         unit = {
             "id": unit_id, "status": state, "input_files": [relative], "valid_report": valid,
             "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context,
+            # "Finished checking" is the discriminator: a preprocessing death
+            # never reaches it, and a unit that did may still carry only
+            # preproc rows (a #warning), which is an analysis all the same.
+            "analysis_reached": finished and not fatal,
+            "failure_class": failure_class,
+            "missing_includes": missing[:MAX_NAMED_INCLUDES],
+            "missing_includes_more": max(0, len(missing) - MAX_NAMED_INCLUDES),
+            "csv_recovered_rows": recovered,
+            "attempt": 1,
+            "diagnosis": diagnosis,
         }
         attach_artifacts(unit, directory, run_dir)
         progress(f"unit {index}/{len(plans)} {relative}: {state} in {process.duration_seconds:.2f}s")
@@ -200,6 +295,7 @@ def run(
 
     units: list[dict[str, Any]] = []
     valid_files: set[str] = set()
+    reached_files: set[str] = set()
     headers: set[str] = set()
     header_forms = header_path_forms(inventory, source)
     for index, unit_id, relative, _, evidence_context in plans:
@@ -208,6 +304,8 @@ def run(
         if unit.get("valid_report"):
             valid_files.add(relative)
             credit_headers(headers, header_forms, cells)
+        if unit.get("analysis_reached"):
+            reached_files.add(relative)
 
     attempted_files = {unit["input_files"][0] for unit in units if "process" in unit}
     excluded_count = len(not_in_build) if scope == "build" else 0
@@ -229,6 +327,13 @@ def run(
             "attempted": len(attempted_files), "analyzed": len(valid_files), "excluded": excluded_count,
             "effective_total": effective_total,
             "ratio": len(valid_files) / effective_total if effective_total else None,
+            # A parseable report is not an analysis: a unit that died at its
+            # first #include still writes a valid CSV of preprocessing rows
+            # and never prints "Finished checking".  `ratio` keeps its
+            # historical meaning (and the exit code with it); this pair says
+            # how many units Splint actually checked.
+            "analysis_reached": len(reached_files),
+            "analysis_ratio": len(reached_files) / effective_total if effective_total else None,
             "inventory_c_files": len(c_files), "not_in_build": len(not_in_build),
             "headers_seen_via_tu": len(headers),
         },
@@ -240,7 +345,105 @@ def _unstarted(unit_id: str, relative: str, state: str, reason: str, evidence_co
     return {
         "id": unit_id, "status": state, "input_files": [relative], "valid_report": False,
         "reason": reason, "evidence_context": evidence_context, "artifacts": [],
+        "analysis_reached": False, "failure_class": None, "attempt": 1,
     }
+
+
+# --- what went wrong, in words ----------------------------------------------
+
+
+def _unwrap(text: str, joiner: str) -> str:
+    """Join Splint's four-space continuation lines back onto their message.
+
+    Splint wraps at 80 columns and indents the rest, sometimes mid-word
+    (``trusted-fir`` / ``mware-m``).  Callers choose the joiner: an empty one
+    restores a split identifier, a space restores prose.
+    """
+    lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("    ") and lines:
+            lines[-1] += joiner + line.strip()
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _ordered_unique(values: Sequence[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(value, None)
+    return list(seen)
+
+
+def diagnose(text: str, rows: Sequence[Sequence[str]]) -> dict[str, Any]:
+    """Aggregate one unit's output into the facts a reconfiguration needs.
+
+    The CSV rows are preferred over the logs because their text is not
+    wrapped; the logs are the fallback for a unit whose CSV never got written.
+    Everything here is counts and identifiers -- never a source line -- so it
+    can travel into the manifest, the flow panel and a model prompt as-is.
+    """
+    header = [cell.strip().lower() for cell in rows[0]] if rows else []
+    flag_column = header.index("flag name") if "flag name" in header else None
+    text_column = header.index("warning text") if "warning text" in header else None
+    messages = [row[text_column] for row in rows[1:] if text_column is not None and len(row) > text_column]
+    flag_names = [row[flag_column] for row in rows[1:] if flag_column is not None and len(row) > flag_column]
+    joined = "\n".join(messages)
+    missing = _ordered_unique(_MISSING_INCLUDE.findall(joined))
+    if not missing:
+        missing = _ordered_unique(_MISSING_INCLUDE.findall(_unwrap(text, "")))
+    prose = _unwrap(text, " ")
+    directives = _ordered_unique(
+        [item.strip()[:200] for item in _ERROR_DIRECTIVE.findall(joined + "\n" + prose)]
+    )
+    parse_errors = len(_PARSE_ERROR.findall(prose))
+    reserved = sum(1 for name in flag_names if name.strip().lower() in _RESERVED_FLAGS)
+    if not flag_names:
+        reserved = len(_RESERVED_NAME.findall(prose))
+    first_error = next(
+        (line.strip()[:300] for line in [*messages, *prose.splitlines()] if is_diagnostic(line)), "",
+    )
+    return {
+        "category": None,
+        "first_error": first_error,
+        "missing_includes": missing[:MAX_MISSING_INCLUDES],
+        "error_directives": directives[:20],
+        "parse_errors": parse_errors,
+        "reserved_name_warnings": reserved,
+        "preproc_only": bool(flag_names) and all(name.strip().lower() == "preproc" for name in flag_names),
+        "csv_recovered_rows": 0,
+    }
+
+
+def classify_failure(valid: bool, csv_error: str | None, diagnosis: Mapping[str, Any], lowered: str) -> str:
+    """One word for why the unit analysed nothing; see FAILURE_CLASSES."""
+    if not valid and csv_error:
+        return "csv"
+    if diagnosis["missing_includes"]:
+        return "include"
+    if diagnosis["error_directives"]:
+        return "configuration"
+    if diagnosis["parse_errors"] or "cannot continue" in lowered or "parse error" in lowered:
+        return "parsing"
+    return "tool"
+
+
+def explain_failure(
+    failure_class: str | None, diagnosis: Mapping[str, Any], finished: bool, exit_code: int | None
+) -> str:
+    """The human sentence for a unit that did not complete."""
+    if failure_class == "include":
+        names = list(diagnosis["missing_includes"])
+        shown = ", ".join(names[:5]) + (f", …(+{len(names) - 5})" if len(names) > 5 else "")
+        return f"preprocessing failed: {len(names)} missing include(s): {shown}"
+    if failure_class == "configuration":
+        return f"preprocessing failed: #error {diagnosis['error_directives'][0]}"[:300]
+    if failure_class == "parsing":
+        first = diagnosis.get("first_error") or ""
+        return f"parse error after preprocessing: {first}"[:300] if first else "Splint could not parse the translation unit"
+    if not finished:
+        return "Splint did not reach Finished checking"
+    return f"unexpected exit status {exit_code}"
 
 
 def header_path_forms(
@@ -281,22 +484,16 @@ def credit_headers(
             headers.add(relative_header)
 
 
-def _validate_csv(path: Path) -> tuple[bool, list[str], str | None]:
+def _validate_csv(path: Path) -> tuple[bool, list[list[str]], list[str], int, str | None]:
+    """Read the report through the shared reader: ``(valid, rows, cells, recovered, reason)``."""
     try:
         text = path.read_text(encoding="utf-8")
-        if not text.strip():
-            return False, [], "invalid Splint CSV: report is empty"
-        if "\x00" in text:
-            return False, [], "invalid Splint CSV: NUL byte"
-        rows = [row for row in csv.reader(text.splitlines(), strict=True) if any(cell.strip() for cell in row)]
-    except (OSError, UnicodeError, csv.Error) as exc:
-        return False, [], f"invalid Splint CSV: {exc}"
-    if not rows or len(rows[0]) < 2:
-        return False, [], "invalid Splint CSV: expected comma-separated columns"
-    width = len(rows[0])
-    if any(len(row) != width for row in rows):
-        return False, [], "invalid Splint CSV: inconsistent or truncated rows"
-    return True, [cell for row in rows for cell in row], None
+    except (OSError, UnicodeError) as exc:
+        return False, [], [], 0, f"invalid Splint CSV: {exc}"
+    rows, recovered, error = splint_rows(text)
+    if error is not None:
+        return False, [], [], 0, error
+    return True, rows, [cell for row in rows for cell in row], recovered, None
 
 
 def _combined_text(*paths: Path) -> str:

@@ -641,7 +641,10 @@ def _finish_interrupted(
 def _not_requested(inventory: list[dict[str, Any]], name: str) -> dict[str, Any]:
     total = len([item for item in inventory if Path(item["path"]).suffix == ".c"]) if name == "splint" else len(inventory)
     metric = "tu_report_coverage" if name == "splint" else "input_coverage"
-    return {"requested": False, "status": "not_requested", "executable": None, "version": None, "units": [], "valid_reports": 0, "coverage": {"metric": metric, "covered": 0, "total": total, "attempted": 0, "analyzed": 0, "excluded": 0, "effective_total": total, "ratio": None}, "unit_counts": {"planned": 0, "started": 0, "completed": 0, "failed": 0, "timed_out": 0, "unscheduled": 0}}
+    coverage: dict[str, Any] = {"metric": metric, "covered": 0, "total": total, "attempted": 0, "analyzed": 0, "excluded": 0, "effective_total": total, "ratio": None}
+    if name == "splint":
+        coverage.update({"analysis_reached": 0, "analysis_ratio": None})
+    return {"requested": False, "status": "not_requested", "executable": None, "version": None, "units": [], "valid_reports": 0, "coverage": coverage, "unit_counts": {"planned": 0, "started": 0, "completed": 0, "failed": 0, "timed_out": 0, "unscheduled": 0}}
 
 
 def _preflight_state(state: str, inventory: list[dict[str, Any]], name: str, reason: str) -> dict[str, Any]:

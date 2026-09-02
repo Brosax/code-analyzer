@@ -2,10 +2,42 @@ from __future__ import annotations
 
 import codecs
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
 from ..events import EVENTS_FILE
+
+# The vocabulary of analyzer *diagnostics* -- lines that say the tool could not
+# do its job, as opposed to findings about the code.  Shared by the review
+# layer (which files them apart from findings) and the adapters (which use
+# them to say why a unit analysed nothing), so both agree on what a
+# diagnostic is.
+_DIAGNOSTIC = re.compile(
+    r"parse.?error|syntax.?error|preprocess(?:or|ing)?(?:.?error)?|cannot (?:continue|parse)|internal.?(?:bug|error)|"
+    r"cannot (?:find|open|read).*include|include file .*not found|missing.?include|configuration.?error|"
+    r"unrecognized (?:option|flag|identifier)|unknown option|no valid configuration",
+    re.I,
+)
+_FATAL = re.compile(r"fatal|parse.?error|syntax.?error|cannot (?:continue|parse)|internal.?(?:bug|error)", re.I)
+
+
+def is_diagnostic(value: str) -> bool:
+    return bool(_DIAGNOSTIC.search(value))
+
+
+def is_fatal(value: str) -> bool:
+    return bool(_FATAL.search(value))
+
+
+def diagnostic_category(value: str) -> str:
+    if re.search(r"parse|syntax|cannot continue|internal|unrecognized identifier", value, re.I):
+        return "parsing"
+    if re.search(r"include", value, re.I):
+        return "include"
+    if re.search(r"preprocess|configuration|macro|option|flag", value, re.I):
+        return "configuration"
+    return "tool"
 
 
 def utf8_validation(path: Path, chunk_size: int = 1024 * 1024) -> tuple[bool, dict[str, Any] | None]:

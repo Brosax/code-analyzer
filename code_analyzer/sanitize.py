@@ -20,6 +20,7 @@ from .events import EVENTS_FILE
 from .html_report import render
 from .persist import manifest_structure_problem, write_json
 from .review import markdown_report
+from .tools.splint_csv import splint_rows
 
 # Rendered scan units and session logs quote the analyzed source verbatim, so
 # they stay out of a shareable archive unless the operator asks for them.
@@ -431,13 +432,22 @@ def _sanitize_file(
         return "sarif" if suffix == ".sarif" else "json"
     if suffix == ".csv":
         try:
-            with source.open("r", encoding="utf-8", newline="") as stream:
-                rows = list(csv.reader(stream, strict=True))
-            if not rows or not any(any(cell.strip() for cell in row) for row in rows):
-                raise ExportError(f"invalid empty CSV: {source}")
-            width = len(rows[0])
-            if width < 2 or any(len(row) != width for row in rows):
-                raise ExportError(f"invalid or truncated CSV: {source}")
+            if _is_splint_report(relative):
+                # Splint's own quoting: read through the reader the adapter
+                # and the review use, so a report they accepted is exported
+                # rather than dropped as malformed.  The writer below escapes
+                # the embedded quotes, so the staged copy re-reads strictly.
+                rows, _recovered, error = splint_rows(source.read_text(encoding="utf-8"))
+                if error is not None:
+                    raise ExportError(f"cannot sanitize CSV {source}: {error}")
+            else:
+                with source.open("r", encoding="utf-8", newline="") as stream:
+                    rows = list(csv.reader(stream, strict=True))
+                if not rows or not any(any(cell.strip() for cell in row) for row in rows):
+                    raise ExportError(f"invalid empty CSV: {source}")
+                width = len(rows[0])
+                if width < 2 or any(len(row) != width for row in rows):
+                    raise ExportError(f"invalid or truncated CSV: {source}")
             with target.open("w", encoding="utf-8", newline="") as stream:
                 csv.writer(stream).writerows([[redactor.text(cell) for cell in row] for row in rows])
             with target.open("r", encoding="utf-8", newline="") as stream:
@@ -483,6 +493,10 @@ def _validate_tree(staging: Path, redactor: Redactor) -> None:
             raise ExportError(f"sensitive path remains in export entry {name}")
         if suffix == ".csv":
             list(csv.reader(io.StringIO(text), strict=True))
+
+
+def _is_splint_report(relative: Path | None) -> bool:
+    return relative is not None and relative.parts[:2] == ("tools", "splint") and relative.name == "report.csv"
 
 
 def _json_leaks(value: Any, redactor: Redactor) -> list[str]:

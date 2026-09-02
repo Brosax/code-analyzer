@@ -98,6 +98,9 @@ def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
     run.add_argument("--splint-scope", choices=("auto", "build", "inventory"))
     run.add_argument("--splint-jobs", type=_positive_int)
     run.add_argument("--splint-heartbeat", type=_positive_float)
+    run.add_argument("--splint-mode", choices=("strict", "checks", "standard", "weak"), help="Splint's predefined check mode")
+    run.add_argument("--build-assist", choices=("off", "propose", "auto"), help="diagnose Splint/Cppcheck preprocessing failures and re-run failed units with an inferred build context")
+    run.add_argument("--log-level", choices=("debug", "info", "warning"), help="how much logs/runner.log records")
     run.add_argument("--llm", action=argparse.BooleanOptionalAction, default=None, help="run the LLM scanners as a second, independent detection path")
     _add_llm_arguments(run)
     run.add_argument("--llm-scanner", choices=LLM_PRODUCERS, action="append")
@@ -290,6 +293,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         run["termination_grace_seconds"] = args.termination_grace
     if args.events_file is not None:
         run["events_file"] = str(args.events_file.resolve())
+    if getattr(args, "log_level", None) is not None:
+        run["log_level"] = args.log_level
     if args.exclude is not None:
         source["exclude"] = args.exclude
     if args.follow_symlinks is not None:
@@ -325,6 +330,10 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         tools.setdefault("splint", {})["jobs"] = args.splint_jobs
     if args.splint_heartbeat is not None:
         tools.setdefault("splint", {})["heartbeat_seconds"] = args.splint_heartbeat
+    if getattr(args, "splint_mode", None) is not None:
+        tools.setdefault("splint", {})["mode"] = args.splint_mode
+    if getattr(args, "build_assist", None) is not None:
+        build["assist"] = args.build_assist
     if args.llm is not None:
         llm["enabled"] = args.llm
     if args.llm_scanner:
