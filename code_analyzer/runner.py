@@ -723,10 +723,8 @@ def _finish_interrupted(
         event("publish", "failed", f"latest.json publication failed: {exc}", data={"error": str(exc)})
         _save_manifest(run_dir, manifest)
     progress("run finished: status interrupted, exit code 130")
-    event(
-        "analysis", "interrupted", "run safely stopped; partial evidence retained", value=1.0,
-        data=finished_data(manifest, 130, None),
-    )
+    # The caller (analyze / run_analysis) announces the verdict once, with the
+    # duration it alone knows; announcing it here as well used to double it.
     return 130, run_dir
 
 

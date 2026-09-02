@@ -15,7 +15,13 @@ from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
-from .common import attach_artifacts, is_diagnostic, output_room, unit_outcome
+from .common import (
+    announce_never_ran,
+    attach_artifacts,
+    is_diagnostic,
+    output_room,
+    unit_outcome,
+)
 from .splint_csv import splint_rows
 
 Plan = tuple[int, str, str, list[str], str]
@@ -314,7 +320,7 @@ def run(
             credit_headers(headers, header_forms, cells)
         if unit.get("analysis_reached"):
             reached_files.add(relative)
-    announce_batches(unit_event, plans_by_index={plan[0]: plan for plan in plans}, units=units, total=total)
+    announce_never_ran(unit_event, units, total)
 
     attempted_files = {unit["input_files"][0] for unit in units if "process" in unit}
     excluded_count = len(not_in_build) if scope == "build" else 0
@@ -348,28 +354,6 @@ def run(
         },
         "unit_counts": counts(units),
     }
-
-
-def announce_batches(
-    unit_event: Callable[..., None], *, plans_by_index: Mapping[int, Plan], units: Sequence[Mapping[str, Any]],
-    total: int,
-) -> None:
-    """One event per (state, reason) for the units that never ran.
-
-    A budget that runs out with a thousand units left used to emit a thousand
-    rows; the manifest still records every unit, the stream records the fact.
-    """
-    batches: dict[tuple[str, str], list[int]] = {}
-    for index, unit in enumerate(units, 1):
-        if "process" in unit or unit.get("status") not in {"unscheduled", "interrupted"}:
-            continue
-        batches.setdefault((str(unit["status"]), str(unit.get("reason") or "")), []).append(index)
-    for (state, reason), indexes in batches.items():
-        unit_event(
-            None, state, f"{len(indexes)} unit(s) {state}: {reason}", max(indexes) / max(1, total),
-            data={"count": len(indexes), "reason": reason, "first_index": min(indexes), "last_index": max(indexes), "total": total},
-            phase="units",
-        )
 
 
 def _unstarted(unit_id: str, relative: str, state: str, reason: str, evidence_context: str = "source-only") -> dict[str, Any]:

@@ -4,7 +4,7 @@ import codecs
 import hashlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from ..events import EVENTS_FILE
 
@@ -72,6 +72,28 @@ def utf8_validation(path: Path, chunk_size: int = 1024 * 1024) -> tuple[bool, di
     except OSError as exc:
         return False, {"byte_offset": None, "reason": str(exc)}
     return True, None
+
+
+def announce_never_ran(unit_event: Any, units: Sequence[Mapping[str, Any]], total: int) -> None:
+    """One event per (status, reason) for the units that never ran.
+
+    A budget that runs out with a thousand units left used to emit a thousand
+    rows; the manifest still records every unit, the stream records the fact.
+    """
+    batches: dict[tuple[str, str], list[int]] = {}
+    for index, unit in enumerate(units, 1):
+        if "process" in unit or unit.get("status") not in {"unscheduled", "interrupted", "skipped"}:
+            continue
+        batches.setdefault((str(unit["status"]), str(unit.get("reason") or "")), []).append(index)
+    for (state, reason), indexes in batches.items():
+        unit_event(
+            None, state, f"{len(indexes)} unit(s) {state}: {reason}", max(indexes) / max(1, total),
+            data={
+                "count": len(indexes), "reason": reason, "first_index": min(indexes), "last_index": max(indexes),
+                "total": total,
+            },
+            phase="units",
+        )
 
 
 def output_room(budget: Any) -> int:

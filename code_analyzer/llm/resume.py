@@ -56,8 +56,16 @@ from .units import coverage_report
 
 # A unit in one of these states was never given to the model, or was cut off
 # before it answered: both are resumable.  "failed" is not -- the model
-# answered and the answer was unusable, and repeating it is not resumption.
+# answered and the answer was unusable, and repeating it is not resumption --
+# with one exception: a session the provider never carried (a transport
+# failure, ``failure_class == "transport"``) is a unit no model ever saw.
 RESUMABLE = ("unscheduled", "interrupted")
+RETRYABLE_FAILURE_CLASSES = ("transport",)
+
+
+def resumable(unit: dict[str, Any]) -> bool:
+    status = unit.get("status")
+    return status in RESUMABLE or (status == "failed" and unit.get("failure_class") in RETRYABLE_FAILURE_CLASSES)
 
 
 def run_resume(
@@ -87,7 +95,7 @@ def run_resume(
         (name, unit)
         for name in sorted(blocks, key=_producer_order)
         for unit in blocks[name].get("units", [])
-        if isinstance(unit, dict) and unit.get("status") in RESUMABLE
+        if isinstance(unit, dict) and resumable(unit)
     ]
     if not pending:
         progress("resume: every unit already carries a result; nothing to scan")
@@ -160,7 +168,7 @@ def run_resume(
             records.extend(state.execute_all(tasks))
 
     resumed = {(record["producer"], record["id"]): record for record in records}
-    resolved = sum(record["status"] not in RESUMABLE for record in records)
+    resolved = sum(not resumable(record) for record in records)
     for name, block in blocks.items():
         units = [
             resumed.get((name, str(unit.get("id") or "")), unit)
@@ -301,7 +309,7 @@ def _unit_payload(run_dir: Path, unit_id: str) -> dict[str, Any] | None:
 def _exit_code(every_unit: list[dict[str, Any]], records: list[dict[str, Any]]) -> int:
     if any(record["status"] == "interrupted" for record in records):
         return EXIT_INTERRUPTED
-    return EXIT_COMPLETE if not any(unit.get("status") in RESUMABLE for unit in every_unit) else EXIT_PARTIAL
+    return EXIT_COMPLETE if not any(resumable(unit) for unit in every_unit) else EXIT_PARTIAL
 
 
 def _producer_order(name: str) -> tuple[int, str]:

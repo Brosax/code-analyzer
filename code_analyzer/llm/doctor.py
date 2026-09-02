@@ -90,6 +90,25 @@ def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: fl
     return result
 
 
+def endpoint_reachable(settings: dict[str, Any], *, timeout: float = 15.0) -> tuple[bool, str | None]:
+    """Is the endpoint answering and serving the configured model?  ``(ok, reason)``.
+
+    The cheap half of :func:`probe_llm` -- a model listing, no generation --
+    so a scan can refuse a dead endpoint in seconds instead of discovering it
+    one unit at a time.
+    """
+    base = endpoint_url(settings).rstrip("/")
+    model = str(settings.get("model", "") or "")
+    try:
+        key = api_key(settings)
+    except UserError as exc:
+        return False, str(exc)
+    models = _models(base, key, model, timeout=timeout)
+    if not models["reachable"] or not models["model_present"]:
+        return False, str(models["reason"] or "the endpoint did not answer")
+    return True, None
+
+
 def _sdk_version() -> str | None:
     """The runtime version, or None when there is no runtime.
 

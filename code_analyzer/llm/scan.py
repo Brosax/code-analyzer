@@ -21,6 +21,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -42,6 +43,7 @@ from ..status import aggregate_units, counts
 from ..tools import LLM_PRODUCERS
 from . import replan
 from .context import build_unit_prompt, render_blocks
+from .doctor import endpoint_reachable
 from .risk import tier_rank
 from .skills import Skill, load_skill, skills_directory
 from .units import build_plan, coverage_report, unit_source
@@ -85,7 +87,7 @@ def run(
     model, endpoint or runtime problem: the phase reports its own failure.
     """
     progress = progress or (lambda _message: None)
-    unit_event = unit_event or (lambda _producer, _unit, _status, _message, _progress: None)
+    unit_event = unit_event or (lambda *_args, **_kwargs: None)
     settings = config["llm"]
     scanners = [name for name in LLM_PRODUCERS if name in set(settings["scanners"])]
     if not scanners:
@@ -99,6 +101,14 @@ def run(
             settings,
             "the deepseek-harness runtime is not importable; install it or set [llm] enabled = false",
         )
+    if open_runtime is None:
+        # Refuse a dead endpoint in seconds.  The last real run spent an hour
+        # learning this one unit at a time: every session ended in
+        # TRANSPORT / Connection error and the budget went with them.
+        reachable, why = endpoint_reachable(settings)
+        if not reachable:
+            progress(f"llm: endpoint unreachable: {why}")
+            return failed(settings, f"endpoint unreachable: {why}")
 
     plan = build_plan(source, inventory, config=config, cancelled=cancelled)
     (run_dir / "llm").mkdir(parents=True, exist_ok=True)
@@ -142,6 +152,7 @@ def run(
             output_event=output_event,
             cancelled=cancelled,
             open_runtime=open_runtime,
+            phase_event=phase_event,
         )
         records, rounds = _rounds(state, plan, units, scanners, config, progress, phase_event)
 
@@ -161,7 +172,7 @@ def run(
         "requested": True,
         "enabled": True,
         "status": aggregate_units(every_unit, applicable=bool(every_unit)),
-        "reason": None,
+        "reason": state.breaker_open,
         "model": str(settings["model"]),
         "endpoint": endpoint_url(settings),
         "sdk_version": _sdk_version(),
@@ -539,8 +550,10 @@ class _Phase:
         output_event: Callable[[str, str, str, str], None] | None,
         cancelled: Callable[[], bool] | None,
         open_runtime: OpenRuntime | None,
+        phase_event: Callable[..., None] | None = None,
     ) -> None:
         self.source = source
+        self.phase_event = phase_event
         self.run_dir = run_dir
         self.settings = settings
         self.grace = grace
@@ -574,6 +587,18 @@ class _Phase:
         # left is one fact, not 250 000 rows.
         self._batches: dict[tuple[str, str, str], dict[str, int]] = {}
         self._batched = 0
+        # The circuit breaker: this many consecutive transport failures in a
+        # row mean the endpoint is gone, and the rest of the phase is
+        # unscheduled at once rather than one dead session at a time.
+        self._breaker_limit = int(settings.get("consecutive_failure_limit") or 0)
+        self._consecutive = 0
+        self.breaker_open: str | None = None
+        # What the heartbeat's ETA is computed from: the last sessions'
+        # durations and completion tokens, cache replays excluded.
+        self._window: deque[tuple[float, int]] = deque(maxlen=20)
+        self._settled = 0
+        self._in_flight = 0
+        self.refunded = {"prompt_tokens": 0, "completion_tokens": 0}
 
     # --- scheduling ---------------------------------------------------------
 
@@ -626,12 +651,14 @@ class _Phase:
         unit_id = unit["unit_id"]
         if self.is_cancelled():
             return self._report(task, self._unstarted(task, "interrupted", "run interrupted"))
+        if self.breaker_open:
+            return self._report(task, self._unstarted(task, "unscheduled", self.breaker_open))
         blocks = [self._directive(producer, unit), *self.prompts[unit_id]]
         prompt = render_blocks(blocks)
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             return self._report(task, self._unstarted(task, "unscheduled", "total budget exhausted"))
-        affordable, reason = self._reserve(prompt)
+        affordable, reason, estimate = self._reserve(prompt)
         if not affordable:
             return self._report(task, self._unstarted(task, "unscheduled", reason))
 
@@ -648,12 +675,15 @@ class _Phase:
             (index - 1) / max(1, self.total),
             data={**self._facts(index, unit), "cached": cached is not None},
         )
+        with self._ledger:
+            self._in_flight += 1
         stop = threading.Event()
         beat = threading.Thread(
             target=self._heartbeat, args=(stop, index, producer, unit), daemon=True,
             name=f"llm-heartbeat-{index}",
         )
         beat.start()
+        self._step(producer, unit_id, "replaying" if cached is not None else "prompting")
         try:
             runtime: ContextManager[Any] = (
                 _Replay(settings, cached) if cached is not None
@@ -670,7 +700,12 @@ class _Phase:
         finally:
             stop.set()
             beat.join(timeout=1.0)
+            with self._ledger:
+                self._in_flight -= 1
+        self._step(producer, unit_id, "validating")
         record, provider_stopped = _provider_stop(record)
+        self._release(record, estimate, cached is not None)
+        self._observe(record, cached is not None)
         if provider_stopped:
             resync_meta_status(
                 unit_directory(self.run_dir, producer, unit_id, self.round_index),
@@ -683,6 +718,8 @@ class _Phase:
         # exists to prevent.
         cacheable = record.get("status") in {"completed", "partial"} and not provider_stopped
         if cached is None and cacheable:
+            if getattr(self.cache, "enabled", True):
+                self._step(producer, unit_id, "caching")
             self.cache.store(key, unit_directory(self.run_dir, producer, unit_id, self.round_index), self.run_dir.name)
         # A replayed unit costs the provider nothing, so its measured usage
         # belongs to the run that paid for it, not to this one.
@@ -692,7 +729,7 @@ class _Phase:
 
     # --- budget -------------------------------------------------------------
 
-    def _reserve(self, prompt: str) -> tuple[bool, str]:
+    def _reserve(self, prompt: str) -> tuple[bool, str, int]:
         estimate = max(1, math.ceil(len(prompt) / CHARS_PER_TOKEN))
         reservation = int(self.settings["max_completion_tokens"])
         # A unit the endpoint would truncate is refused, not trimmed: a scanner
@@ -704,15 +741,87 @@ class _Phase:
             return False, (
                 f"unit would exceed the endpoint's {window}-token context window "
                 f"(Ollama: set OLLAMA_CONTEXT_LENGTH on the host or pin num_ctx in a Modelfile)"
-            )
+            ), estimate
         with self._ledger:
             if self.prompt_spent + estimate > self.prompt_budget:
-                return False, "prompt token budget exhausted"
+                return False, "prompt token budget exhausted", estimate
             if self.completion_reserved + reservation > self.completion_budget:
-                return False, "completion token budget exhausted"
+                return False, "completion token budget exhausted", estimate
             self.prompt_spent += estimate
             self.completion_reserved += reservation
-        return True, ""
+        return True, "", estimate
+
+    def _release(self, record: dict[str, Any], estimate: int, cached: bool) -> None:
+        """Give back what a finished session did not use.
+
+        The reservation is made before dispatch and used to stay spent for
+        ever: 394 dead sessions of the last real run held 788 000 completion
+        tokens they never generated, and 255 648 tasks went unscheduled for a
+        budget nobody had consumed.  Refunds follow the provider's own count
+        when it reported one; a transport failure never reached a model, so
+        its prompt estimate comes back too.
+        """
+        usage = record.get("usage_measured") if isinstance(record.get("usage_measured"), dict) else {}
+        requests = int(usage.get("requests") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        reservation = int(self.settings["max_completion_tokens"])
+        with self._ledger:
+            if requests > 0 and not cached:
+                unused = max(0, reservation - min(reservation, completion))
+                self.completion_reserved -= unused
+                self.refunded["completion_tokens"] += unused
+            if record.get("failure_class") == "transport" and not cached:
+                back = min(estimate, self.prompt_spent)
+                self.prompt_spent -= back
+                self.refunded["prompt_tokens"] += back
+
+    def _observe(self, record: dict[str, Any], cached: bool) -> None:
+        """Feed the ETA window and the circuit breaker with one terminal record."""
+        tripped: dict[str, Any] | None = None
+        usage = record.get("usage_measured") if isinstance(record.get("usage_measured"), dict) else {}
+        with self._ledger:
+            self._settled += 1
+            duration = record.get("duration_seconds")
+            if isinstance(duration, (int, float)) and duration > 0 and not cached:
+                self._window.append((float(duration), int(usage.get("completion_tokens") or 0)))
+            if record.get("failure_class") == "transport" and not cached:
+                self._consecutive += 1
+                if self._breaker_limit and self._consecutive >= self._breaker_limit and not self.breaker_open:
+                    failure = record.get("provider_failure") if isinstance(record.get("provider_failure"), dict) else {}
+                    tripped = {
+                        "consecutive": self._consecutive, "code": str(failure.get("code") or "TRANSPORT"),
+                        "message": str(failure.get("message") or ""),
+                    }
+                    self.breaker_open = (
+                        f"provider unreachable: {tripped['code']} {tripped['message']} "
+                        f"(circuit breaker after {tripped['consecutive']} consecutive failures)"
+                    ).strip()
+            elif record.get("status") in {"completed", "partial"}:
+                self._consecutive = 0
+        if tripped is not None and self.phase_event is not None:
+            self.phase_event(
+                "breaker_open",
+                f"circuit breaker opened after {tripped['consecutive']} consecutive {tripped['code']} failures",
+                tripped,
+            )
+
+    def rate(self) -> dict[str, Any]:
+        """Throughput and ETA from the recent window, with the basis stated."""
+        with self._ledger:
+            window = list(self._window)
+            settled, in_flight = self._settled, self._in_flight
+        remaining = max(0, self.total - settled)
+        if not window:
+            return {"tok_s": None, "eta_seconds": None, "basis": None, "remaining": remaining, "in_flight": in_flight}
+        seconds = sum(duration for duration, _tokens in window)
+        tokens = sum(count for _duration, count in window)
+        mean = seconds / len(window)
+        return {
+            "tok_s": round(tokens / seconds, 1) if tokens and seconds else None,
+            "eta_seconds": round(remaining * mean / max(1, self.jobs), 1),
+            "basis": f"mean of the last {len(window)} session(s) {mean:.1f}s, {self.jobs} at a time, {remaining} remaining",
+            "remaining": remaining, "in_flight": in_flight,
+        }
 
     def budget_state(self) -> dict[str, Any]:
         return {
@@ -728,6 +837,8 @@ class _Phase:
             # before it is spent -- but the run now records both, so the
             # estimate can be checked against reality instead of trusted.
             "measured": self.measured,
+            # Reservations handed back by finished sessions (see _release).
+            "refunded": dict(self.refunded),
         }
 
     def account(self, record: dict[str, Any]) -> None:
@@ -811,27 +922,38 @@ class _Phase:
             "Put any rationale inside each finding's description field, not outside the object.",
         ])}
 
-    def _forward(self, producer: str, unit_id: str) -> Callable[[dict[str, Any]], None] | None:
-        if self.output_event is None:
-            return None
+    def _forward(self, producer: str, unit_id: str) -> Callable[[dict[str, Any]], None]:
+        """Turn the SDK's notification stream into steps (always) and output rows (live only)."""
+        last: dict[str, str] = {"step": ""}
+
+        def step(name: str, detail: str = "") -> None:
+            label = f"{name} {detail}".strip()
+            if label != last["step"]:
+                last["step"] = label
+                self._step(producer, unit_id, name, detail)
 
         def forward(event: dict[str, Any]) -> None:
             kind, data = _unwrap_notification(event)
-            if kind == "assistant/chunk":
+            text = None
+            if kind == "turn/start":
+                step("waiting")
+            elif kind == "assistant/chunk":
                 chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
-                if chunk.get("type") != "text" or not chunk.get("text"):
-                    return
-                text = str(chunk["text"])[:2000]
+                if chunk.get("type") == "text" and chunk.get("text"):
+                    step("streaming")
+                    text = str(chunk["text"])[:2000]
             elif kind.startswith("tool/call"):
-                text = f"tool {data.get('name') or data.get('tool') or ''}".strip()
+                name = str(data.get("name") or data.get("tool") or "")
+                step("reading", name)
+                text = f"tool {name}".strip()
             elif kind == "llm/retry":
                 failure = data.get("failure") if isinstance(data.get("failure"), dict) else {}
+                step("retry", f"{data.get('retry')}/{data.get('maxRetries')} {failure.get('code') or ''}".strip())
                 text = f"retry {data.get('retry')}/{data.get('maxRetries')}: {failure.get('code')} {failure.get('message')}"
-            else:
-                # Turn and step boundaries, usage chunks, status pings: the
-                # session log keeps them; the live pane has nothing to show.
-                return
-            self.output_event(producer, unit_id, "agent", f"{kind}: {text}".strip())
+            elif kind == "turn/end":
+                step("parsing")
+            if text is not None and self.output_event is not None:
+                self.output_event(producer, unit_id, "agent", f"{kind}: {text}".strip())
 
         return forward
 
@@ -853,7 +975,7 @@ class _Phase:
             self.unit_event(producer, unit["unit_id"], "heartbeat", message, None, data={
                 **self._facts(index, unit), "elapsed": round(elapsed, 1),
                 "remaining_budget_seconds": round(remaining, 1), "prompt_tokens_estimated": self.prompt_spent,
-                "measured": dict(self.measured),
+                "measured": dict(self.measured), "jobs": self.jobs, **self.rate(),
             })
 
     def _decorate(self, record: dict[str, Any], task: Task, skill: Skill) -> dict[str, Any]:
@@ -896,13 +1018,23 @@ class _Phase:
         if "artifacts" in record and not record["artifacts"] and status in {"unscheduled", "interrupted"}:
             self._tally(producer, status, str(record.get("reason") or ""), index)
             return record
+        cache = record.get("cache") if isinstance(record.get("cache"), dict) else {}
+        failure = record.get("provider_failure") if isinstance(record.get("provider_failure"), dict) else {}
         self.unit_event(producer, record["id"], status, f"{status}; {detail}", index / max(1, self.total), data={
             **self._facts(index, unit), "reason": record.get("reason"),
             "finish_reason": record.get("finish_reason") or None,
+            "failure_class": record.get("failure_class"), "provider_code": failure.get("code"),
+            "duration_seconds": record.get("duration_seconds"),
             "finding_count": record.get("finding_count", 0), "malformed_count": record.get("malformed_count", 0),
             "valid_report": record.get("valid_report"),
+            "cache_hit": bool(cache.get("hit")), "source_run": cache.get("source_run"),
         })
         return record
+
+    def _step(self, producer: str, unit_id: str, step: str, detail: str = "") -> None:
+        """Where one unit is: prompting, waiting, retry k/N, streaming, reading, parsing, validating, caching."""
+        label = f"{step} {detail}".strip()
+        self.unit_event(producer, unit_id, "step", label, None, data={"step": step, "detail": detail or None})
 
     def _tally(self, producer: str, status: str, reason: str, index: int) -> None:
         with self._ledger:

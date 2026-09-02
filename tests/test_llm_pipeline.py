@@ -603,6 +603,9 @@ def _stable(summary: dict[str, Any]) -> dict[str, Any]:
             unit["artifacts"] = [
                 item for item in unit["artifacts"] if not item["path"].endswith("/meta.json")
             ]
+            # Provenance, not evidence: a replay says so, and says where from.
+            unit.pop("cache", None)
+            unit.pop("duration_seconds", None)
     return summary
 
 

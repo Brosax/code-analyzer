@@ -1,0 +1,414 @@
+{
+  "events": [
+    {
+      "data": {
+        "turn": 1
+      },
+      "seq": 1,
+      "time": 1788270081000,
+      "type": "turn/start"
+    },
+    {
+      "data": {
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 2,
+      "time": 1788270081001,
+      "type": "step/start"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 3,
+      "time": 1788270081010,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 4,
+      "time": 1788270081010,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "delayMs": 471,
+        "failure": {
+          "code": "TRANSPORT",
+          "message": "Connection error."
+        },
+        "maxRetries": 5,
+        "mode": "normal",
+        "policyKey": "[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",\"SERVER\",\"TIMEOUT\",\"TRANSPORT\"],500,10000,0.1]",
+        "provider": "code-analyzer-endpoint",
+        "retry": 1,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 5,
+      "time": 1788270081011,
+      "type": "llm/retry"
+    },
+    {
+      "data": {
+        "retry": 1,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 6,
+      "time": 1788270081481,
+      "type": "llm/retry-started"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 7,
+      "time": 1788270081481,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 8,
+      "time": 1788270081481,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "delayMs": 931,
+        "failure": {
+          "code": "TRANSPORT",
+          "message": "Connection error."
+        },
+        "maxRetries": 5,
+        "mode": "normal",
+        "policyKey": "[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",\"SERVER\",\"TIMEOUT\",\"TRANSPORT\"],500,10000,0.1]",
+        "provider": "code-analyzer-endpoint",
+        "retry": 2,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 9,
+      "time": 1788270081482,
+      "type": "llm/retry"
+    },
+    {
+      "data": {
+        "retry": 2,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 10,
+      "time": 1788270082412,
+      "type": "llm/retry-started"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 11,
+      "time": 1788270082412,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 12,
+      "time": 1788270082412,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "delayMs": 1913,
+        "failure": {
+          "code": "TRANSPORT",
+          "message": "Connection error."
+        },
+        "maxRetries": 5,
+        "mode": "normal",
+        "policyKey": "[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",\"SERVER\",\"TIMEOUT\",\"TRANSPORT\"],500,10000,0.1]",
+        "provider": "code-analyzer-endpoint",
+        "retry": 3,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 13,
+      "time": 1788270082413,
+      "type": "llm/retry"
+    },
+    {
+      "data": {
+        "retry": 3,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 14,
+      "time": 1788270084325,
+      "type": "llm/retry-started"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 15,
+      "time": 1788270084325,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 16,
+      "time": 1788270084325,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "delayMs": 3744,
+        "failure": {
+          "code": "TRANSPORT",
+          "message": "Connection error."
+        },
+        "maxRetries": 5,
+        "mode": "normal",
+        "policyKey": "[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",\"SERVER\",\"TIMEOUT\",\"TRANSPORT\"],500,10000,0.1]",
+        "provider": "code-analyzer-endpoint",
+        "retry": 4,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 17,
+      "time": 1788270084326,
+      "type": "llm/retry"
+    },
+    {
+      "data": {
+        "retry": 4,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 18,
+      "time": 1788270088069,
+      "type": "llm/retry-started"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 19,
+      "time": 1788270088069,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 20,
+      "time": 1788270088069,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "delayMs": 8717,
+        "failure": {
+          "code": "TRANSPORT",
+          "message": "Connection error."
+        },
+        "maxRetries": 5,
+        "mode": "normal",
+        "policyKey": "[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",\"SERVER\",\"TIMEOUT\",\"TRANSPORT\"],500,10000,0.1]",
+        "provider": "code-analyzer-endpoint",
+        "retry": 5,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 21,
+      "time": 1788270088070,
+      "type": "llm/retry"
+    },
+    {
+      "data": {
+        "retry": 5,
+        "retryId": "5f126110-7c3a-410e-8b6e-f5e94e65df2e",
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 22,
+      "time": 1788270096786,
+      "type": "llm/retry-started"
+    },
+    {
+      "data": {
+        "chunk": {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0
+          }
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 23,
+      "time": 1788270096786,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "chunk": {
+          "reason": {
+            "failure": {
+              "code": "TRANSPORT",
+              "message": "Connection error."
+            },
+            "kind": "error"
+          },
+          "type": "finish"
+        },
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 24,
+      "time": 1788270096786,
+      "type": "assistant/chunk"
+    },
+    {
+      "data": {
+        "step": 1,
+        "turn": 1
+      },
+      "seq": 25,
+      "time": 1788270096787,
+      "type": "step/end"
+    },
+    {
+      "data": {
+        "reason": {
+          "error": {
+            "code": "TRANSPORT",
+            "message": "Connection error."
+          },
+          "kind": "error"
+        },
+        "turn": 1
+      },
+      "seq": 26,
+      "time": 1788270096787,
+      "type": "turn/end"
+    }
+  ],
+  "final_response": "",
+  "finish_reason": "error",
+  "notifications": [],
+  "session_id": "7f3e5a1c9b2d4e60"
+}

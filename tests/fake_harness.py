@@ -130,6 +130,38 @@ def unavailable(message: str = "dsh runtime is not installed") -> Response:
     return Response(finish_reason="error", error=HarnessUnavailable, error_message=message)
 
 
+def transport_failed(*, delay: float = 0.0) -> Response:
+    """A session the provider never carried, exactly as the pinned SDK reports it.
+
+    Six requests, five retries, zero tokens, ``finish_reason="error"`` and an
+    empty reply: the shape of every one of the 394 sessions of the run that
+    motivated the circuit breaker.  ``delay`` is the wall time it burns.
+    """
+    recorded = fixture("transport-failed")
+    return Response(
+        final_response=recorded.final_response, finish_reason=recorded.finish_reason,
+        events=recorded.events, notifications=recorded.notifications, session_id=recorded.session_id, delay=delay,
+    )
+
+
+def steps(*kinds: str, text: str = "") -> tuple[dict[str, Any], ...]:
+    """Script the SDK's step notifications for a display test: ``turn/start``, ``tool/call``, ...
+
+    ``text`` is what an ``assistant/chunk`` text chunk carries.
+    """
+    scripted: list[dict[str, Any]] = []
+    for index, kind in enumerate(kinds, 1):
+        data: dict[str, Any] = {"turn": 1, "step": 1}
+        if kind == "assistant/chunk":
+            data["chunk"] = {"type": "text", "text": text}
+        elif kind == "tool/call":
+            data["name"] = "read"
+        elif kind == "llm/retry":
+            data.update({"retry": 1, "maxRetries": 5, "failure": {"code": "TRANSPORT", "message": "Connection error."}})
+        scripted.append({"type": kind, "seq": index, "time": 1788270081000 + index, "data": data})
+    return tuple(scripted)
+
+
 def _session_id(producer: str, unit_id: str, attempt: int) -> str:
     # Derived, never random: session ids reach persisted artifacts.
     stable = f"{producer}\0{unit_id}\0{attempt}".encode()

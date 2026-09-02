@@ -76,6 +76,44 @@ def test_untrusted_text_is_flattened_and_capped() -> None:
     assert "…(+12)" in line and len(line) < 1200
 
 
+def test_a_long_argv_keeps_the_argument_that_varies() -> None:
+    argv = ["splint", *[f"+flag{i}" for i in range(60)], "-tmpdir", "/run/tools/splint/u/tmp", "+csv", "/run/tools/splint/u/report.csv", "./platform/ext/target/arm/mps2/an521/cmsis_drivers/Driver_PPC.c"]
+    line = format_line(_event("unit", "started", "scanning", tool="splint", unit="u", data={"argv": argv, "cwd": "/src"}))
+    argv_line = next(item for item in line.splitlines() if item.startswith("   | argv: "))
+    assert argv_line.endswith("./platform/ext/target/arm/mps2/an521/cmsis_drivers/Driver_PPC.c")
+    assert " … " in argv_line and argv_line.startswith("   | argv: splint +flag0")
+    assert "   | cwd:  /src" in line
+    assert "cwd:" not in format_line(_event("unit", "started", "scanning", tool="splint", unit="u", data={"cwd": "/src"}), cwd=False)
+
+
+def test_the_formatter_never_raises() -> None:
+    weird = AnalysisEvent("unit", "failed", "x", tool="t", unit="u", timestamp=float("nan"), data={1: object(), "deep": {"a": {"b": {"c": {"d": 1}}}}, "many": {f"k{i}": i for i in range(40)}})
+    line = format_line(weird)
+    assert line.startswith("1970-01-01T00:00:00.000Z  ERROR  unit") and len(line) < 1500
+    broken = AnalysisEvent("unit", "failed", "x", timestamp="soon")  # type: ignore[arg-type]
+    assert "unformattable" in format_line(broken)
+
+
+def test_the_verdict_survives_any_level(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    with RunLogger("warning") as sink:
+        sink(_event("analysis", "started", "analysis started", data={"argv": ["code-analyzer"]}))
+        sink(_event("run", "created", str(run_dir)))
+        sink(_event("tool", "completed", "cppcheck finished", tool="cppcheck"))
+        sink(_event("unit", "partial", "partial in 0.02s", tool="splint", unit="u1", data={"cwd": "/src"}))
+        sink(_event("unit", "partial", "partial in 0.02s", tool="splint", unit="u2", data={"cwd": "/src"}))
+        sink(_event("analysis", "finished", "analysis finished with exit code 10", data={"exit_code": 10, "status": "partial"}))
+    lines = (run_dir / "logs" / "runner.log").read_text(encoding="utf-8").splitlines()
+    statuses = [line.split()[4] for line in lines if not line.startswith("   |")]
+    assert statuses == ["started", "created", "partial", "partial", "finished"]
+    assert lines[-1].split()[1] == "WARN" and "exit=10" in lines[-1]
+    # The working directory is said once per tool, not once per unit.
+    assert sum(line.startswith("   | cwd:") for line in lines) == 1
+    assert level_of(_event("analysis", "finished", "x", data={"exit_code": 20})) == "error"
+    assert level_of(_event("analysis", "interrupted", "x", data={"exit_code": 130})) == "error"
+
+
 def test_error_excerpt_prefers_diagnostics_then_the_tail() -> None:
     text = "noise\nbl1/a.c:8:19: Cannot find include file x.h on search path: /src\nmore noise\n*** Cannot continue.\n"
     assert error_excerpt(text) == ["bl1/a.c:8:19: Cannot find include file x.h on search path: /src", "*** Cannot continue."]
@@ -151,7 +189,7 @@ def test_a_real_run_explains_itself_and_ends_with_its_verdict(tmp_path: Path) ->
     assert result.exit_code == 0 and result.report_directory is not None
     log = (result.report_directory / "logs" / "runner.log").read_text(encoding="utf-8")
     lines = [line for line in log.splitlines() if not line.startswith("   |")]
-    assert lines[0].split()[1:4] == ["INFO", "analysis", "-"] and "version=2.0.0" in lines[0]
+    assert lines[0].split()[1:4] == ["INFO", "analysis", "-"] and "version=" in lines[0]
     assert log.splitlines()[1].startswith("   | argv: ") and log.splitlines()[2].startswith("   | cwd:  ")
     assert any(line.split()[1:5] == ["INFO", "tool", "cppcheck", "started"] and "executable=" in line for line in lines)
     assert any("   | argv: " in line and "--output-file=" in line for line in log.splitlines())

@@ -135,6 +135,101 @@ def measured_usage(events: list[dict[str, Any]]) -> dict[str, int]:
     return {"prompt_tokens": prompt, "completion_tokens": completion, "requests": requests}
 
 
+# The failure codes the SDK's own retry policy names (seen verbatim in a real
+# session's ``llm/retry`` events).  A session that ends on one never reached a
+# model, so it is resumable; a model that answered and was wrong is not.
+RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset({"TRANSPORT", "TIMEOUT", "RATE_LIMIT", "SERVER", "EMPTY_RESPONSE"})
+MAX_TIMELINE = 40
+
+
+def event_body(item: Any) -> tuple[str, dict[str, Any]]:
+    """The type and data one event or notification carries, whichever shape it has."""
+    if not isinstance(item, dict):
+        return "", {}
+    payload = item.get("payload")
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if not isinstance(event, dict):
+        event = item
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return str(event.get("type", "") or ""), data
+
+
+def provider_failure(events: list[dict[str, Any]], notifications: list[Any] | None = None) -> dict[str, Any] | None:
+    """Why the provider ended a session in error, from the session's own stream.
+
+    The SDK does not raise on a transport failure: it retries, gives up, and
+    hands back an ordinary result with ``finish_reason="error"`` and an empty
+    reply.  The cause lives only in the events -- ``llm/retry`` with a
+    failure code, a ``turn/end`` whose reason is an error -- which is what an
+    operator reading "response: empty response" needed to see.  ``None`` when
+    the stream records no provider error.
+    """
+    stream = events if events else list(notifications or [])
+    code: Any = None
+    message: Any = None
+    retries = requests = 0
+    for item in stream:
+        kind, data = event_body(item)
+        if kind == "llm/retry":
+            retries += 1
+            failure = data.get("failure") if isinstance(data.get("failure"), dict) else {}
+            code, message = failure.get("code", code), failure.get("message", message)
+        elif kind == "assistant/chunk":
+            chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
+            if chunk.get("type") == "usage":
+                requests += 1
+            elif chunk.get("type") == "finish":
+                reason = chunk.get("reason") if isinstance(chunk.get("reason"), dict) else {}
+                if reason.get("kind") == "error":
+                    failure = reason.get("failure") or reason.get("error") or {}
+                    if isinstance(failure, dict):
+                        code, message = failure.get("code") or code, failure.get("message") or message
+        elif kind == "turn/end":
+            reason = data.get("reason") if isinstance(data.get("reason"), dict) else {}
+            if reason.get("kind") == "error":
+                failure = reason.get("error") or reason.get("failure") or {}
+                if isinstance(failure, dict):
+                    code, message = failure.get("code") or code, failure.get("message") or message
+    if code is None and message is None:
+        return None
+    label = str(code or "UNKNOWN")
+    return {
+        "code": label, "message": str(message or ""), "requests": requests, "retries": retries,
+        "class": "transport" if label.upper() in RETRYABLE_FAILURE_CODES else "provider",
+    }
+
+
+def timeline(events: list[dict[str, Any]], limit: int = MAX_TIMELINE) -> list[dict[str, Any]]:
+    """The session's steps as a short human list: what happened, when, in order."""
+    result: list[dict[str, Any]] = []
+    for item in events:
+        kind, data = event_body(item)
+        step = detail = None
+        if kind == "turn/start":
+            step, detail = "waiting", f"turn {data.get('turn', '?')}"
+        elif kind == "llm/retry":
+            failure = data.get("failure") if isinstance(data.get("failure"), dict) else {}
+            step = "retry"
+            detail = f"{data.get('retry', '?')}/{data.get('maxRetries', '?')} {failure.get('code', '')}: {failure.get('message', '')}"
+        elif kind.startswith("tool/call"):
+            step, detail = "tool", str(data.get("name") or data.get("tool") or "")
+        elif kind == "assistant/chunk":
+            chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
+            if chunk.get("type") == "finish":
+                reason = chunk.get("reason") if isinstance(chunk.get("reason"), dict) else {}
+                step, detail = "finish", str(reason.get("kind") or "")
+        elif kind == "turn/end":
+            reason = data.get("reason") if isinstance(data.get("reason"), dict) else {}
+            step, detail = "turn_end", str(reason.get("kind") or "")
+        if step is None:
+            continue
+        when = item.get("time") if isinstance(item, dict) else None
+        result.append({"t": when if isinstance(when, (int, float)) else None, "step": step, "detail": str(detail)[:200]})
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _count(usage: dict[str, Any], *keys: str) -> int:
     for key in keys:
         value = usage.get(key)

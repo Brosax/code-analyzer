@@ -10,7 +10,10 @@ from .config import validate_config
 from .doctor import probe_tool
 from .errors import UserError
 from .inventory import discover
+from .llm.doctor import endpoint_reachable
 from .tools import TOOL_NAMES
+
+LLM_PROBE_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,9 @@ class PreflightResult:
     compile_database: dict[str, Any] | None
     inventory_files: int | None
     tools: dict[str, dict[str, Any]]
+    # The LLM endpoint's answer to "are you there and serving the model",
+    # when the LLM lane is enabled; None otherwise.
+    llm: dict[str, Any] | None = None
 
 
 def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = True) -> PreflightResult:
@@ -76,7 +82,21 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
             tool_results[name] = result
             if result["status"] != "compatible":
                 issues.append(PreflightIssue("warning", f"tools.{name}.executable", f"{name}: {result['status']}"))
-    return PreflightResult(not any(item.severity == "error" for item in issues), tuple(issues), compile_info, inventory_files, tool_results)
+    llm_info: dict[str, Any] | None = None
+    if probe_tools and checked["llm"]["enabled"]:
+        # A scan that may run for hours must not find out one unit at a time
+        # that the tunnel is down.
+        reachable, reason = endpoint_reachable(checked["llm"], timeout=LLM_PROBE_SECONDS)
+        llm_info = {
+            "reachable": reachable, "reason": reason,
+            "endpoint": checked["llm"].get("endpoint"), "model": checked["llm"].get("model"),
+        }
+        if not reachable:
+            issues.append(PreflightIssue("warning", "llm.endpoint", f"LLM 端点不可达：{reason}"))
+    return PreflightResult(
+        not any(item.severity == "error" for item in issues), tuple(issues), compile_info, inventory_files,
+        tool_results, llm_info,
+    )
 
 
 def _field_from_error(message: str) -> str | None:

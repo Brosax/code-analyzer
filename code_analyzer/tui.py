@@ -54,7 +54,7 @@ from .config import (
 from .errors import UserError
 from .flow import WIDE_BREAKPOINT, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
-from .progress import animation_disabled_by_env
+from .progress import animation_disabled_by_env, single_line
 from .runlog import format_line
 from .tools import TOOL_NAMES
 
@@ -746,10 +746,10 @@ class AnalyzerApp(App[TuiOutcome]):
     @staticmethod
     def _format_log_event(event: AnalysisEvent) -> str:
         # The same line logs/runner.log gets, with the operator's clock; an
-        # analyzer's raw output keeps the short stream form.
+        # analyzer's raw output keeps a short stream form of its own.
         if event.phase == "output":
             clock = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
-            return f"{clock}  {event.tool or event.phase}/{event.unit or '-'}  [{event.stream or 'stdout'}]  {format_line(event, local=True).split('  ', 6)[-1]}"
+            return f"{clock}  {event.tool or event.phase}/{event.unit or '-'}  [{event.stream or 'stdout'}]  {single_line(event.message)}"
         return format_line(event, local=True)
 
     def _flush_log_queue(self) -> None:

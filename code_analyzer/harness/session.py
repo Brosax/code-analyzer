@@ -26,8 +26,10 @@ from .runtime import (
     RunOutcome,
     finish_status,
     measured_usage,
+    provider_failure,
     redact_credential,
     request_description,
+    timeline,
 )
 from .schema import SCHEMA_VERSION, parse_findings, response_unparsed, schema_hash
 from .verdict import VERDICT_SCHEMA_VERSION, parse_verdict, verdict_schema_hash
@@ -268,15 +270,35 @@ def _run_session(
             partial = list(exc.events)
 
     parsed = parse(None if outcome is None else outcome.final_response)
+    failure = provider_failure(outcome.events, outcome.notifications) if outcome is not None else None
+    failure_class: str | None = None
     if outcome is not None:
         status = finish_status(outcome.finish_reason, parsed.valid)
         reason = parsed.reason
+        if str(outcome.finish_reason or "").strip().lower() == "error" and failure is not None:
+            # The provider's own account beats "response: empty response":
+            # nothing reached the model, and the reason should say so.
+            status = "failed"
+            reason = (
+                f"provider {failure['code']}: {failure['message']} "
+                f"({failure['requests']} requests, {failure['retries']} retries)"
+            )
+            failure_class = failure["class"]
+        elif status == "timed_out":
+            failure_class = "timeout"
+        elif not parsed.valid:
+            failure_class = "parse"
+    elif status == "timed_out":
+        failure_class = "timeout"
+    elif status == "failed":
+        failure_class = "ceiling" if "ceiling" in str(reason or "") else "provider"
 
     # Everything below is persisted evidence that rebuild-dashboard and
     # recover-report re-derive the review from, so the credential is stripped
     # here rather than only on the way into a shareable archive.
     result = redact_credential(parsed.result, active)
     reason = redact_credential(reason, active)
+    failure = redact_credential(failure, active) if failure is not None else None
     write_json(
         directory / "response.json",
         redact_credential({
@@ -301,7 +323,7 @@ def _run_session(
     )
     write_json(
         directory / "meta.json",
-        _meta(producer, subject, status, started_at, outcome, parsed.counts, cache, partial),
+        _meta(producer, subject, status, started_at, outcome, parsed.counts, cache, partial, failure=failure),
     )
 
     record: dict[str, Any] = {
@@ -314,6 +336,10 @@ def _run_session(
         "evidence_context": "source-only",
         "finish_reason": outcome.finish_reason if outcome else "",
         "usage_measured": measured_usage(outcome.events if outcome else partial),
+        "duration_seconds": round(outcome.duration_seconds, 3) if outcome else None,
+        "failure_class": failure_class,
+        "provider_failure": failure,
+        "cache": {"hit": bool((cache or {}).get("hit", False)), "source_run": (cache or {}).get("source_run")},
         **parsed.counts,
         **redact_credential(parsed.record, active),
     }
@@ -371,6 +397,8 @@ def _meta(
     counts: dict[str, int],
     cache: dict[str, Any] | None,
     partial: list[dict[str, Any]] | None = None,
+    *,
+    failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     events = outcome.events if outcome else list(partial or [])
     return {
@@ -385,6 +413,11 @@ def _meta(
         "tool_call_count": _tool_calls(events),
         "notification_count": len(outcome.notifications) if outcome else 0,
         "usage_measured": measured_usage(events),
+        # The provider's own account of a failed session, and the session's
+        # steps in order: what an auditor wants first, kept in the file that
+        # already holds the volatile facts so the evidence set stays five files.
+        "provider_failure": failure,
+        "timeline": timeline(events),
         **counts,
         "cache": {
             "hit": bool((cache or {}).get("hit", False)),

@@ -11,7 +11,7 @@ from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
-from .common import attach_artifacts, output_room, unit_outcome
+from .common import announce_never_ran, attach_artifacts, output_room, unit_outcome
 
 
 def run(
@@ -50,7 +50,6 @@ def run(
         facts = {"index": index, "total": len(passes), "label": name, "files": len(files)}
         if cancelled is not None and cancelled():
             units.append({"id": name, "status": "interrupted", "input_files": files, "valid_report": False, "reason": "run interrupted", "evidence_context": evidence_context, "artifacts": []})
-            unit_event(name, "interrupted", "run interrupted", index / max(1, len(passes)), data={**facts, "reason": "run interrupted"})
             for later_name, _, later_files in passes[index:]:
                 units.append({"id": later_name, "status": "interrupted", "input_files": later_files, "valid_report": False, "reason": "run interrupted", "evidence_context": "build-aware" if later_name == "compile-db" else "source-only", "artifacts": []})
             break
@@ -63,7 +62,6 @@ def run(
         stderr = directory / "stderr.raw"
         if time.monotonic() >= deadline:
             units.append({"id": name, "status": "unscheduled", "input_files": files, "valid_report": False, "reason": "total budget exhausted", "evidence_context": evidence_context, "artifacts": []})
-            unit_event(name, "unscheduled", "unscheduled (budget exhausted)", index / max(1, len(passes)), data={**facts, "reason": "total budget exhausted"})
             continue
         argv = [
             executable, "--enable=all", "--inconclusive", "--check-level=exhaustive", "--check-library",
@@ -139,6 +137,7 @@ def run(
             for later_name, _, later_files in passes[len(units):]:
                 units.append({"id": later_name, "status": "interrupted", "input_files": later_files, "valid_report": False, "reason": "run interrupted", "evidence_context": "build-aware" if later_name == "compile-db" else "source-only", "artifacts": []})
             break
+    announce_never_ran(unit_event, units, len(passes))
     attempted_files = {path for unit in units if "process" in unit for path in unit["input_files"]}
     analyzed_files = {path for unit in units if unit.get("valid_report") for path in unit["input_files"]}
     return _result(units, len(attempted_files), len(analyzed_files), len(inventory))

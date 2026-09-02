@@ -60,6 +60,7 @@ def run_assess(
     progress: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     open_runtime: OpenRuntime | None = None,
+    unit_event: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Validate the pending candidates of one run and file the verdicts.
 
@@ -139,7 +140,7 @@ def run_assess(
                 prompts=prompts,
                 cache=_Cache(config, run_dir),
                 progress=progress,
-                unit_event=lambda *_args, **_kwargs: None,
+                unit_event=unit_event or (lambda *_args, **_kwargs: None),
                 output_event=None,
                 cancelled=cancelled,
                 open_runtime=open_runtime,

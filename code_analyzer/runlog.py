@@ -19,6 +19,7 @@ run's final status, because the runner emits it as the last event.
 """
 from __future__ import annotations
 
+import math
 import shlex
 import threading
 import time
@@ -56,13 +57,26 @@ _CONTINUATION_KEYS = frozenset({"error_excerpt", "argv", "cwd"})
 _SKIPPED_KEYS = frozenset({"total", "message", "dir"})
 MAX_VALUE_CHARS = 200
 MAX_LIST_ITEMS = 8
-MAX_ARGV_CHARS = 400
+MAX_MAPPING_ITEMS = 32
+# An argv longer than this keeps its head and its tail: the tail is where
+# the one argument that varies per unit -- the file -- lives.
+MAX_ARGV_CHARS = 600
+_ARGV_TAIL_CHARS = 200
+# Lines that frame the run are written whatever the level: without them a
+# log at "warning" would have no header and no verdict.
+_FRAME = frozenset({("run", "created"), ("analysis", "started"), ("analysis", "finished"), ("analysis", "interrupted")})
 
 
 def level_of(event: AnalysisEvent) -> str:
     """The severity a line carries, derived from the phase and status words."""
     if event.phase == "output" or event.status in DEBUG_STATUSES:
         return "debug"
+    if event.phase == "analysis" and event.status in {"finished", "interrupted"}:
+        # The verdict is graded by the exit code it announces.
+        code = (event.data or {}).get("exit_code") if isinstance(event.data, dict) else None
+        if code in (0, None) and event.status == "finished":
+            return "info"
+        return "warning" if code in (1, 10) else "error"
     if event.status in ERROR_STATUSES:
         return "error"
     if event.status in WARNING_STATUSES:
@@ -73,18 +87,33 @@ def level_of(event: AnalysisEvent) -> str:
     return "info"
 
 
-def format_line(event: AnalysisEvent, *, local: bool = False) -> str:
+def format_line(event: AnalysisEvent, *, local: bool = False, cwd: bool = True) -> str:
     """One event as its log line(s), continuation lines included.
 
     ``local`` swaps the UTC ISO stamp for a local ``HH:MM:SS`` clock, which is
-    what the TUI pane shows; the columns after it are identical.
+    what the TUI pane shows; the columns after it are identical.  ``cwd``
+    lets a writer that has already named the working directory skip the
+    repetition.  Never raises: a line the formatter cannot make is still a
+    line, because the producer thread behind it must not die of a log.
     """
+    try:
+        return _format_line(event, local=local, cwd=cwd)
+    except Exception as exc:  # noqa: BLE001 - the log must not take the run down
+        return f"{_stamp(0.0, local)}  ERROR  runlog         -                                 unformattable  {single_line(repr(event))[:400]}  error={_quote(f'{type(exc).__name__}: {exc}')}"
+
+
+def _stamp(timestamp: Any, local: bool) -> str:
+    value = float(timestamp) if isinstance(timestamp, (int, float)) and math.isfinite(float(timestamp)) else 0.0
+    value = max(0.0, value)
     if local:
-        stamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
-    else:
-        seconds = int(event.timestamp)
-        millis = min(999, int(round((event.timestamp - seconds) * 1000)))
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{millis:03d}Z"
+        return time.strftime("%H:%M:%S", time.localtime(value))
+    seconds = int(value)
+    millis = min(999, int(round((value - seconds) * 1000)))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{millis:03d}Z"
+
+
+def _format_line(event: AnalysisEvent, *, local: bool, cwd: bool) -> str:
+    stamp = _stamp(event.timestamp, local)
     level = _LABEL[level_of(event)]
     who = single_line(event.tool or "-")
     if event.unit:
@@ -104,13 +133,12 @@ def format_line(event: AnalysisEvent, *, local: bool = False) -> str:
         lines.extend(f"   | {single_line(str(item))[:MAX_VALUE_CHARS * 2]}" for item in excerpt[:10])
     argv = data.get("argv")
     if isinstance(argv, list) and argv:
-        joined = shlex.join(str(item) for item in argv)
+        joined = single_line(shlex.join(str(item) for item in argv))
         if len(joined) > MAX_ARGV_CHARS:
-            joined = joined[:MAX_ARGV_CHARS] + " …"
-        lines.append(f"   | argv: {single_line(joined)}")
-    cwd = data.get("cwd")
-    if cwd:
-        lines.append(f"   | cwd:  {single_line(str(cwd))}")
+            joined = joined[: MAX_ARGV_CHARS - _ARGV_TAIL_CHARS] + " … " + joined[-_ARGV_TAIL_CHARS:]
+        lines.append(f"   | argv: {joined}")
+    if cwd and data.get("cwd"):
+        lines.append(f"   | cwd:  {single_line(str(data['cwd']))}")
     return "\n".join(lines)
 
 
@@ -124,10 +152,10 @@ def _pairs(data: dict[str, Any]) -> list[str]:
                 ordered.append(f"index={data['index']}/{data['total']}")
             else:
                 ordered.append(f"{name}={_value(key, data[key])}")
-    for key in sorted(data):
+    for key in sorted(data, key=str):
         if key in seen or key in _CONTINUATION_KEYS or key in _SKIPPED_KEYS or data[key] is None:
             continue
-        ordered.append(f"{key}={_value(key, data[key])}")
+        ordered.append(f"{single_line(str(key))}={_value(str(key), data[key])}")
     return ordered
 
 
@@ -150,7 +178,9 @@ def _value(key: str, value: Any) -> str:
 def _flat(value: Any) -> str:
     """One list item or mapping as prose: ``k:v k:v`` for a mapping, else its text."""
     if isinstance(value, dict):
-        return " ".join(f"{k}:{single_line(str(v))}" for k, v in list(value.items())[:MAX_LIST_ITEMS])
+        items = list(value.items())
+        text = " ".join(f"{k}:{single_line(str(v))}" for k, v in items[:MAX_MAPPING_ITEMS])
+        return text + (f" …(+{len(items) - MAX_MAPPING_ITEMS})" if len(items) > MAX_MAPPING_ITEMS else "")
     return single_line(str(value))
 
 
@@ -187,6 +217,7 @@ class RunLogger:
         self._lock = threading.Lock()
         self._pending: list[AnalysisEvent] = []
         self._stream: IO[str] | None = None
+        self._last_cwd: dict[str, str] = {}
         self.path: Path | None = None
         if path is not None:
             self._open(path)
@@ -211,10 +242,20 @@ class RunLogger:
     def _write(self, event: AnalysisEvent) -> None:
         if self._stream is None or event.phase == "output":
             return
-        if _RANK[level_of(event)] < self._threshold:
+        framing = (event.phase, event.status) in _FRAME
+        if not framing and _RANK[level_of(event)] < self._threshold:
             return
-        self._stream.write(format_line(event) + "\n")
-        self._stream.flush()
+        # The working directory is one fact per tool, not one per unit.
+        cwd = (event.data or {}).get("cwd") if isinstance(event.data, dict) else None
+        repeat = bool(cwd) and self._last_cwd.get(str(event.tool)) == cwd
+        if cwd:
+            self._last_cwd[str(event.tool)] = str(cwd)
+        try:
+            self._stream.write(format_line(event, cwd=not repeat) + "\n")
+            self._stream.flush()
+        except (OSError, ValueError):
+            # A full disk or a closed handle must not stop the analyzers.
+            return
 
     def close(self) -> None:
         with self._lock:

@@ -11,7 +11,13 @@ from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
 from .adapter import Adapter, RunContext
-from .common import attach_artifacts, output_room, unit_outcome, utf8_validation
+from .common import (
+    announce_never_ran,
+    attach_artifacts,
+    output_room,
+    unit_outcome,
+    utf8_validation,
+)
 
 
 def shard_files(files: list[str], prefix_bytes: int = 200) -> list[list[str]]:
@@ -77,14 +83,12 @@ def run(
         facts = {"index": index, "total": len(shards), "label": name, "files": len(paths)}
         if cancelled is not None and cancelled():
             units.append({"id": name, "status": "interrupted", "input_files": paths, "valid_report": False, "reason": "run interrupted", "evidence_context": "source-only", "artifacts": []})
-            unit_event(name, "interrupted", "run interrupted", index / max(1, len(shards)), data={**facts, "reason": "run interrupted"})
             break
         directory = run_dir / "tools" / "flawfinder" / name
         directory.mkdir(parents=True, exist_ok=True)
         stdout, stderr, report = directory / "stdout.raw", directory / "stderr.raw", directory / "report.sarif"
         if time.monotonic() >= deadline:
             units.append({"id": name, "status": "unscheduled", "input_files": paths, "valid_report": False, "reason": "total budget exhausted", "evidence_context": "source-only", "artifacts": []})
-            unit_event(name, "unscheduled", "unscheduled (budget exhausted)", index / max(1, len(shards)), data={**facts, "reason": "total budget exhausted"})
             continue
         argv = [executable, "--sarif", "--minlevel=0", "--neverignore", "--columns", "--omittime", "--quiet", "--", *paths]
         unit_timeout = max(0.001, deadline - time.monotonic())
@@ -142,6 +146,7 @@ def run(
         for index in range(len(units) + 1, len(shards) + 1):
             paths = shards[index - 1]
             units.append({"id": f"shard-{index:04d}", "status": "interrupted", "input_files": paths, "valid_report": False, "reason": "run interrupted", "evidence_context": "source-only", "artifacts": []})
+    announce_never_ran(unit_event, units, len(shards))
     attempted = {path for unit in units if "process" in unit for path in unit["input_files"]}
     analyzed = {path for unit in units if unit.get("valid_report") for path in unit["input_files"]}
     status = aggregate_units(units, applicable=bool(compatible))

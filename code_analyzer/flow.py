@@ -287,8 +287,11 @@ class RunFlow:
         self._finish(node, event)
         node.in_flight.clear()
         data = event.data or {}
-        if data.get("reason") and not node.detail:
+        if data.get("reason"):
             node.detail = _clean(data["reason"])
+        elif event.status in {"missing", "incompatible", "interrupted", "skipped", "failed"}:
+            # A tool that never ran has only its message to explain itself.
+            node.detail = _clean(event.message)
 
     def _on_llm(self, event: AnalysisEvent) -> None:
         if event.status == "started":
