@@ -390,6 +390,7 @@ button[disabled]{opacity:.5;cursor:default}
 <button id="cancel" disabled>取消 / Cancel</button><a id="report" hidden href="#">index.html</a></div>
 <div class="bar" id="controls" hidden><button id="pause-llm">暂停 LLM</button><button id="pause-static">暂停静态</button>
 <button id="jobs-down">并发 −</button><span id="jobs">并发 -</span><button id="jobs-up">并发 +</button><span class="muted small" id="control-state"></span></div>
+<div class="log" id="decision" hidden></div>
 <h2>DAG</h2><div class="dag" id="dag"></div>
 <h2>Events</h2><div class="log" id="log"></div>
 <p class="muted small">此页面只读取 events.jsonl 与 manifest.json；节点状态是 manifest 的投影，不是另一份事实。</p>
@@ -430,7 +431,18 @@ button[disabled]{opacity:.5;cursor:default}
       $("pause-static").textContent = lanes.static.paused ? "继续静态" : "暂停静态";
       $("jobs").textContent = "并发 " + lanes.llm.jobs;
       $("control-state").textContent = (s.control.skipped.length ? "已跳过 " + s.control.skipped.join(", ") : "") + (s.pending.length ? " · 待决策 " + s.pending.length : "");
-    } else { $("controls").hidden = true; }
+      const box = $("decision"); box.replaceChildren();
+      if (s.pending.length) {
+        const p = s.pending[0];
+        box.hidden = false;
+        box.append(line("div", "", "待决策 " + p.id + " · " + p.summary));
+        (p.items || []).forEach((it, i) => box.append(line("div", "", (it.preselected === false ? "[ ] " : "[x] ") + (it.label || it.op) + "  " + (it.evidence || "") + "  (" + (it.origin || "") + ")")));
+        const yes = line("button", "", "应用预选项并重跑"); const no = line("button", "", "拒绝");
+        yes.onclick = () => post({ action: "decide", id: p.id, answer: "apply", selected: (p.items || []).map((it, i) => it.preselected === false ? -1 : i).filter(i => i >= 0) }).then(pollState);
+        no.onclick = () => post({ action: "decide", id: p.id, answer: "reject" }).then(pollState);
+        box.append(yes, no);
+      } else { box.hidden = true; }
+    } else { $("controls").hidden = true; $("decision").hidden = true; }
     if (s.report_directory) { $("title").textContent = s.report_directory.split("/").pop(); $("report").href = "file://" + s.report_directory + "/index.html"; }
   };
   $("cancel").onclick = async () => { $("cancel").disabled = true; await fetch("/cancel", { method: "POST", headers: { "Origin": window.location.origin } }); };

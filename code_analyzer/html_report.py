@@ -460,7 +460,7 @@ _JS_MAIN = r"""
       no_overlap: "无跨工具重叠组。", no_diags: "无工具诊断。",
       no_findings: "没有符合筛选条件的发现。",
       search_label: "搜索", search_placeholder: "规则、CWE、文件或消息",
-      filter_context: "上下文", opt_all_contexts: "全部上下文", opt_build: "构建感知", opt_source: "仅源码",
+      filter_context: "上下文", opt_all_contexts: "全部上下文", opt_build: "构建感知", opt_source: "仅源码", opt_superseded: "已被替代的尝试",
       filter_engine: "引擎", opt_all_engines: "全部引擎", opt_static: "静态工具", opt_llm: "LLM 扫描",
       filter_review_level: "评分等级", opt_all_levels: "全部等级",
       filter_severity: "规范化严重度", opt_all_sev: "全部严重度",
@@ -547,7 +547,7 @@ _JS_MAIN = r"""
       no_overlap: "No cross-tool overlap groups.", no_diags: "No tool diagnostics.",
       no_findings: "No findings match the filters.",
       search_label: "Search", search_placeholder: "Rule, CWE, file, or message",
-      filter_context: "Context", opt_all_contexts: "All contexts", opt_build: "Build-aware", opt_source: "Source-only",
+      filter_context: "Context", opt_all_contexts: "All contexts", opt_build: "Build-aware", opt_source: "Source-only", opt_superseded: "Superseded attempts",
       filter_engine: "Engine", opt_all_engines: "All engines", opt_static: "Static tools", opt_llm: "LLM scanners",
       filter_review_level: "Review level", opt_all_levels: "All review levels",
       filter_severity: "Normalized severity", opt_all_sev: "All severities",
@@ -1272,7 +1272,7 @@ _JS_MAIN = r"""
     const sort = id("sort").value;
     let rows = findings.filter(x =>
       (!state.fingerprints || state.fingerprints.has(x.fingerprint))
-      && (!context || x.evidence_context === context)
+      && (!context || (context === "superseded" ? String(x.evidence_context || "").endsWith("/superseded") : x.evidence_context === context))
       && (!engine || x.engine === engine)
       && (!reviewLevel || x.review_level === reviewLevel)
       && (!sev || x.severity === sev)
@@ -1483,6 +1483,7 @@ _HTML_BODY = r"""<div class="sheet">
 <option value="" data-i18n="opt_all_contexts">全部上下文</option>
 <option value="build-aware" data-i18n="opt_build">构建感知</option>
 <option value="source-only" data-i18n="opt_source">仅源码</option>
+<option value="superseded" data-i18n="opt_superseded">已被替代的尝试</option>
 </select></label>
 <label class="control"><span data-i18n="filter_engine">引擎</span><select id="engine">
 <option value="" data-i18n="opt_all_engines">全部引擎</option>

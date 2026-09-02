@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import threading
 from pathlib import Path
 
 import pytest
@@ -372,5 +373,50 @@ def test_events_queue_on_the_worker_and_fold_on_the_tick(tmp_path: Path) -> None
             app._event_from_worker(AnalysisEvent("control", "paused", "llm lane paused", data={"lane": "llm"}))
             app._tick_flow()
             assert app.flow.paused["llm"]
+
+    asyncio.run(exercise())
+
+
+def test_a_pending_patch_opens_the_dialog_and_the_choice_reaches_the_runner(tmp_path: Path) -> None:
+    from code_analyzer.control import DecisionRequest
+    from code_analyzer.tui import PatchScreen
+
+    request = DecisionRequest(
+        id="bc1", kind="build_context_patch", summary="splint: round 1: 2 item(s); probe 2/2 now preprocess",
+        items=(
+            {"op": "add_include", "value": "include", "label": "-I include", "evidence": "satisfies 3 unit(s): hal.h", "origin": "deterministic", "preselected": True},
+            {"op": "add_stub_header", "value": "vendor.h", "label": "stub vendor.h", "evidence": "1 unit(s); the tree carries no vendor.h", "origin": "deterministic", "preselected": False},
+        ),
+        round=1, probe={"sampled": 2, "reached_before": 0, "reached_after": 2}, evidence_path="inputs/build-context/r1", preselected=(0,),
+    )
+
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            answers: list = []
+            threading.Thread(target=lambda: answers.append(app.control.request_decision(request, timeout=15)), daemon=True).start()
+            for _ in range(30):
+                await pilot.pause(0.1)
+                if isinstance(app.screen, PatchScreen):
+                    break
+            assert isinstance(app.screen, PatchScreen), "the runner's request did not open the dialog"
+            items = app.screen.query_one("#patch-items")
+            assert list(items.selected) == [0]
+            # Defer: the dialog closes, the runner keeps waiting, `d` brings it back.
+            await pilot.press("l")
+            await pilot.pause(0.3)
+            assert not isinstance(app.screen, PatchScreen) and not answers
+            await pilot.press("d")
+            await pilot.pause(0.3)
+            assert isinstance(app.screen, PatchScreen)
+            await pilot.click("#apply")
+            for _ in range(30):
+                await pilot.pause(0.1)
+                if answers:
+                    break
+            assert answers and answers[0].answer == "apply" and answers[0].selected == (0,) and answers[0].decided_by == "tui"
+            assert not app.control.pending()
 
     asyncio.run(exercise())

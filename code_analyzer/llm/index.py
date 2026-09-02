@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..includes import normalize_include, resolve_include
+
 INDEX_SCHEMA_VERSION = 1
 
 # Below this a file's units are reported under unscanned_reasons.parse_confidence_low.
@@ -875,29 +877,12 @@ def _include_graph(files: dict[str, Any]) -> dict[str, Any]:
 def _resolve_include(
     target: str, directory: str, by_path: dict[str, str], by_suffix: dict[str, list[str]]
 ) -> str | None:
-    """Resolve one include target to a file in the tree, or ``None``."""
-    normalized = _normalize_include(f"{directory}/{target}" if directory else target)
-    if normalized in by_path:
-        return normalized
-    plain = _normalize_include(target)
-    if plain in by_path:
-        return plain
-    # A tail match is the last resort and only when it is unambiguous: two
-    # files ending "config.h" must not silently become one edge.
-    matches = by_suffix.get(plain, ())
-    return matches[0] if len(matches) == 1 else None
+    """Resolve one include target to a file in the tree, or ``None`` (see includes.py)."""
+    return resolve_include(target, directory, by_path, by_suffix)
 
 
 def _normalize_include(target: str) -> str:
-    parts: list[str] = []
-    for part in target.replace("\\", "/").split("/"):
-        if part in ("", "."):
-            continue
-        if part == ".." and parts:
-            parts.pop()
-            continue
-        parts.append(part)
-    return "/".join(parts)
+    return normalize_include(target)
 
 
 def _paired_header(

@@ -5,7 +5,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
@@ -30,6 +30,8 @@ def run(
     output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
     control: Any = None,
+    only_files: Sequence[str] | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
     unit_event = unit_event or (lambda *_args, **_kwargs: None)
@@ -39,12 +41,17 @@ def run(
     grace = float(config["run"]["termination_grace_seconds"])
     jobs = min(4, os.cpu_count() or 1)
     passes: list[tuple[str, list[str], list[str]]] = []
-    if filtered_db:
-        db_path = run_dir / "inputs" / "compile_commands.filtered.json"
-        passes.append(("compile-db", [f"--project={db_path}"], sorted(covered)))
-    fallback = [item["path"] for item in inventory if item["path"] not in covered]
-    if fallback:
-        passes.append(("fallback", [], fallback))
+    if only_files is not None:
+        # A build-context re-run: the fallback pass again, over the same
+        # files, under the patched [build], into a directory of its own.
+        passes.append((f"fallback-r{attempt}", [], sorted(only_files)))
+    else:
+        if filtered_db:
+            db_path = run_dir / "inputs" / "compile_commands.filtered.json"
+            passes.append(("compile-db", [f"--project={db_path}"], sorted(covered)))
+        fallback = [item["path"] for item in inventory if item["path"] not in covered]
+        if fallback:
+            passes.append(("fallback", [], fallback))
     units: list[dict[str, Any]] = []
     deadline = time.monotonic() + timeout
     for index, (name, pass_args, files) in enumerate(passes, 1):
@@ -76,7 +83,7 @@ def run(
             f"--relative-paths={source.resolve()}", "--quiet", "-j", str(jobs),
         ]
         argv.extend(pass_args)
-        if name == "fallback":
+        if name.startswith("fallback"):
             argv.append("--force")
             build = config["build"]
             standard = build.get("cpp_standard") or build.get("c_standard")
@@ -91,12 +98,12 @@ def run(
                 argv.append(f"-D{value}")
             for value in undefines:
                 argv.append(f"-U{value}")
-            file_list = run_dir / "inputs" / "cppcheck-fallback-files.txt"
+            file_list = run_dir / "inputs" / ("cppcheck-fallback-files.txt" if name == "fallback" else f"cppcheck-{name}-files.txt")
             file_list.write_text("".join(path + "\n" for path in files), encoding="utf-8")
             argv.append(f"--file-list={file_list}")
         unit_timeout = max(0.001, deadline - time.monotonic())
         unit_event(name, "started", f"scanning {len(files)} files", (index - 1) / max(1, len(passes)), data={
-            **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3), "attempt": 1,
+            **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3), "attempt": attempt,
             "evidence_context": evidence_context,
         })
 
@@ -127,14 +134,16 @@ def run(
         unit = {
             "id": name, "status": state, "input_files": files, "valid_report": valid,
             "process": process.as_dict(), "reason": reason, "evidence_context": evidence_context,
-            "attempt": 1, "diagnosis": diagnose_report(report) if valid else None,
+            "attempt": attempt, "diagnosis": diagnose_report(report) if valid else None,
         }
+        if only_files is not None:
+            unit["supersedes"] = "fallback"
         attach_artifacts(unit, directory, run_dir)
         units.append(unit)
         diagnosis = unit["diagnosis"] or {}
         unit_event(name, state, f"{state} in {process.duration_seconds:.2f}s", index / max(1, len(passes)), data={
             **facts, "duration_seconds": process.duration_seconds, "exit_code": process.exit_code,
-            "reason": reason, "valid_report": valid, "attempt": 1, "findings": diagnosis.get("findings"),
+            "reason": reason, "valid_report": valid, "attempt": attempt, "findings": diagnosis.get("findings"),
             "failure_class": diagnosis.get("category"), "diagnosis": diagnosis.get("counts"),
             "dir": str(directory.relative_to(run_dir)),
             "error_excerpt": error_excerpt(_combined_text(stdout, stderr)) if state != "completed" else None,
@@ -239,8 +248,30 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries,
         ctx.compile_db.covered_set, ctx.config, ctx.progress,
         cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
-        output_budget=ctx.output_budget, control=ctx.control,
+        output_budget=ctx.output_budget, control=ctx.control, attempt=ctx.attempt,
     )
+
+
+def _rerun(executable: str, ctx: RunContext, files: Sequence[str]) -> dict[str, Any]:
+    return run(
+        executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries,
+        ctx.compile_db.covered_set, ctx.config, ctx.progress,
+        cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
+        output_budget=ctx.output_budget, control=ctx.control, only_files=list(files), attempt=ctx.attempt,
+    )
+
+
+def reconfigurable(record: dict[str, Any]) -> list[str]:
+    """The fallback pass, when its report says headers were missing."""
+    from .common import effective_units
+
+    for unit in effective_units(record.get("units") or []):
+        counts = (unit.get("diagnosis") or {}).get("counts") or {}
+        if str(unit.get("id", "")).startswith("fallback") and unit.get("valid_report") and (
+            counts.get("missingInclude") or counts.get("missingIncludeSystem")
+        ):
+            return [str(unit["id"])]
+    return []
 
 
 def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -285,4 +316,6 @@ ADAPTER = Adapter(
     ),
     canary=_canary,
     apt_package="cppcheck",
+    rerun=_rerun,
+    reconfigurable=reconfigurable,
 )

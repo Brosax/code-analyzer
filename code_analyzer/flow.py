@@ -42,6 +42,7 @@ MAX_DETAIL = 200
 SPINE_RAMP = 3
 
 TAIL_NODES: tuple[tuple[str, str], ...] = (
+    ("build_context", "修补"),
     ("stability", "稳定"),
     ("review", "审查"),
     ("audit", "关联"),
@@ -196,6 +197,8 @@ class RunFlow:
         if not review.get("enabled", True):
             self._disable("review")
             self._disable("audit")
+        if (config.get("build") or {}).get("assist", "propose") == "off":
+            self._disable("build_context")
         if not run.get("shareable_export", True):
             self._disable("export")
         self.percent = 0.0
@@ -476,6 +479,26 @@ class RunFlow:
             })
         else:
             self.pending_decisions = [item for item in self.pending_decisions if item["id"] != identity]
+
+    def _on_build_context(self, event: AnalysisEvent) -> None:
+        node = self.nodes.get("build_context")
+        if node is None:
+            return
+        data = event.data or {}
+        if event.status == "started":
+            self._start(node, event)
+            return
+        if event.status == "finished":
+            outcome = str(data.get("outcome") or "applied")
+            self._settle(node, outcome, event.timestamp)
+            node.detail = _clean(event.message)
+            return
+        if event.status == "failed":
+            self._settle(node, "failed", event.timestamp)
+        elif node.state != "running":
+            self._start(node, event)
+        node.status = event.status
+        node.detail = _clean(event.message)
 
     def _on_stability(self, event: AnalysisEvent) -> None:
         self._phase_event("stability", event)

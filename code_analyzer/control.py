@@ -329,6 +329,16 @@ class RunControl:
     def new_request_id(self, prefix: str = "d") -> str:
         return f"{prefix}{next(self._ids)}"
 
+    def auto_decide(self, request: DecisionRequest, decision: Decision) -> Decision:
+        """Record a decision the policy made on its own, so the journal shows it like any other."""
+        self._announce(
+            "decision", "requested", f"decision requested: {request.summary}",
+            id=request.id, kind=request.kind, round=request.round, items=len(request.items),
+            probe=request.probe, evidence=request.evidence_path,
+        )
+        self._announce_decision(request, decision)
+        return decision
+
     def _announce_decision(self, request: DecisionRequest, decision: Decision) -> None:
         self._announce(
             "decision", "decided", f"decision {request.id}: {decision.answer} by {decision.decided_by}",
@@ -352,3 +362,39 @@ class RunControl:
     def _check_lane(lane: str) -> None:
         if lane not in LANES:
             raise ValueError(f"unknown lane {lane!r}; expected one of {', '.join(LANES)}")
+
+
+# --- deciders for a run without a screen ---------------------------------------------
+
+
+def auto_no(request: DecisionRequest) -> Decision:
+    """Headless without consent: record only.  The patch is suggested, never applied."""
+    return Decision("reject", decided_by="policy", note="non-interactive run without --build-assist-yes")
+
+
+def auto_yes(request: DecisionRequest) -> Decision:
+    """``--build-assist-yes``: apply everything pre-ticked, exactly as the dialog would offer it."""
+    return Decision("apply", tuple(request.preselected), decided_by="cli --build-assist-yes")
+
+
+def stdin_decider(stdin: Any, stderr: Any) -> Callable[[DecisionRequest], Decision]:
+    """The terminal's version of the dialog: a preview, then ``[y/N]``."""
+
+    def decide(request: DecisionRequest) -> Decision:
+        print(f"\nBuild-context patch ({request.kind}, round {request.round}): {request.summary}", file=stderr)
+        for index, item in enumerate(request.items):
+            tick = "x" if index in request.preselected else " "
+            print(f"  [{tick}] {item.get('label', item.get('op'))}  {item.get('evidence', '')}  ({item.get('origin', '')})", file=stderr)
+        if request.probe:
+            print(f"  probe: {request.probe.get('reached_after', 0)}/{request.probe.get('sampled', 0)} sampled unit(s) now preprocess", file=stderr)
+        print("  impact: re-runs only the failed units into new unit directories; no source, config file or build is touched.", file=stderr)
+        print("Apply the pre-ticked items and re-run? [y/N] ", end="", file=stderr, flush=True)
+        try:
+            answer = stdin.readline().strip().lower()
+        except (OSError, ValueError):
+            answer = ""
+        if answer in {"y", "yes"}:
+            return Decision("apply", tuple(request.preselected), decided_by="cli")
+        return Decision("reject", decided_by="cli", note="declined at the prompt")
+
+    return decide

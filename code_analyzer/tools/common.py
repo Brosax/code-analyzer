@@ -74,6 +74,85 @@ def utf8_validation(path: Path, chunk_size: int = 1024 * 1024) -> tuple[bool, di
     return True, None
 
 
+# How a re-run's outcome ranks against the unit it would replace.
+UNIT_RANK: dict[str, int] = {
+    "completed": 3, "partial": 2, "timed_out": 1, "failed": 1, "unscheduled": 0, "interrupted": 0,
+}
+
+
+def effective_units(units: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The units that stand: every unit minus those a later attempt superseded."""
+    return [dict(unit) for unit in units if not unit.get("superseded_by")]
+
+
+def merge_attempt(previous: dict[str, Any], rerun: dict[str, Any], *, attempt: int) -> dict[str, Any]:
+    """Fold a re-run's units into a tool record without touching the old ones.
+
+    Every previous unit stays, verbatim; each re-run unit is appended with
+    its attempt number and, when it did at least as well as the unit it
+    re-ran (``UNIT_RANK``, ties broken by ``analysis_reached``), the old unit
+    is marked ``superseded_by`` it.  A worse re-run is kept as evidence but
+    supersedes nothing.  Status, coverage and counts are recomputed over the
+    effective set, so the exit code follows what actually stands.
+    """
+    from ..status import aggregate_units, counts
+
+    record = dict(previous)
+    units = [dict(unit) for unit in previous.get("units") or []]
+    by_file: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+    for unit in units:
+        if unit.get("superseded_by"):
+            continue
+        by_id[str(unit.get("id"))] = unit
+        files = unit.get("input_files") or []
+        if len(files) == 1:
+            by_file[str(files[0])] = unit
+    for new in rerun.get("units") or []:
+        new = dict(new)
+        new["attempt"] = attempt
+        files = new.get("input_files") or []
+        # An adapter that re-ran a many-file unit names what it re-ran; a
+        # one-file unit is matched by its file.
+        old = by_id.get(str(new.get("supersedes"))) if new.get("supersedes") else None
+        if old is None and len(files) == 1:
+            old = by_file.get(str(files[0]))
+        if old is not None:
+            better = UNIT_RANK.get(str(new.get("status")), 0) > UNIT_RANK.get(str(old.get("status")), 0)
+            same = UNIT_RANK.get(str(new.get("status")), 0) == UNIT_RANK.get(str(old.get("status")), 0)
+            if better or (same and bool(new.get("analysis_reached")) >= bool(old.get("analysis_reached"))):
+                old["superseded_by"] = new["id"]
+                new["supersedes"] = old["id"]
+                by_file[str(files[0])] = new
+            else:
+                new["superseded_by"] = old["id"]
+                new["supersedes"] = old["id"]
+        units.append(new)
+    effective = [unit for unit in units if not unit.get("superseded_by")]
+    coverage = dict(previous.get("coverage") or {})
+    valid_files = {unit["input_files"][0] for unit in effective if unit.get("valid_report") and unit.get("input_files")}
+    reached_files = {unit["input_files"][0] for unit in effective if unit.get("analysis_reached") and unit.get("input_files")}
+    attempted = {unit["input_files"][0] for unit in effective if "process" in unit and unit.get("input_files")}
+    effective_total = coverage.get("effective_total") or len(effective) or None
+    coverage.update({
+        "covered": len(valid_files), "analyzed": len(valid_files), "attempted": len(attempted),
+        "ratio": len(valid_files) / effective_total if effective_total else None,
+    })
+    if "analysis_reached" in coverage:
+        coverage.update({
+            "analysis_reached": len(reached_files),
+            "analysis_ratio": len(reached_files) / effective_total if effective_total else None,
+        })
+    tally = counts(effective)
+    tally["superseded"] = sum(1 for unit in units if unit.get("superseded_by"))
+    record.update({
+        "units": units, "status": aggregate_units(effective, applicable=bool(effective)),
+        "valid_reports": sum(bool(unit.get("valid_report")) for unit in effective),
+        "coverage": coverage, "unit_counts": tally, "attempts": attempt,
+    })
+    return record
+
+
 def announce_never_ran(unit_event: Any, units: Sequence[Mapping[str, Any]], total: int) -> None:
     """One event per (status, reason) for the units that never ran.
 

@@ -122,7 +122,10 @@ def run(
     output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
     control: Any = None,
+    only_files: Sequence[str] | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
+    """Run Splint over the inventory's C files (or ``only_files`` of them, on a re-run)."""
     progress = progress or (lambda _message: None)
     unit_event = unit_event or (lambda *_args, **_kwargs: None)
     c_files = [item["path"] for item in inventory if Path(item["path"]).suffix.lower() == ".c"]
@@ -141,8 +144,11 @@ def run(
         "inventory" if requested_scope == "auto" else requested_scope
     )
     selected = sorted(by_file) if scope == "build" else c_files
+    if only_files is not None:
+        wanted = set(only_files)
+        selected = [relative for relative in selected if relative in wanted]
     not_in_build = sorted(set(c_files) - set(by_file)) if compile_db_present else []
-    if compile_db_present:
+    if compile_db_present and only_files is None:
         (run_dir / "inputs" / "splint-not-in-build.txt").write_text(
             "".join(path + "\n" for path in not_in_build), encoding="utf-8"
         )
@@ -161,10 +167,12 @@ def run(
             ).hexdigest()[:12]
             safe = relative.replace("/", "__").replace("\\", "__")
             safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in safe)
-            raw_plans.append((
-                f"{safe[:80]}-{fingerprint}", relative, flags,
-                "build-aware" if entries else "source-only",
-            ))
+            unit_id = f"{safe[:80]}-{fingerprint}"
+            if attempt > 1 and (run_dir / "tools" / "splint" / unit_id).exists():
+                # The same flags again: a new directory all the same, because
+                # evidence is never overwritten.
+                unit_id = f"{unit_id}-a{attempt}"
+            raw_plans.append((unit_id, relative, flags, "build-aware" if entries else "source-only"))
     plans: list[Plan] = [(index, *item) for index, item in enumerate(raw_plans, 1)]
 
     deadline = time.monotonic() + float(settings["total_timeout_seconds"])
@@ -197,15 +205,11 @@ def run(
         tmp.mkdir(exist_ok=True)
         stdout, stderr, report = directory / "stdout.raw", directory / "stderr.raw", directory / "report.csv"
         unit_timeout = min(per_tu, max(0.001, remaining))
-        argv = [
-            executable, "+nof", *options, "+unixlib", "+showsummary", "+its4mostrisky", "+its4veryrisky",
-            "+its4risky", "+its4moderate", "+its4low", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report),
-            *flags, "./" + relative,
-        ]
+        argv = unit_argv(executable, options, flags, tmp, report, relative)
         facts = {"index": index, "total": total, "label": relative, "path": relative}
         unit_event(unit_id, "started", "scanning", (index - 1) / total, data={
             **facts, "argv": argv, "cwd": str(source), "timeout_seconds": round(unit_timeout, 3),
-            "attempt": 1, "evidence_context": evidence_context,
+            "attempt": attempt, "evidence_context": evidence_context,
         })
 
         def beat(elapsed: float) -> None:
@@ -261,14 +265,14 @@ def run(
             "missing_includes": missing[:MAX_NAMED_INCLUDES],
             "missing_includes_more": max(0, len(missing) - MAX_NAMED_INCLUDES),
             "csv_recovered_rows": recovered,
-            "attempt": 1,
+            "attempt": attempt,
             "diagnosis": diagnosis,
         }
         attach_artifacts(unit, directory, run_dir)
         unit_event(unit_id, state, f"{state} in {process.duration_seconds:.2f}s", index / total, data={
             **facts, "duration_seconds": process.duration_seconds, "exit_code": process.exit_code,
             "reason": reason, "failure_class": failure_class, "missing_includes": missing[:MAX_NAMED_INCLUDES],
-            "analysis_reached": unit["analysis_reached"], "valid_report": valid, "attempt": 1,
+            "analysis_reached": unit["analysis_reached"], "valid_report": valid, "attempt": attempt,
             "csv_recovered_rows": recovered, "dir": str(directory.relative_to(run_dir)),
             "error_excerpt": error_excerpt(text) if state != "completed" else None,
         })
@@ -361,6 +365,32 @@ def run(
         },
         "unit_counts": counts(units),
     }
+
+
+def unit_argv(
+    executable: str, options: Sequence[str], flags: Sequence[str], tmp: Path, report: Path, relative: str,
+) -> list[str]:
+    """The one argv contract, shared by the run, the re-run and the build-context probe."""
+    return [
+        executable, "+nof", *options, "+unixlib", "+showsummary", "+its4mostrisky", "+its4veryrisky",
+        "+its4risky", "+its4moderate", "+its4low", "-tmpdir", str(tmp), "+csvoverwrite", "+csv", str(report),
+        *flags, "./" + relative,
+    ]
+
+
+# Failure classes a different build context can change.
+RECONFIGURABLE_CLASSES = frozenset({"include", "configuration", "parsing", "csv"})
+
+
+def reconfigurable(record: Mapping[str, Any]) -> list[str]:
+    """The effective units a patched build context could rescue."""
+    from .common import effective_units
+
+    return [
+        str(unit["id"]) for unit in effective_units(record.get("units") or [])
+        if unit.get("status") in {"partial", "failed"} and not unit.get("analysis_reached")
+        and unit.get("failure_class") in RECONFIGURABLE_CLASSES
+    ]
 
 
 def _unstarted(unit_id: str, relative: str, state: str, reason: str, evidence_context: str = "source-only") -> dict[str, Any]:
@@ -536,7 +566,17 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries, ctx.config, ctx.progress,
         compile_db_present=ctx.compile_db.present, cancelled=ctx.cancelled,
         unit_event=ctx.unit_event, output_event=ctx.output_event, output_budget=ctx.output_budget,
-        control=ctx.control,
+        control=ctx.control, attempt=ctx.attempt,
+    )
+
+
+def _rerun(executable: str, ctx: RunContext, files: Sequence[str]) -> dict[str, Any]:
+    """Re-run only ``files`` under ``ctx.config`` (already patched) as attempt ``ctx.attempt``."""
+    return run(
+        executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries, ctx.config, ctx.progress,
+        compile_db_present=ctx.compile_db.present, cancelled=ctx.cancelled,
+        unit_event=ctx.unit_event, output_event=ctx.output_event, output_budget=ctx.output_budget,
+        control=ctx.control, only_files=list(files), attempt=ctx.attempt,
     )
 
 
@@ -581,4 +621,6 @@ ADAPTER = Adapter(
     help_topics=("nof", "csv", "tmpdir", "modes", "ITS4"),
     canary=_canary,
     apt_package="splint",
+    rerun=_rerun,
+    reconfigurable=reconfigurable,
 )

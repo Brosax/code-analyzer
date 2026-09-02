@@ -32,6 +32,7 @@ from textual.widgets import (
     ProgressBar,
     RichLog,
     Select,
+    SelectionList,
     Static,
 )
 
@@ -51,7 +52,7 @@ from .config import (
     set_config_value,
     validate_config,
 )
-from .control import RunControl
+from .control import Decision, DecisionRequest, RunControl
 from .errors import UserError
 from .flow import WIDE_BREAKPOINT, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
@@ -63,7 +64,7 @@ from .tools import TOOL_NAMES
 # their keys free for the form otherwise.
 RUN_ONLY_ACTIONS = frozenset({
     "cycle_pane", "cycle_filter", "toggle_pause_llm", "toggle_pause_static", "skip_selected",
-    "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail",
+    "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail", "open_decision",
 })
 PANES = ("log", "llm", "problems")
 PANE_LABELS = {"log": "日志", "llm": "LLM 明细", "problems": "问题"}
@@ -78,6 +79,10 @@ TUI_FIELDS = (
     "run.output_root",
     "build.compile_database_mode",
     "build.compile_database",
+    "build.include",
+    "build.define",
+    "build.c_standard",
+    "build.assist",
     "tools.cppcheck.enabled",
     "tools.flawfinder.enabled",
     "tools.splint.enabled",
@@ -85,6 +90,8 @@ TUI_FIELDS = (
     "review.fail_on",
     "llm.enabled",
 )
+# List-valued fields are one Input each, items separated by ';'.
+LIST_SEPARATOR = ";"
 
 
 # Node state -> colour, and the three-step ramp the spine cell walks so a dot
@@ -164,6 +171,72 @@ class PathScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class PatchScreen(ModalScreen[Decision]):
+    """A build-context patch, item by item, with the probe's verdict and the impact.
+
+    Built from ``Text`` segments like the flow panel: header names come from
+    analyzer output about untrusted code and must render as themselves.
+    """
+
+    BINDINGS = [
+        Binding("escape", "reject", "全部拒绝"),
+        Binding("l", "defer", "稍后决定"),
+    ]
+
+    def __init__(self, request: DecisionRequest) -> None:
+        super().__init__()
+        self.request = request
+
+    def compose(self) -> ComposeResult:
+        request = self.request
+        probe = request.probe or {}
+        with Vertical(id="dialog"):
+            yield Label(f"构建上下文补丁 · {request.id} · 第 {request.round} 轮", classes="dialog-title")
+            yield Static(Text(single_line(request.summary)), id="patch-summary")
+            if probe:
+                yield Static(Text(
+                    f"探针：{probe.get('sampled', 0)} 个样本，应用补丁后 {probe.get('reached_after', 0)} 个可完成预处理"
+                    f"（此前 {probe.get('reached_before', 0)} 个）"
+                ), classes="warning" if not probe.get("reached_after") else "")
+            options = []
+            for index, item in enumerate(request.items):
+                label = Text()
+                label.append(single_line(str(item.get("label") or item.get("op")))[:60])
+                if item.get("evidence"):
+                    label.append("  " + single_line(str(item["evidence"]))[:70], style="dim")
+                label.append(f"  {'推断' if item.get('origin') == 'deterministic' else 'LLM'}", style="italic")
+                options.append((label, index, index in request.preselected))
+            yield SelectionList(*options, id="patch-items")
+            yield Static(
+                "影响：仅在本报告目录内重跑失败的单元（新单元目录，原报告保留）；不修改 .code-analyzer.toml；"
+                "不运行任何构建命令；不安装工具。桩头文件写在报告目录内并放在 -I 最后。",
+                classes="warning",
+            )
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("稍后决定 (l)", id="defer")
+                yield Button("全部拒绝 (Esc)", id="reject")
+                yield Button("应用所选", id="apply", variant="primary")
+
+    @on(Button.Pressed, "#apply")
+    def apply_pressed(self) -> None:
+        selected = tuple(sorted(int(value) for value in self.query_one("#patch-items", SelectionList).selected))
+        self.dismiss(Decision("apply" if selected else "reject", selected, "tui", "" if selected else "nothing selected"))
+
+    @on(Button.Pressed, "#reject")
+    def reject_pressed(self) -> None:
+        self.action_reject()
+
+    @on(Button.Pressed, "#defer")
+    def defer_pressed(self) -> None:
+        self.action_defer()
+
+    def action_reject(self) -> None:
+        self.dismiss(Decision("reject", (), "tui"))
+
+    def action_defer(self) -> None:
+        self.dismiss(Decision("defer", (), "tui"))
+
+
 class InfoScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape", "close", "关闭")]
 
@@ -207,6 +280,7 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("up", "cursor_up", "上一节点", show=False),
         Binding("down", "cursor_down", "下一节点", show=False),
         Binding("enter", "node_detail", "节点详情", show=False),
+        Binding("d", "open_decision", "决策", show=False),
     ]
     CSS = """
     Screen { background: $surface; }
@@ -316,6 +390,8 @@ class AnalyzerApp(App[TuiOutcome]):
         self._pane = "log"
         self._log_filter = "all"
         self._problems_snapshot = ""
+        self._decision_open: str | None = None
+        self._deferred: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -338,6 +414,10 @@ class AnalyzerApp(App[TuiOutcome]):
                         yield Label("构建上下文", classes="section-title first")
                         yield self._field_widget(FIELD_BY_PATH["build.compile_database_mode"])
                         yield self._field_widget(FIELD_BY_PATH["build.compile_database"])
+                        yield self._field_widget(FIELD_BY_PATH["build.include"])
+                        yield self._field_widget(FIELD_BY_PATH["build.define"])
+                        yield self._field_widget(FIELD_BY_PATH["build.c_standard"])
+                        yield self._field_widget(FIELD_BY_PATH["build.assist"])
                         yield Label("报告", classes="section-title")
                         yield self._field_widget(FIELD_BY_PATH["run.shareable_export"])
                         yield self._field_widget(FIELD_BY_PATH["review.fail_on"])
@@ -401,6 +481,11 @@ class AnalyzerApp(App[TuiOutcome]):
             return Vertical(control, classes="field field-bool")
         if field.kind == "choice":
             control = Select([(choice, choice) for choice in field.choices], value=value, allow_blank=False, id=widget_id, disabled=field.readonly)
+        elif field.kind in {"list", "path_list"}:
+            control = Input(
+                (LIST_SEPARATOR + " ").join(str(item) for item in (value or [])), id=widget_id, disabled=field.readonly,
+                placeholder=f"可留空；多个以 {LIST_SEPARATOR} 分隔",
+            )
         else:
             control = Input(
                 "" if value is None else str(value), id=widget_id, disabled=field.readonly,
@@ -525,6 +610,32 @@ class AnalyzerApp(App[TuiOutcome]):
         lines = self.flow.node_detail(node_id, time.time())
         self.push_screen(InfoScreen(f"节点详情 · {node_id}", "\n".join(lines)))
 
+    def action_open_decision(self) -> None:
+        if self.control is None:
+            return
+        pending = self.control.pending()
+        if not pending:
+            self.query_one("#run-stop-hint", Static).update("当前没有待决策项")
+            return
+        self._open_decision(pending[0])
+
+    def _open_decision(self, request: DecisionRequest) -> None:
+        if self._decision_open is not None:
+            return
+        self._decision_open = request.id
+        self.push_screen(PatchScreen(request), lambda decision, req=request: self._decided(req, decision))
+
+    def _decided(self, request: DecisionRequest, decision: Decision | None) -> None:
+        self._decision_open = None
+        if decision is None or self.control is None:
+            return
+        if decision.answer == "defer":
+            self._deferred.add(request.id)
+            self.query_one("#run-stop-hint", Static).update(f"补丁 {request.id} 稍后决定 · 按 d 重新打开")
+            return
+        self.control.decide(request.id, decision.answer, decision.selected, decision.decided_by, decision.note)
+        self._flow_dirty = True
+
     def action_skip_selected(self) -> None:
         node_id = self._selected_node()
         if self.control is None or node_id is None or self.flow is None:
@@ -594,7 +705,9 @@ class AnalyzerApp(App[TuiOutcome]):
                 value = control.value
             else:
                 text = control.value.strip()
-                if field.kind.startswith("optional") and not text:
+                if field.kind in {"list", "path_list"}:
+                    value = [item.strip() for item in text.split(LIST_SEPARATOR) if item.strip()]
+                elif field.kind.startswith("optional") and not text:
                     value = None
                 elif field.kind == "int":
                     value = int(text)
@@ -854,6 +967,13 @@ class AnalyzerApp(App[TuiOutcome]):
             return
         if self._drain_events():
             self._flow_dirty = True
+        # A decision the runner is waiting on opens its dialog on its own;
+        # one the operator deferred waits for `d`.
+        if self.control is not None and self._decision_open is None and not isinstance(self.screen, ModalScreen):
+            for request in self.control.pending():
+                if request.id not in self._deferred:
+                    self._open_decision(request)
+                    break
         if self._flow_animated:
             self._flow_frame += 1
         elif not self._flow_dirty:

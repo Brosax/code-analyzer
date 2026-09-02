@@ -21,7 +21,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 Progress = Callable[[str], None]
 UnitEvent = Callable[..., None]
@@ -97,6 +97,8 @@ class RunContext:
     # The operator's RunControl (checkpoint at unit boundaries); None in a
     # direct adapter call.
     control: Any | None = None
+    # Which attempt this is: 1 for the run itself, 2+ for a build-context re-run.
+    attempt: int = 1
 
 
 @dataclass(frozen=True)
@@ -136,3 +138,9 @@ class Adapter:
     canary: Callable[[str, Path], tuple[bool, str | None]] = lambda _executable, _root: (True, None)
     # Named in doctor's guidance; never installed automatically (README:9).
     apt_package: str = ""
+    # The build-context loop: re-run the named input files under a patched
+    # ``ctx.config`` into NEW unit directories (never overwriting evidence),
+    # and say which units of a record are worth re-running.  An adapter that
+    # cannot be reconfigured leaves ``rerun`` None and reports no units.
+    rerun: Callable[[str, "RunContext", Sequence[str]], dict[str, Any]] | None = None
+    reconfigurable: Callable[[dict[str, Any]], list[str]] = lambda _record: []

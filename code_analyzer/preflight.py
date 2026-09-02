@@ -9,11 +9,15 @@ from .compile_db import resolve_compile_db
 from .config import validate_config
 from .doctor import probe_tool
 from .errors import UserError
+from .includes import scan_includes
 from .inventory import discover
 from .llm.doctor import endpoint_reachable
 from .tools import TOOL_NAMES
 
 LLM_PROBE_SECONDS = 15.0
+# Above this share of quoted includes the tree cannot satisfy, Splint's
+# preprocessing will mostly fail and the operator should hear it up front.
+INCLUDE_WARNING_RATIO = 0.3
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,8 @@ class PreflightResult:
     # The LLM endpoint's answer to "are you there and serving the model",
     # when the LLM lane is enabled; None otherwise.
     llm: dict[str, Any] | None = None
+    # What a pre-run include scan predicts about Splint's preprocessing.
+    build_context: dict[str, Any] | None = None
 
 
 def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = True) -> PreflightResult:
@@ -82,6 +88,24 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
             tool_results[name] = result
             if result["status"] != "compatible":
                 issues.append(PreflightIssue("warning", f"tools.{name}.executable", f"{name}: {result['status']}"))
+    build_info: dict[str, Any] | None = None
+    if probe_tools and checked["tools"]["splint"]["enabled"] and inventory_files:
+        try:
+            inventory = discover(source, checked, Path(checked["run"]["output_root"]))
+            build_info = scan_includes(source, inventory, checked["build"])
+        except (OSError, UserError):
+            build_info = None
+        if build_info:
+            total = sum(build_info["unresolved"].values())
+            scanned = build_info["scanned_files"]
+            if scanned and total and total >= INCLUDE_WARNING_RATIO * scanned:
+                roots = ", ".join(f"{root or '.'} ({count})" for root, count in build_info["predicted_roots"][:4])
+                top = ", ".join(list(build_info["unresolved"])[:5])
+                issues.append(PreflightIssue(
+                    "warning", "build.include",
+                    f"{total} 处 #include 无法在源码树中解析（前 {scanned} 个 .c 文件）：{top}；"
+                    f"预计可用的 include 根目录：{roots or '无'}；Splint 预处理很可能失败，[build] assist 可在运行中修补",
+                ))
     llm_info: dict[str, Any] | None = None
     if probe_tools and checked["llm"]["enabled"]:
         # A scan that may run for hours must not find out one unit at a time
@@ -95,7 +119,7 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
             issues.append(PreflightIssue("warning", "llm.endpoint", f"LLM 端点不可达：{reason}"))
     return PreflightResult(
         not any(item.severity == "error" for item in issues), tuple(issues), compile_info, inventory_files,
-        tool_results, llm_info,
+        tool_results, llm_info, build_info,
     )
 
 

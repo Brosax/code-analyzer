@@ -26,9 +26,13 @@ NODE_STATES: dict[str, str] = {
     "running": "running", "paused": "running", "pending": "pending",
     "unscheduled": "pending", "skipped": "pending",
     "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
+    # The build-context loop's own words.
+    "applied": "success", "off": "pending", "rejected": "pending",
+    "diagnosed": "running", "inferred": "running", "proposed": "running", "probing": "running",
+    "probed": "running", "awaiting": "running", "applying": "running",
 }
 STATES: tuple[str, ...] = ("success", "partial", "failed", "running", "pending")
-PHASE_NODES: tuple[str, ...] = ("discovery", "review", "audit", "export", "dashboard")
+PHASE_NODES: tuple[str, ...] = ("discovery", "build_context", "review", "audit", "export", "dashboard")
 # serve.py injects this object into its page script, so the two front ends
 # cannot draw different glyphs for one state.
 STATE_GLYPHS: dict[str, str] = {"success": "✓", "partial": "◐", "failed": "✕", "running": "●", "pending": "○"}

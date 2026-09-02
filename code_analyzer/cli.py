@@ -9,6 +9,7 @@ from typing import Any
 from . import __version__
 from .compile_db_wizard import run_compile_db
 from .config import load_config
+from .control import auto_no, auto_yes, stdin_decider
 from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
@@ -100,6 +101,7 @@ def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
     run.add_argument("--splint-heartbeat", type=_positive_float)
     run.add_argument("--splint-mode", choices=("strict", "checks", "standard", "weak"), help="Splint's predefined check mode")
     run.add_argument("--build-assist", choices=("off", "propose", "auto"), help="diagnose Splint/Cppcheck preprocessing failures and re-run failed units with an inferred build context")
+    run.add_argument("--build-assist-yes", action="store_true", help="apply a proposed build-context patch without asking (headless runs otherwise only record it)")
     run.add_argument("--log-level", choices=("debug", "info", "warning"), help="how much logs/runner.log records")
     run.add_argument("--llm", action=argparse.BooleanOptionalAction, default=None, help="run the LLM scanners as a second, independent detection path")
     _add_llm_arguments(run)
@@ -216,8 +218,14 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(source, args.config, overrides)
         if config["llm"]["enabled"]:
             _warn_third_party(config)
+        if getattr(args, "build_assist_yes", False):
+            decider = auto_yes
+        elif _has_tty():
+            decider = stdin_decider(sys.stdin, sys.stderr)
+        else:
+            decider = auto_no
         with JsonlEventSink(events_file(config)) as sink:
-            exit_code, run_dir = analyze(source, config, event_sink=sink)
+            exit_code, run_dir = analyze(source, config, event_sink=sink, decider=decider)
         print(run_dir)
         return exit_code
     except UserError as exc:

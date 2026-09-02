@@ -260,6 +260,10 @@ def build_review(
         "diagnostics": diagnostics,
         "report_integrity": {
             "status": "partial" if omitted_units else "complete",
+            "superseded_units": sum(
+                1 for name in TOOL_NAMES for unit in (manifest.get("tools", {}).get(name) or {}).get("units") or []
+                if isinstance(unit, dict) and unit.get("superseded_by")
+            ),
             "included_reports": max(0, sum(
                 len(tool.get("units", [])) for tool in tools.values()
             ) - len(omitted_units)),
@@ -919,14 +923,18 @@ def _line_span(item: dict[str, Any]) -> tuple[int, int] | tuple[()]:
 
 
 def _evidence_context(tool_name: str, unit: dict[str, Any], tool: dict[str, Any]) -> str:
+    # A unit a later attempt superseded keeps its rows -- nothing is ever
+    # dropped from the review -- but they are tagged so a reader (and the
+    # dashboard) can tell the attempt that stands from the one it replaced.
+    suffix = "/superseded" if unit.get("superseded_by") else ""
     declared = unit.get("evidence_context")
     if declared in {"build-aware", "source-only"}:
-        return str(declared)
+        return str(declared) + suffix
     if tool_name == "cppcheck":
-        return "build-aware" if unit.get("id") == "compile-db" else "source-only"
+        return ("build-aware" if unit.get("id") == "compile-db" else "source-only") + suffix
     if tool_name == "splint" and tool.get("scope") == "build":
-        return "build-aware"
-    return "source-only"
+        return "build-aware" + suffix
+    return "source-only" + suffix
 
 
 def _report_integrity(
