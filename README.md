@@ -84,6 +84,14 @@ node; `F2` hides it entirely and gives the log its rows back.
 `CODE_ANALYZER_NO_ANIMATION=1` and `TERM=dumb` freeze the animation without
 hiding anything, exactly as they do for the CLI spinner.
 
+The run is controllable while it runs: `p`/`P` pause and resume the LLM or
+static lane at the next unit boundary, `s` skips the selected producer's
+remaining units, `+`/`-` change the LLM concurrency, `r` re-runs the LLM units
+that never got an answer as a round of their own, `d` reopens a deferred
+build-context patch dialog, `Enter` shows a node's reasons and steps, `F3`/`F4`
+switch the side pane and the log filter. Every action is journalled as a
+`control/*` line in `events.jsonl` and `logs/runner.log`.
+
 During a scan, `Ctrl+C` requests cooperative cancellation. Running process
 groups receive the same bounded TERM/KILL cleanup as the CLI; an existing run
 directory is retained with an `interrupted` manifest and exit code `130`.
@@ -97,7 +105,25 @@ python3 run_code_analyzer.py analyze /path/to/project
 code-analyzer analyze . --tool cppcheck --output-root /tmp/reports
 code-analyzer analyze . --splint-scope build --splint-jobs 4
 code-analyzer analyze . --fail-on high
+code-analyzer analyze . --no-compile-db --build-assist propose      # ask before patching the build context
+code-analyzer analyze . --no-compile-db --build-assist-yes          # headless: apply the pre-ticked patch
+code-analyzer tools-resume /path/to/report-directory --tool splint  # finish a recorded patch later
 ```
+
+Without a compile database Splint tends to die at the first `#include`. The
+run ends its static lane with a build-context loop: it aggregates the failed
+units' diagnosis, infers only what the tree proves (include roots, per-subtree
+overrides, typed Splint options, optional empty stub headers that are never
+pre-ticked), asks the configured LLM endpoint to fill in what only reading the
+tree can tell (a board, a define, which headers are external — every item
+validated like hand-written TOML), tries the patch on a sample of failed
+units, and puts the result to the operator: a checkbox dialog in the TUI, a
+`[y/N]` prompt on a terminal, `--build-assist-yes` for unattended runs,
+record-only otherwise. An applied patch re-runs only the failed units as a
+second attempt into new unit directories; the first attempt is kept, marked
+superseded, and its review rows stay tagged. Evidence lives under
+`inputs/build-context/r<N>/` plus `suggested-config.toml`; the project's own
+TOML and the scanned tree are never touched.
 
 Scan progress is written to stderr in real time. In an interactive terminal, a
 small spinner with elapsed time remains animated between progress events, so a

@@ -363,17 +363,17 @@ def validate_patch(
         try:
             if op in {"add_include", "add_system_include"}:
                 path = _tree_dir(str(raw.get("path") or raw.get("value") or ""), directories)
-                kept.append(PatchItem(op, path, origin, "proposed", 0, rationale=rationale))
+                kept.append(PatchItem(op, path, origin, rationale[:120] or "proposed", 0, rationale=rationale))
             elif op in {"add_define", "add_undefine"}:
                 value = str(raw.get("value") or "")
                 if not _DEFINE.match(value):
                     raise ValueError(f"define {value!r} is not NAME, NAME=VALUE or NAME(args)")
-                kept.append(PatchItem(op, value, origin, "proposed", 0, rationale=rationale))
+                kept.append(PatchItem(op, value, origin, rationale[:120] or "proposed", 0, rationale=rationale))
             elif op == "set_standard":
                 value = str(raw.get("value") or "")
                 if value not in C_STANDARDS:
                     raise ValueError(f"standard {value!r} is not one of {', '.join(C_STANDARDS)}")
-                kept.append(PatchItem(op, value, origin, "proposed", 0, rationale=rationale))
+                kept.append(PatchItem(op, value, origin, rationale[:120] or "proposed", 0, rationale=rationale))
             elif op == "add_override":
                 match = str(raw.get("match") or "")
                 if not match or not any(_glob_match(path, match) for path in index.by_path):
@@ -392,7 +392,7 @@ def validate_patch(
                         value[key] = entries
                 if not value:
                     raise ValueError("override carries nothing")
-                kept.append(PatchItem(op, value, origin, "proposed", 0, match=match, rationale=rationale))
+                kept.append(PatchItem(op, value, origin, rationale[:120] or "proposed", 0, match=match, rationale=rationale))
             elif op == "set_splint_option":
                 name = str(raw.get("name") or "")
                 if name not in SPLINT_OPTIONS:
@@ -400,14 +400,14 @@ def validate_patch(
                 value = raw.get("value")
                 if value not in SPLINT_OPTIONS[name] or isinstance(value, bool) != isinstance(SPLINT_OPTIONS[name][0], bool):
                     raise ValueError(f"splint option {name} does not accept {value!r}")
-                kept.append(PatchItem(op, (name, value), origin, "proposed", 0, rationale=rationale))
+                kept.append(PatchItem(op, (name, value), origin, rationale[:120] or "proposed", 0, rationale=rationale))
             elif op == "add_stub_header":
                 name = str(raw.get("name") or raw.get("value") or "")
                 if name not in external:
                     raise ValueError(f"stub {name!r} is not a header the tree lacks")
                 if sum(1 for item in kept if item.op == "add_stub_header") >= MAX_STUBS:
                     raise ValueError("too many stubs")
-                kept.append(PatchItem(op, name, origin, "proposed", 0, rationale=rationale, preselected=False))
+                kept.append(PatchItem(op, name, origin, rationale[:120] or rationale[:120] or "proposed", 0, rationale=rationale, preselected=False))
             else:
                 raise ValueError(f"unknown op {op!r}")
         except ValueError as exc:

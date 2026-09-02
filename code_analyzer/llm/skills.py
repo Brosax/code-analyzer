@@ -75,6 +75,8 @@ def parse_skill(text: str, *, origin: str = "<string>") -> Skill:
 SCANNER_ROLE = "scanner"
 VALIDATOR_ROLE = "validator"
 VALIDATOR_SKILL = "llm-validator"
+CONFIGURATOR_ROLE = "configurator"
+CONFIGURATOR_SKILL = "build-context-configurator"
 
 
 def skill_role(name: str) -> str:

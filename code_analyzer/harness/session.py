@@ -171,6 +171,59 @@ def run_candidate(
     )
 
 
+PROPOSAL_FILENAME = "proposal.json"
+PROPOSAL_SCHEMA_VERSION = 1
+
+
+def run_proposal(
+    runtime: HarnessRuntime,
+    *,
+    run_dir: Path,
+    producer: str,
+    round_id: str,
+    prompt: str | list[dict[str, Any]],
+    unit_sha256: str,
+    skill_version: str,
+    parse: Callable[[str | None], tuple[bool, str | None, dict[str, Any], dict[str, int]]],
+    schema_sha256: str,
+    input_files: list[str] | None = None,
+    settings: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run the build-context configurator once, with the same evidence discipline.
+
+    ``proposal.json`` takes the place of findings.json: what the model
+    proposed after validation, what was dropped and why.  ``parse`` is the
+    caller's validator; it returns ``(valid, reason, result, counts)``.
+    """
+
+    def parsed(text: str | None) -> _Parsed:
+        valid, reason, result, counts = parse(text)
+        return _Parsed(valid, reason, result, counts, {"proposal": result})
+
+    return _run_session(
+        runtime,
+        directory=unit_directory(run_dir, producer, round_id),
+        run_dir=run_dir,
+        producer=producer,
+        subject={"round_id": round_id},
+        prompt=prompt,
+        unit_sha256=unit_sha256,
+        skill_version=skill_version,
+        schema={"version": PROPOSAL_SCHEMA_VERSION, "sha256": schema_sha256},
+        parse=parsed,
+        result_file=PROPOSAL_FILENAME,
+        input_files=input_files,
+        settings=settings,
+        session_id=session_id,
+        cache=None,
+        cancelled=cancelled,
+        on_event=on_event,
+    )
+
+
 @dataclass(frozen=True)
 class _Parsed:
     """What one response reduced to: the result file body and its record counts."""

@@ -95,11 +95,29 @@ compile database、运行 CMake 或安装工具。扫描中 `Ctrl+C` 经确认�
 |---|---|
 | `单元 2/2` | 已完成单元数 / 计划数；计划数未知时显示 `已完成 N 单元`，绝不编造分母 |
 | `compile-db` / `fallback` | cppcheck 的构建感知遍 / 纯源码回退遍 |
-| `分片 3/5`（`shard-000N`） | flawfinder 的分片 |
+| `分片 3/5`（`shard-000N`） | flawfinder 的分片；分片数来自 `units/planned` 事件，未宣布时不显示分母 |
 | `src/dev.c` + `范围 build · jobs 4` | splint 正在检查的翻译单元与其扫描范围 |
-| `src/dev.c (high)` | LLM scanner 正在审查的单元及其风险档位 |
-| `8 findings` | 该 producer 已报告的 finding 数（LLM 侧实时可得；静态工具的计数要等报告解析） |
-| `prompt 41.2k/4.2M（估算：字符/4）` | token 预算；**估算说明永远随数字出现** |
+| `src/dev.c (high)` + `等待 / 流式 / 读取 x.h / 解析 / 校验` | LLM scanner 正在审查的单元、风险档位，以及会话进行到的**步骤** |
+| `8 findings` | 该 producer 已报告的 finding 数——静态工具在单元报告解析完成时累加，LLM 每个会话结束时累加 |
+| `◐` | 部分完成：工具跑完了，但有单元失败、超时或未调度；节点详情列出原因直方图 |
+| `prompt 41.2k/4.2M（估算：字符/4）` + `12 tok/s · ETA 18 分` | token 预算；**估算说明永远随数字出现**；速率与 ETA 来自最近 20 个会话的滑动均值 |
+
+运行中可用的按键（`F1` 也列出）：
+
+| 键 | 作用 |
+|---|---|
+| `↑` `↓` | 在 producer 行之间移动光标（`▶` 标记） |
+| `Enter` | 光标所在节点的详情：原因直方图、未调度/被跳过的单元、正在进行的步骤 |
+| `p` / `P` | 暂停 / 恢复 LLM 泳道 / 静态泳道；正在运行的单元会完成，下一单元在检查点等待 |
+| `s` | 跳过光标所在 producer 尚未开始的单元（确认对话框）；已有证据保留 |
+| `+` / `-` | 调整 LLM 并发（上限 8；第三方 provider 见 12.5 节的速率限制） |
+| `r` | LLM 重试：把未得到模型回答的单元（断路器/预算未调度、传输或提供方失败）作为新一轮重新扫描；可勾选"仅传输/提供方失败" |
+| `d` | 重新打开推迟的构建上下文补丁对话框（见 8.1 节） |
+| `F3` / `F4` | 切换右侧面板（日志 / LLM / 问题）/ 切换日志过滤（全部 / 警告 / 错误） |
+| `Ctrl+C` | 协作式取消 |
+
+每一次操作都会以 `control/*` 事件写入 `events.jsonl` 与 `logs/runner.log`：谁在什么时候
+暂停、跳过、改了并发、做了什么决定，事后都查得到。
 
 终端宽度 ≥120 列时流程图与日志左右并排，较窄时上下堆叠且流程图自动折叠——
 **运行中的节点永远不会被折叠掉**，被省略的用 `… 另外 N 个` 汇总。`F2` 可隐藏
@@ -271,6 +289,55 @@ code-analyzer analyze ./project \
 
 这些参数只用于未被 compile database 覆盖的 fallback 扫描。
 
+### 8.1 让工具自己找出缺的构建上下文
+
+没有 compile database 时，Splint 常常在第一条 `#include` 就死掉：头文件明明在树里，
+只是没人告诉它去哪找。`[build] assist`（默认 `propose`）让运行在静态工具跑完后
+多走一个**修补循环**：
+
+1. **诊断**：汇总失败单元记录下的原因——缺哪些头文件、哪些 `#error`、几处解析错误。
+2. **推断**（确定性代码）：只提出树能证明的东西——唯一地携带某个缺失头文件的目录成为
+   `-I`；同名头文件出现在多个板级目录时，按失败文件所在子树给出 `[[build.overrides]]`；
+   保留名警告是唯一失败原因时提出 `report_reserved_names = false`；树里根本没有的头文件
+   可以生成**空的桩头文件**（默认不勾选，永远由代码生成、放在报告目录内、排在 `-I` 最后）。
+3. **咨询模型**（8.2 节）：只要 `[llm]` 端点可达就会问一次，与 `llm.enabled` 无关。
+4. **探针**：先在 ≤ `assist_probe_units`（默认 12）个失败单元上试跑补丁，报告有几个
+   现在能到达 `Finished checking`。
+5. **决定**：TUI 弹出逐项勾选的对话框；终端上是 `[y/N]`；无 TTY 的运行只记录不应用，
+   除非给了 `--build-assist-yes`。`assist = "auto"` 只在补丁全部来自确定性推断且探针有
+   改善时自动应用。
+6. **重跑**：只重跑失败单元，作为 attempt 2 写进**新的**单元目录；原尝试保留并标记
+   `superseded_by`，审查表中对应行的 `evidence_context` 带 `/superseded` 后缀，
+   dashboard 可按"已被替代的尝试"过滤。
+
+```bash
+code-analyzer analyze ./project --no-compile-db --build-assist propose        # 询问（默认）
+code-analyzer analyze ./project --no-compile-db --build-assist-yes            # 无人值守：应用预选项
+code-analyzer analyze ./project --build-assist off                            # 关闭
+code-analyzer tools-resume ./reports/<slug>/<run> --tool splint               # 事后续跑同一循环
+```
+
+证据全部在报告目录里：`inputs/build-context/r<N>/` 下有 `diagnosis.json`、`patch.json`、
+`probe.json`、`llm.json`、`decision.json`、`applied-config.toml`、`stubs/`；
+`suggested-config.toml` 是可以直接粘进项目 TOML 的 `[build]` 片段；`manifest.json` 的
+`build_context` 记录每一轮的前后对比。循环**从不**改写项目自己的 `.code-analyzer.toml`、
+不往源码树写任何文件、不运行构建命令、不安装工具。
+
+`tools-resume` 从上一轮之后继续：无人值守时只记录了补丁的运行，事后在终端里确认一次
+即可应用并重新推导审查报告。
+
+### 8.2 LLM 配置器
+
+确定性推断解决不了"这个子树到底按哪块板编译"、"`#error` 要的宏该是什么值"、
+"哪些缺失头文件真的是外部 SDK"这类问题。`build-context-configurator` 技能把诊断
+（只有计数、头文件名与目录名，没有源码正文）交给 `[llm]` 端点的模型，允许它只读地翻
+几个头文件，然后返回一个 JSON 提议。提议里的每一项都经过与手写 TOML 相同的校验：
+路径必须是树内目录、`match` 必须命中至少一个文件、宏定义必须符合 `NAME[=VALUE]`、
+桩头文件名必须来自诊断的 external 列表；不合规的项被丢弃并逐条记录在
+`llm/sessions/build-context-configurator/r<N>/proposal.json` 的 `problems` 里。模型提出的
+项在对话框里标为 **LLM**，探针没有改善时默认不勾选，且**永远**不会被 `auto` 模式
+自动应用。第三方端点会在决策摘要里注明"诊断已离开本机"。
+
 排除路径或选择读取 `.gitignore`：
 
 ```bash
@@ -333,6 +400,15 @@ include = ["include"]
 system_include = []
 define = ["PRODUCT=1"]
 undefine = []
+assist = "propose"            # off | propose | auto（8.1 节）
+assist_rounds = 1
+assist_probe_units = 12
+approval_timeout_seconds = 0  # 0 = 一直等操作者
+stub_headers = true
+
+[[build.overrides]]           # 子树专属的 include / define
+match = "platform/ext/target/arm/rse/**"
+include = ["platform/ext/target/arm/rse/common/partition"]
 
 [review]
 enabled = true
@@ -357,6 +433,10 @@ total_timeout_seconds = 14400
 scope = "auto"
 jobs = 1
 heartbeat_seconds = 10
+mode = "weak"                 # weak | standard | checks | strict
+report_reserved_names = true
+try_to_recover = true
+skip_system_headers = true
 ```
 
 配置优先级是：内建默认值、小于 `SOURCE/.code-analyzer.toml`、小于显式
@@ -529,6 +609,12 @@ gate_includes_llm = true
 ```
 
 ### 12.5 源码会离开本机吗？
+
+第三方端点还有两件事要知道：`[llm] reasoning = "low"` 之类的推理档位会作为请求参数
+传给 provider（始终思考的模型拒绝 `off`，思考 token 计入 `max_completion_tokens`，
+给足 4000 以上）；`jobs` 超过 provider 的并发配额时会收到 HTTP 429，单元以
+`provider RATE_LIMIT` 失败，运行中按 `-` 降低并发、按 `r` 重试即可。
+
 
 用 `gpu-host` 这类本地 profile 时不会。切换到第三方 profile（如 `openrouter`）时，
 被扫描的固件源码会发送给该服务商及其背后的模型提供方；CLI 与 `llm-doctor` 都会打印

@@ -229,3 +229,38 @@ def test_a_cache_replay_is_marked_on_the_record(tmp_path: Path, fake: FakeHarnes
     started = next(e for e in events if e.phase == "unit" and e.status == "started")
     assert started.message.startswith("cached (") and started.data["cached"] is True
     assert [e.data["step"] for e in events if e.phase == "unit" and e.status == "step"][0] == "replaying"
+
+
+# --- the operator's retry -------------------------------------------------------------
+
+
+def test_an_operator_retry_reruns_the_transport_failures_as_its_own_round(tmp_path: Path, fake: FakeHarness) -> None:
+    from code_analyzer.analysis import CancellationToken
+    from code_analyzer.control import RunControl
+
+    fake.script_default(transport_failed())
+    config = _config(tmp_path, consecutive_failure_limit=0)
+    control = RunControl(CancellationToken(), llm_jobs=1)
+    events: list[AnalysisEvent] = []
+
+    def sink(event: AnalysisEvent) -> None:
+        events.append(event)
+        # The operator presses `r` the moment the transport failure lands --
+        # and the provider is back by the time the retry round runs.
+        if event.phase == "unit" and event.status == "failed" and (event.data or {}).get("failure_class") == "transport":
+            fake.script_default("well-formed")
+            control.request_retry("llm", None, "test")
+
+    result = run_analysis(AnalysisRequest(_tree(tmp_path), config), events=sink, control=control)
+    manifest = result.manifest
+    block = manifest["llm"]["scanners"]["llm-memory-safety"]
+    assert [unit["status"] for unit in block["units"]] == ["failed", "completed"]
+    unit_id = block["units"][0]["id"]
+    plan = json.loads((result.report_directory / "llm" / "plan.json").read_text(encoding="utf-8"))
+    operator = [entry for entry in plan["rounds"] if entry.get("decided_by") == "operator"]
+    assert len(operator) == 1 and operator[0]["action"] == "retry" and operator[0]["scheduled"] == 1
+    assert operator[0]["targets"] == [unit_id]
+    assert list((result.report_directory / "llm/sessions/llm-memory-safety").glob("*/r1/findings.json"))
+    assert [e.status for e in events if e.phase == "control"] == ["retry_requested"]
+    assert any(e.phase == "llm" and e.status == "retry" for e in events)
+    assert len(fake.calls_for("llm-memory-safety")) == 2

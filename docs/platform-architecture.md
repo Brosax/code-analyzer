@@ -399,6 +399,18 @@ LLM 单元级别已有 `llm/sessions/**/events.jsonl`。**运行级**没有—�
 
 ---
 
+### 6.4 已交付的补充：`data`、`control`、`decision`、`logs/runner.log`
+
+- `AnalysisEvent.data`：每类事件的结构化事实（工具的 argv/cwd/exit_code/错误摘录、
+  单元的 index/total/attempt/failure_class、LLM 会话的 step/tok_s/eta、修补循环的
+  before/after）。`events.py:clean_data` 保证它可序列化且有界。
+- `control/*`（paused/resumed/skipped/jobs/retry_requested）与 `decision/*`
+  （requested/decided）：操作者在 TUI、`serve` 或 CLI 上的每一次干预都是事件，
+  由 `RunControl` 的监听器发出。
+- `logs/runner.log`：`runlog.RunLogger` 从同一事件流投影出的人读日志，一行一个事实，
+  级别由事件语义决定（失败/超时 WARN，致命 ERROR），argv 与 cwd 每工具打印一次。
+  它不是第二个数据源：`events.jsonl` 才是。
+
 ## 7. Context 管理策略 — EXISTS；跨文件依赖是 NEW
 
 规范的流程与现状逐段对照：
@@ -837,17 +849,20 @@ Code Review · run 2026-08-21T13:02:11Z-ab12cd34ef56
    `llm_scan.running()` 的 `scanners` 是空字典，于是 `graph(manifest)` 会把六个
    scanner 塌成一个 `llm` 节点。逐 scanner 的实时视图只能来自事件流。运行结束后
    反过来，所以结果页仍读 manifest。
-3. **计数器：分子靠数，分母才解析。** 分子是终态 `unit` 事件的整数计数；分母是从
-   `progress` 阶段自由文本里刮出来的**提示**，只单向 `max` 增长，提示没来就显示
-   "已完成 N 单元"而不编造分母。结构上更干净的方案——给 `AnalysisEvent` 加
-   `index`/`total` 字段——**被否决**：`tests/test_events.py:104` 钉死了 JSONL 的
-   键集合，改它会同时破坏 `serve._event_dict` 与 §6 的契约。文本耦合由
-   `tests/test_flow.py` 的端到端用例兜底：producer 改措辞会让测试变红，而不是让
-   面板悄悄显示一个横杠。
-4. **`audit` 不入流程图。** `runner.py` 写 `audit/assessment.json` 时不发任何事件，
-   画出来会整场 `pending` 然后突然变绿。`serve` 的 audit 节点今天正是这个毛病
-   （其 JS 监听的 `e.phase === "audit"` 从未触发）。修法是给 runner 补三条事件，
-   属于另一件事。
+3. **计数器：分子靠数，分母来自事件的 `data`。** 早先的版本把分母从 `progress`
+   文本里刮出来，并因为 `tests/test_events.py` 钉死了 JSONL 键集合而否决了结构化
+   字段。这个决定已经**反转**：`AnalysisEvent` 多了一个 `data` 字典（`clean_data`
+   限深、限长、限键数），单元事件携带 `index`/`total`/`label`/`argv`/`reason`/
+   `failure_class`，`units/planned` 宣布分母，`units/unscheduled` 把成千上万条
+   "未调度"合并成一条带 `count` 的事件。理由是去重：同一个事实以前会以 `progress`
+   文本、`unit` 事件和 `runner.log` 行三种形态各出现一次，现在 CLI 进度行由 runner
+   从同一个事件派生，`events.jsonl` 里不再有 `progress` 行。键集合契约随之升级，
+   `serve._event_dict` 原样透传 `data`。
+4. **`audit`、`build_context` 入流程图。** runner 现在为审计层发 `audit/*` 事件，为
+   构建上下文修补循环发 `build_context/*`（diagnosed → inferred → consulting/consulted
+   → probing/probed → awaiting → applying/applied → finished）与 `decision/*`
+   事件；`flow.py` 的 `TAIL_NODES` 以"修补"打头，`serve` 页面画同一张图并在有待决策
+   项时显示决策条。
 
 模型在 `code_analyzer/flow.py`，纯逻辑、零 UI 依赖，像 `serve.graph` 一样单测
 （`tests/test_flow.py` 有一条测试专门断言 import 它不会拉进 textual / rich / http）。

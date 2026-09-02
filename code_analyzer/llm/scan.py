@@ -165,6 +165,8 @@ def run(
             control=control,
         )
         records, rounds = _rounds(state, plan, units, scanners, config, progress, phase_event)
+        if control is not None:
+            records, rounds = _operator_rounds(state, records, rounds, units, scanners, control, progress, phase_event)
 
     write_json(
         run_dir.joinpath(*replan.PLAN_PATH),
@@ -313,6 +315,71 @@ def _rounds(
         state.round_index = 0
         entry["budget_after"] = state.budget_state()
         entry["scheduled"] = len(follow_up)
+        rounds.append(entry)
+    return records, rounds
+
+
+# How many times an operator may ask for the failed units again in one run.
+OPERATOR_ROUNDS = 3
+
+
+def _operator_rounds(
+    state: "_Phase",
+    records: list[dict[str, Any]],
+    rounds: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    scanners: list[str],
+    control: Any,
+    progress: Callable[[str], None],
+    phase_event: Callable[..., None] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The operator's retries, after the planner's rounds and independently of them.
+
+    A retry re-arms the circuit breaker and re-runs the units that never got a
+    model's answer -- unscheduled by the breaker, the budget or a skip, or
+    failed in transport -- or exactly the units the operator named.  Each
+    retry is a ledger round of its own, ``decided_by: "operator"``, with its
+    evidence under ``r<N>/`` like a re-planning round.
+    """
+    for _attempt in range(OPERATOR_ROUNDS):
+        asked = control.drain_retries("llm")
+        if asked is False or state.is_cancelled():
+            break
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for record in records:
+            latest[(str(record.get("producer")), str(record.get("id")))] = record
+        wanted = set(asked) if asked is not None else None
+        targets = [
+            key for key, record in latest.items()
+            if (wanted is None and (record.get("status") == "unscheduled" or record.get("failure_class") in {"transport", "provider"}))
+            or (wanted is not None and key[1] in wanted)
+        ]
+        index = len(rounds) + 1
+        entry: dict[str, Any] = {
+            "round": index, "decided_by": "operator", "action": "retry",
+            "targets": [unit_id for _producer, unit_id in targets],
+            "rationale": "operator asked for the units that never got an answer" if asked is None else "operator named the units",
+            "budget_before": state.budget_state(), "breaker_was_open": state.breaker_open,
+        }
+        follow_up = [
+            task for task in _tasks(units, scanners) if (task[1], task[2]["unit_id"]) in set(targets)
+        ]
+        if not follow_up:
+            entry.update({"scheduled": 0, "budget_after": state.budget_state()})
+            rounds.append(entry)
+            progress(f"llm: retry round {index}: nothing to retry")
+            continue
+        state.breaker_open = None
+        state._consecutive = 0
+        progress(f"llm: retry round {index}: {len(follow_up)} unit(s), asked by the operator")
+        if phase_event is not None:
+            phase_event("retry", f"retry round {index}: {len(follow_up)} unit(s), asked by the operator", {
+                "round": index, "targets": len(follow_up), "decided_by": "operator",
+            })
+        state.round_index = index
+        records.extend(state.execute_all(follow_up))
+        state.round_index = 0
+        entry.update({"scheduled": len(follow_up), "budget_after": state.budget_state()})
         rounds.append(entry)
     return records, rounds
 

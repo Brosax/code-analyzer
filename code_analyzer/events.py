@@ -70,7 +70,10 @@ def clean_data(value: Any, *, depth: int = 0, key: str = "") -> Any:
 class JsonlEventSink:
     """JSONL sink holding one run per file; safe to call from worker threads."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, append: bool = False) -> None:
+        # A post-run command (tools-resume) appends to the run's journal; a
+        # run of its own starts one.
+        self._append = append
         self._lock = threading.Lock()
         self._pending: list[AnalysisEvent] = []
         self._stream: IO[bytes] | None = None
@@ -91,7 +94,7 @@ class JsonlEventSink:
     def _open(self, path: Path) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._stream = path.open("wb")
+            self._stream = path.open("ab" if self._append else "wb")
         except OSError as exc:
             raise UserError(f"cannot open events file {path}: {exc}") from exc
         self.path = path

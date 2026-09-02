@@ -644,9 +644,32 @@ Coordinator 必须避免四种失衡：漏掉函数、同一 agent 无意义重�
 单元耗时以分钟计，heartbeat 是必需而非可选。每 `heartbeat_seconds`（默认 15）
 发一次，携带：已耗时、实测 tok/s、剩余预算、按剩余单元数与滑动均值算出的 ETA。
 
-事件经既有的 `event("unit", "heartbeat", …)` 词汇发出
-（`runner.py:185-194` 的闭包），因此 CLI 的 `ProgressDisplay` 和 TUI 的实时日志
-**不需要任何改动**就能显示 LLM 进度。
+事件经既有的 `event("unit", "heartbeat", …)` 词汇发出，因此 CLI 的 `ProgressDisplay`
+和 TUI 的实时日志不需要任何改动就能显示 LLM 进度。
+
+**已交付**（2026-09）：每个会话另外发 `unit/step` 事件（prompting → waiting →
+streaming → reading `<tool>` → parsing → validating → caching），heartbeat 的 `data`
+携带实测 `tok_s` 与按最近 20 个会话滑动均值算出的 `eta_seconds`；provider 的失败
+原因从 SDK 事件流里读出并写进单元的 `reason`/`failure_class`/`provider_failure`
+（`RATE_LIMIT`、`TRANSPORT` 等），连续传输失败达到 `consecutive_failure_limit` 时
+断路器一次性把剩余单元标为 `unscheduled` 而不是一个个超时；预算按实测用量退款。
+扫描开始前先探测端点（`endpoint_reachable`，15 s），隧道断了的运行在几秒内失败并
+说明原因。
+
+### 5.8 操作者的重试轮次与构建上下文配置器
+
+`RunControl.request_retry("llm", ids | None)` 在扫描阶段结束时被 `_operator_rounds`
+排空：未得到模型回答的单元（断路器/预算未调度、传输或提供方失败）或操作者点名的单元
+作为新一轮重跑，断路器重新合上，`llm/plan.json` 记一条 `decided_by: "operator"`，
+证据在 `r<N>/` 下。TUI 的 `r` 键走这条路；运行结束后同样的单元由 `llm-resume` 处理。
+
+第二种 LLM 角色 `role: configurator`（`skills/build-context-configurator`）不产出
+任何 finding：它读静态工具的**预处理失败诊断**（头文件名、目录名、`#error` 文本、
+计数——没有源码正文），可只读地翻几个头文件，返回一个 JSON 提议。提议里的每一项都
+经过 `build_context.validate_patch` 与 `validate_config`，再经探针试跑，最后由
+操作者逐项决定；`auto` 模式永远不会自动应用它的项。它与 scanner 共用 `_Phase`
+（预算、心跳、沙箱、证据五件套），但用自己的 cordis 文档（只允许 `fs`）、自己的会话
+目录 `llm/sessions/build-context-configurator/r<N>/` 和 `proposal.json`。
 
 ---
 

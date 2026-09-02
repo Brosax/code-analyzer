@@ -41,6 +41,10 @@ WIDE_BREAKPOINT = 120
 MAX_DETAIL = 200
 SPINE_RAMP = 3
 
+# Failure classes a retry can change: the provider never carried the session.
+RETRYABLE_CLASSES = frozenset({"transport", "provider"})
+MAX_RETRYABLE = 5000
+
 TAIL_NODES: tuple[tuple[str, str], ...] = (
     ("build_context", "修补"),
     ("stability", "稳定"),
@@ -141,6 +145,8 @@ class Node:
     in_flight: dict[str, str] = field(default_factory=dict)
     # Why units ended the way they did: failure class (or status word) -> count.
     reasons: dict[str, int] = field(default_factory=dict)
+    # LLM units that never got a model's answer, by id: what a retry can target.
+    retryable: dict[str, str] = field(default_factory=dict)
     # Where each in-flight unit is (LLM steps); unit -> step label.
     steps: dict[str, str] = field(default_factory=dict)
     skipped: bool = False
@@ -412,6 +418,12 @@ class RunFlow:
         if event.status != "completed":
             node.failures += 1
             self._remember_reason(node, str(data.get("failure_class") or event.status), 1)
+            if node.kind == "llm" and unit and len(node.retryable) < MAX_RETRYABLE and (
+                event.status in {"unscheduled", "interrupted"} or data.get("failure_class") in RETRYABLE_CLASSES
+            ):
+                node.retryable[unit] = str(data.get("failure_class") or event.status)
+        elif node.kind == "llm" and unit:
+            node.retryable.pop(unit, None)
         found = data.get("findings") if data.get("findings") is not None else data.get("finding_count")
         if _count(found) is not None:
             node.findings = (node.findings or 0) + int(found)
@@ -594,6 +606,21 @@ class RunFlow:
 
     def producer_ids(self) -> list[str]:
         return [node.id for node in self._producers()]
+
+    def retryable_units(self, *, transport_only: bool = False) -> list[str]:
+        """The LLM unit ids a retry would target, across scanners."""
+        ids: list[str] = []
+        for node in self.nodes.values():
+            if node.kind != "llm":
+                continue
+            for unit, why in node.retryable.items():
+                if not transport_only or why in RETRYABLE_CLASSES:
+                    ids.append(unit)
+        return ids
+
+    def llm_active(self) -> bool:
+        """Whether any scanner can still take a retry: the LLM lane has not settled."""
+        return any(node.kind == "llm" and node.state in {"pending", "running"} for node in self.nodes.values())
 
     def llm_rows(self) -> list[LlmRow]:
         rows = []

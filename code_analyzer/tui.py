@@ -64,7 +64,7 @@ from .tools import TOOL_NAMES
 # their keys free for the form otherwise.
 RUN_ONLY_ACTIONS = frozenset({
     "cycle_pane", "cycle_filter", "toggle_pause_llm", "toggle_pause_static", "skip_selected",
-    "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail", "open_decision",
+    "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail", "open_decision", "retry_llm",
 })
 PANES = ("log", "llm", "problems")
 PANE_LABELS = {"log": "日志", "llm": "LLM 明细", "problems": "问题"}
@@ -237,6 +237,40 @@ class PatchScreen(ModalScreen[Decision]):
         self.dismiss(Decision("defer", (), "tui"))
 
 
+class RetryScreen(ModalScreen[str | None]):
+    """Ask the LLM lane to try again: every unit that never got an answer, or only the transport failures."""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def __init__(self, failed: int, unscheduled: int, transport: int, reasons: dict[str, int]) -> None:
+        super().__init__()
+        self.failed, self.unscheduled, self.transport, self.reasons = failed, unscheduled, transport, reasons
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("重试 LLM 单元", classes="dialog-title")
+            yield Static(Text(
+                f"失败 {self.failed} · 未调度 {self.unscheduled} · 其中传输/提供方失败 {self.transport}\n"
+                + ("原因：" + "；".join(f"{reason} {count}" for reason, count in sorted(self.reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:6]) if self.reasons else "")
+            ))
+            yield Checkbox("仅重试传输/提供方失败的单元", value=bool(self.transport), id="transport-only")
+            yield Static("重试会重新合上断路器，在当前运行内以新的一轮（r<N>/）重新扫描；已有证据保留。", classes="warning")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("取消 (Esc)", id="cancel")
+                yield Button("重试", id="retry", variant="primary")
+
+    @on(Button.Pressed, "#retry")
+    def retry_pressed(self) -> None:
+        self.dismiss("transport" if self.query_one("#transport-only", Checkbox).value else "all")
+
+    @on(Button.Pressed, "#cancel")
+    def cancel_pressed(self) -> None:
+        self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class InfoScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape", "close", "关闭")]
 
@@ -281,6 +315,7 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("down", "cursor_down", "下一节点", show=False),
         Binding("enter", "node_detail", "节点详情", show=False),
         Binding("d", "open_decision", "决策", show=False),
+        Binding("r", "retry_llm", "重试 LLM", show=False),
     ]
     CSS = """
     Screen { background: $surface; }
@@ -609,6 +644,35 @@ class AnalyzerApp(App[TuiOutcome]):
             return
         lines = self.flow.node_detail(node_id, time.time())
         self.push_screen(InfoScreen(f"节点详情 · {node_id}", "\n".join(lines)))
+
+    def action_retry_llm(self) -> None:
+        if self.control is None or self.flow is None:
+            return
+        if not self.flow.llm_active():
+            self.query_one("#run-stop-hint", Static).update("LLM 阶段已结束：运行后用 llm-resume 续扫")
+            return
+        llm_nodes = [node for node in self.flow.nodes.values() if node.kind == "llm"]
+        failed = sum(node.failures for node in llm_nodes)
+        unscheduled = sum(node.unscheduled for node in llm_nodes)
+        transport = len(self.flow.retryable_units(transport_only=True))
+        if not failed and not unscheduled and not transport:
+            self.query_one("#run-stop-hint", Static).update("没有需要重试的 LLM 单元")
+            return
+        reasons: dict[str, int] = {}
+        for node in llm_nodes:
+            for reason, count in node.reasons.items():
+                reasons[reason] = reasons.get(reason, 0) + count
+        self.push_screen(RetryScreen(failed, unscheduled, transport, reasons), self._retry_confirmed)
+
+    def _retry_confirmed(self, choice: str | None) -> None:
+        if choice is None or self.control is None or self.flow is None:
+            return
+        ids = self.flow.retryable_units(transport_only=True) if choice == "transport" else None
+        self.control.request_retry("llm", ids, "tui")
+        self.query_one("#run-stop-hint", Static).update(
+            f"已请求重试 {len(ids) if ids is not None else '全部未得到回答的'} LLM 单元；将在本轮结束后执行"
+        )
+        self._flow_dirty = True
 
     def action_open_decision(self) -> None:
         if self.control is None:
@@ -1134,7 +1198,14 @@ class AnalyzerApp(App[TuiOutcome]):
                 lines.append(self._pending_log_lines.popleft())
         if not lines or not self.is_mounted:
             return
-        log = self.query_one("#run-log", RichLog)
+        try:
+            log = self.query_one("#run-log", RichLog)
+        except NoMatches:
+            # The run view is not up yet (or already torn down): keep the
+            # lines for the next tick rather than lose them.
+            with self._log_lock:
+                self._pending_log_lines.extendleft(reversed(lines))
+            return
         for line in lines:
             log.write(line)
 

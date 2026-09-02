@@ -27,18 +27,7 @@ from .audit import (
     load_assessment,
     write_assessment,
 )
-from .build_context import (
-    applied_config_toml,
-    diagnose_units,
-    infer_patch,
-    manifest_block,
-    probe_patch,
-    relative_to_run,
-    select_probe_files,
-    suggested_toml,
-    write_round,
-    write_stubs,
-)
+from .build_context import manifest_block
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
 from .control import CANCELLED, SKIP_PRODUCER, Decision, DecisionRequest, RunControl
@@ -51,13 +40,14 @@ from .llm import scan as llm_scan
 from .persist import json_bytes
 from .persist import write_json as _write_json
 from .progress import ProgressDisplay
+from .reconfigure import LoopContext, run_loop
 from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_review
 from .runlog import RunLogger
 from .sanitize import ExportError, export_shareable
 from .sarif import build_sarif, write_sarif
 from .status import overall
 from .tools import TOOL_NAMES, CompileDatabase, OutputBudget, RunContext, adapter
-from .tools.common import artifact_index, merge_attempt
+from .tools.common import artifact_index
 
 # The whole run's share of disk for tool output.  Generous: flawfinder's native
 # report is its stdout, so this has to sit far above any real report and act
@@ -499,141 +489,27 @@ def _analyze(
         window.finish(STATIC)
 
     def run_build_context() -> None:
-        """Diagnose -> infer -> probe -> decide -> re-run, inside the static lane.
+        """Diagnose -> infer -> consult -> probe -> decide -> re-run, inside the static lane.
 
         Runs after the tools and before the window closes, so a Splint
-        re-run never waits for the LLM lane.  Every round leaves its evidence
-        under inputs/build-context/r<N>/ and its verdict in the manifest.
+        re-run never waits for the LLM lane; the loop itself lives in
+        reconfigure.py so tools-resume can run it over a finished run.
         """
-        assist = str(config["build"]["assist"])
-        if assist == "off":
+        if config["build"]["assist"] == "off":
             return
-        rounds_limit = int(config["build"]["assist_rounds"])
-        rounds: list[dict[str, Any]] = []
-        outcome, why = "skipped", "no unit needed a different build context"
-        current = config
-        def bc(state: str, message: str, **data: Any) -> None:
-            window.event(STATIC, 1.0, "build_context", state, message, data={"assist": assist, **data})
-            progress(f"build-context: {message}")
-        bc("started", f"build-context assistance ({assist})")
-        for name in requested_names:
-            declared = adapter(name)
-            if declared.rerun is None or name not in resolved_tools:
-                continue
-            resolved, version = resolved_tools[name]
-            for round_index in range(1, rounds_limit + 1):
-                if cancellation.cancelled:
-                    return
-                record = manifest["tools"][name]
-                unit_ids = declared.reconfigurable(record)
-                if not unit_ids:
-                    break
-                files = _unit_files(record, unit_ids)
-                diagnosis = diagnose_units(record, inventory, tool=name)
-                bc("diagnosed", f"{name}: {diagnosis.units_failed}/{diagnosis.units_total} unit(s) could not be preprocessed; {len(diagnosis.missing_headers)} distinct missing header(s)", tool=name, round=round_index, **diagnosis.counts)
-                patch = infer_patch(diagnosis, current, source=source, round=round_index)
-                if not patch.items:
-                    why = f"{name}: nothing the tree can prove -- {len(diagnosis.missing_headers)} header(s), none resolvable"
-                    bc("skipped", why, tool=name, round=round_index)
-                    write_round(run_dir, round_index, diagnosis=diagnosis.as_dict())
-                    rounds.append({"round": round_index, "tool": name, "diagnosis": diagnosis.counts, "items": 0, "applied": False, "reason": why})
-                    break
-                preselected = tuple(index for index, item in enumerate(patch.items) if item.preselected)
-                labels = [item.label() for item in patch.items]
-                bc("inferred", f"{name}: {len(patch.items)} patch item(s): " + "; ".join(labels[:4]) + (" …" if len(labels) > 4 else ""), tool=name, round=round_index, items=labels)
-                probe = None
-                if name == "splint" and preselected:
-                    sample = select_probe_files(diagnosis, record, int(config["build"]["assist_probe_units"]))
-                    bc("probing", f"{name}: trying the patch on {len(sample)} failed unit(s)", tool=name, round=round_index, sampled=len(sample))
-                    try:
-                        trial = patch.apply(current, run_dir, source, preselected)
-                        probe = probe_patch(resolved, source, run_dir, trial, sample, round=round_index, cancelled=cancellation.is_cancelled)
-                    except UserError as exc:
-                        probe = {"sampled": 0, "reached_before": 0, "reached_after": 0, "per_file": [], "error": str(exc)}
-                    bc("probed", f"{name}: {probe['reached_after']}/{probe['sampled']} sampled unit(s) now reach Finished checking", tool=name, round=round_index, **{k: v for k, v in probe.items() if k != "per_file"})
-                evidence = write_round(run_dir, round_index, diagnosis=diagnosis.as_dict(), patch=patch.as_dict(), probe=probe)
-                summary = f"{name}: round {round_index}: {len(patch.items)} item(s)"
-                if probe is not None:
-                    summary += f"; probe {probe['reached_after']}/{probe['sampled']} now preprocess"
-                request = DecisionRequest(
-                    id=control.new_request_id("bc"), kind="build_context_patch", summary=summary,
-                    items=tuple({**item.as_dict(), "label": item.label()} for item in patch.items),
-                    round=round_index, probe=probe, evidence_path=relative_to_run(evidence, run_dir), preselected=preselected,
-                )
-                improved = probe is None or probe["reached_after"] > probe["reached_before"]
-                deterministic = all(item.origin == "deterministic" for item in patch.items)
-                if assist == "auto" and improved and deterministic:
-                    decision = control.auto_decide(request, Decision("apply", preselected, "auto", "deterministic patch; probe improved"))
-                else:
-                    bc("awaiting", f"{name}: waiting for a decision on {len(patch.items)} item(s)", tool=name, round=round_index, decision=request.id)
-                    timeout = float(config["build"]["approval_timeout_seconds"]) or None
-                    decision = control.request_decision(request, timeout=timeout)
-                write_round(run_dir, round_index, decision={"answer": decision.answer, "selected": list(decision.selected), "decided_by": decision.decided_by, "note": decision.note})
-                if decision.answer != "apply" or not decision.selected:
-                    outcome, why = "rejected", f"{name}: round {round_index} {decision.answer} by {decision.decided_by}" + (f" ({decision.note})" if decision.note else "")
-                    bc("rejected", why, tool=name, round=round_index, decision=request.id)
-                    rounds.append({"round": round_index, "tool": name, "diagnosis": diagnosis.counts, "items": len(patch.items), "probe": probe, "decision": decision.answer, "decided_by": decision.decided_by, "applied": False})
-                    break
-                try:
-                    patched = patch.apply(current, run_dir, source, decision.selected)
-                except UserError as exc:
-                    outcome, why = "failed", f"{name}: the patch did not validate: {exc}"
-                    bc("failed", why, tool=name, round=round_index)
-                    rounds.append({"round": round_index, "tool": name, "items": len(patch.items), "applied": False, "reason": why})
-                    break
-                stubs = patch.selected_stubs(decision.selected)
-                if stubs:
-                    write_stubs(run_dir, round_index, stubs, run_id=run_id)
-                write_round(run_dir, round_index, applied_config=applied_config_toml(patched))
-                bc("applying", f"{name}: re-running {len(files)} unit(s) with the patch (attempt {round_index + 1})", tool=name, round=round_index, units=len(files), stubs=len(stubs))
-                attempt = round_index + 1
-                def rerun_unit(
-                    unit: str | None, status: str, message: str, value: float | None,
-                    data: dict[str, Any] | None = None, *, phase: str = "unit", tool_name: str = name,
-                    attempt_no: int = attempt,
-                ) -> None:
-                    window.event(STATIC, 1.0, phase, status, message, tool=tool_name, unit=unit, data=data)
-                    if data and "index" in data and status != "info":
-                        progress(f"build-context attempt {attempt_no} {tool_name}: unit {data['index']}/{data['total']} {data.get('label', unit)}: {message}")
-                context = RunContext(
-                    source=source, run_dir=run_dir, inventory=inventory,
-                    compile_db=CompileDatabase(entries=filtered_db, covered=frozenset(db_covered), present=compile_path is not None),
-                    config=patched, progress=lambda message, tool_name=name: progress(f"build-context {tool_name}: {message}"),
-                    cancelled=cancellation.is_cancelled, unit_event=rerun_unit,
-                    output_event=(lambda unit, stream, message, tool_name=name: event("output", "running", message, tool=tool_name, unit=unit, stream=stream)) if live_events else None,
-                    output_budget=output_budget, control=control, attempt=attempt,
-                )
-                before = {"failed": diagnosis.units_failed, "analysis_reached": diagnosis.units_analysis_reached}
-                try:
-                    result = declared.rerun(resolved, context, files)
-                except Exception as exc:
-                    outcome, why = "failed", f"{name}: re-run failed: {exc}"
-                    bc("failed", why, tool=name, round=round_index)
-                    rounds.append({"round": round_index, "tool": name, "items": len(patch.items), "applied": False, "reason": why})
-                    break
-                result["executable"], result["version"] = resolved, version
-                merged = merge_attempt(record, result, attempt=attempt)
-                with manifest_lock:
-                    manifest["tools"][name] = merged
-                    save_manifest()
-                after_diag = diagnose_units(merged, inventory, tool=name)
-                after = {"failed": after_diag.units_failed, "analysis_reached": after_diag.units_analysis_reached}
-                rounds.append({
-                    "round": round_index, "tool": name, "diagnosis": diagnosis.counts, "items": len(patch.items),
-                    "selected": list(decision.selected), "probe": probe, "decision": decision.answer,
-                    "decided_by": decision.decided_by, "applied": True, "attempt": attempt,
-                    "rerun_units": len(files), "before": before, "after": after, "status": merged["status"],
-                })
-                outcome, why = "applied", None
-                current = patched
-                (run_dir / "suggested-config.toml").write_text(suggested_toml(config, patched, source), encoding="utf-8")
-                bc("applied", f"{name}: attempt {attempt} {merged['status']}; analysis reached {after['analysis_reached']}/{merged['unit_counts']['planned']} (was {before['analysis_reached']}); {merged['unit_counts'].get('superseded', 0)} unit(s) superseded", tool=name, round=round_index, before=before, after=after, tool_status=merged["status"], superseded=merged["unit_counts"].get("superseded", 0))
-                if after["failed"] >= before["failed"]:
-                    break
-        with manifest_lock:
-            manifest["build_context"] = manifest_block(assist, outcome, rounds, reason=why)
-            save_manifest()
-        bc("finished", f"build-context assistance {outcome}" + (f": {why}" if why else ""), outcome=outcome, rounds=len(rounds))
+
+        def emit(phase: str, status: str, message: str, *, tool: str | None = None, unit: str | None = None, stream: str | None = None, data: dict[str, Any] | None = None) -> None:
+            if phase == "output":
+                event(phase, status, message, tool=tool, unit=unit, stream=stream, data=data)
+            else:
+                window.event(STATIC, 1.0, phase, status, message, tool=tool, unit=unit, data=data)
+
+        run_loop(LoopContext(
+            source=source, run_dir=run_dir, run_id=run_id, inventory=inventory, config=config, manifest=manifest,
+            manifest_lock=manifest_lock, save_manifest=save_manifest, requested_names=list(requested_names),
+            resolved_tools=resolved_tools, compile_db=CompileDatabase(entries=filtered_db, covered=frozenset(db_covered), present=compile_path is not None),
+            output_budget=output_budget, control=control, emit=emit, progress=progress, live_events=live_events,
+        ))
 
     def run_llm() -> None:
         progress("llm: starting semantic scan")
@@ -945,17 +821,6 @@ def _save_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     temporary = run_dir / ".manifest.json.tmp"
     temporary.write_bytes(json_bytes(manifest))
     temporary.replace(target)
-
-
-def _unit_files(record: dict[str, Any], unit_ids: list[str]) -> list[str]:
-    wanted = set(unit_ids)
-    files: list[str] = []
-    for unit in record.get("units") or []:
-        if str(unit.get("id")) in wanted:
-            for path in unit.get("input_files") or []:
-                if path not in files:
-                    files.append(str(path))
-    return files
 
 
 def _tool_summary(result: dict[str, Any], executable: str, version: str | None, duration: float) -> dict[str, Any]:

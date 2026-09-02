@@ -28,7 +28,7 @@ NODE_STATES: dict[str, str] = {
     "not_requested": "pending", "not_applicable": "pending", "disabled": "pending",
     # The build-context loop's own words.
     "applied": "success", "off": "pending", "rejected": "pending",
-    "diagnosed": "running", "inferred": "running", "proposed": "running", "probing": "running",
+    "diagnosed": "running", "inferred": "running", "proposed": "running", "consulting": "running", "consulted": "running", "probing": "running",
     "probed": "running", "awaiting": "running", "applying": "running",
 }
 STATES: tuple[str, ...] = ("success", "partial", "failed", "running", "pending")

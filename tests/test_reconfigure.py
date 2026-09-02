@@ -61,6 +61,9 @@ def _config(tmp_path: Path, source: Path, assist: str, **build: object) -> dict:
     return load_config(source, None, {
         "run": {"output_root": str(tmp_path / "reports"), "shareable_export": False},
         "build": {"compile_database_mode": "disabled", "assist": assist, "assist_probe_units": 2, **build},
+        # A port nothing listens on: the configurator is skipped at its gate,
+        # so these runs test the deterministic loop alone.
+        "llm": {"endpoint": "http://127.0.0.1:1/v1"},
         "tools": {
             "cppcheck": {"enabled": False}, "flawfinder": {"enabled": False},
             "splint": {"executable": str(_picky_splint(tmp_path)), "jobs": 1},
@@ -103,7 +106,7 @@ def test_auto_assist_reruns_the_failed_units_and_the_report_keeps_both_attempts(
     assert len(block["rounds"]) == 1 and block["rounds"][0]["applied"] and block["rounds"][0]["after"]["failed"] == 1
     run_dir = result.report_directory
     round_dir = run_dir / "inputs/build-context/r1"
-    assert sorted(p.name for p in round_dir.iterdir()) == ["applied-config.toml", "decision.json", "diagnosis.json", "meta.json", "patch.json", "probe", "probe.json"]
+    assert sorted(p.name for p in round_dir.iterdir()) == ["applied-config.toml", "decision.json", "diagnosis.json", "llm.json", "meta.json", "patch.json", "probe", "probe.json"]
     probe = json.loads((round_dir / "probe.json").read_text(encoding="utf-8"))
     assert probe["sampled"] == 2 and probe["reached_after"] == 2
     patch = json.loads((round_dir / "patch.json").read_text(encoding="utf-8"))
@@ -115,7 +118,7 @@ def test_auto_assist_reruns_the_failed_units_and_the_report_keeps_both_attempts(
     assert not (source / ".code-analyzer.toml").exists() and sorted(p.name for p in (source / "app").iterdir()) == ["a.c", "b.c", "c.c", "lone.c", "ok.c"]
     # The flow of events: diagnosed -> inferred -> probing -> probed -> (decision) -> applying -> applied -> finished.
     statuses = [e.status for e in events if e.phase == "build_context"]
-    assert statuses == ["started", "diagnosed", "inferred", "probing", "probed", "applying", "applied", "finished"]
+    assert statuses == ["started", "diagnosed", "inferred", "consulted", "probing", "probed", "applying", "applied", "finished"]
     assert [e.status for e in events if e.phase == "decision"] == ["requested", "decided"]
     reruns = [e for e in events if e.phase == "unit" and e.status == "started" and (e.data or {}).get("attempt") == 2]
     assert len(reruns) == 4

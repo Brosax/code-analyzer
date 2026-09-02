@@ -13,13 +13,15 @@ from .control import auto_no, auto_yes, stdin_decider
 from .dashboard import rebuild_dashboard
 from .doctor import probe_all
 from .errors import UserError
-from .events import JsonlEventSink, events_file
+from .events import EVENTS_FILE, JsonlEventSink, events_file
 from .llm.doctor import probe_llm
 from .llm.profiles import PROFILE_NAMES, third_party_warning
 from .llm.resume import run_resume
+from .reconfigure import run_tools_resume
 from .recovery import recover_report
 from .runner import analyze
 from .serve import DEFAULT_PORT, serve
+from .status import EXIT_COMPLETE, EXIT_PARTIAL
 from .tools import LLM_PRODUCERS, TOOL_NAMES
 from .validate import run_assess
 
@@ -69,6 +71,11 @@ def parser() -> argparse.ArgumentParser:
     live.add_argument("--analyze", type=Path, metavar="SOURCE", help="run the analysis in this process, with cancel support")
     live.add_argument("--port", type=int, default=DEFAULT_PORT)
     _add_analyze_arguments(live)
+    resume_tools = commands.add_parser("tools-resume", help="continue a finished run's build-context loop: diagnose, patch, re-run the failed Splint/Cppcheck units, re-derive the review")
+    resume_tools.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    resume_tools.add_argument("--tool", choices=("splint", "cppcheck"), help="only this tool (default: every reconfigurable tool in the run)")
+    resume_tools.add_argument("--build-assist", choices=("propose", "auto"), help="override the run's build.assist for this resume")
+    resume_tools.add_argument("--build-assist-yes", action="store_true", help="apply the proposed patch without asking")
     assess = commands.add_parser("assess", help="validate the correlated candidates of a finished run with the LLM validator")
     assess.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     assess.add_argument("--config", type=Path)
@@ -193,6 +200,23 @@ def main(argv: list[str] | None = None) -> int:
                                progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
             print(report_directory)
             return int(block["exit_code"])
+        if args.command == "tools-resume":
+            if args.build_assist_yes:
+                decider = auto_yes
+            elif _has_tty():
+                decider = stdin_decider(sys.stdin, sys.stderr)
+            else:
+                decider = auto_no
+            report_dir = args.report_directory.expanduser().resolve()
+            with JsonlEventSink(report_dir / EVENTS_FILE, append=True) as sink:
+                block = run_tools_resume(
+                    report_dir, tool=args.tool, assist=args.build_assist, decider=decider,
+                    progress=lambda message: print(f"[code-analyzer] {message}", file=sys.stderr, flush=True),
+                    event_sink=sink,
+                )
+            print(report_dir)
+            print(f"[code-analyzer] build-context {block.get('outcome')}: {block.get('reason') or 'see manifest.json build_context'}", file=sys.stderr)
+            return EXIT_COMPLETE if block.get("outcome") in {"applied", "skipped"} else EXIT_PARTIAL
         if args.command == "assess":
             report_directory = args.report_directory.expanduser().resolve()
             config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))

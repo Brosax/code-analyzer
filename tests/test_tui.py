@@ -420,3 +420,33 @@ def test_a_pending_patch_opens_the_dialog_and_the_choice_reaches_the_runner(tmp_
             assert not app.control.pending()
 
     asyncio.run(exercise())
+
+
+def test_r_opens_the_retry_dialog_while_the_llm_lane_runs_and_asks_the_control(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        app.config["llm"]["enabled"] = True
+        app.config["llm"]["scanners"] = ["llm-security"]
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(app, AnalysisEvent("llm", "started", "llm starting"))
+            _feed(app, AnalysisEvent("unit", "started", "scanning", tool="llm-security", unit="a.c:f", data={"index": 1, "total": 3, "path": "a.c"}))
+            _feed(app, AnalysisEvent("unit", "failed", "failed; provider TRANSPORT", tool="llm-security", unit="a.c:f", data={"index": 1, "total": 3, "failure_class": "transport"}))
+            _feed(app, AnalysisEvent("unit", "started", "scanning", tool="llm-security", unit="b.c:g", data={"index": 2, "total": 3, "path": "b.c"}))
+            _feed(app, AnalysisEvent("unit", "failed", "failed; scanner produced no parsable report", tool="llm-security", unit="b.c:g", data={"index": 2, "total": 3, "failure_class": "parse"}))
+            assert app.flow is not None and app.flow.retryable_units(transport_only=True) == ["a.c:f"]
+            await pilot.press("r")
+            await pilot.pause()
+            await pilot.click("#retry")
+            await pilot.pause()
+            assert app.control is not None and app.control.drain_retries("llm") == ["a.c:f"]
+            # Untick the filter: every unit that never got an answer.
+            await pilot.press("r")
+            await pilot.pause()
+            await pilot.click("#transport-only")
+            await pilot.click("#retry")
+            await pilot.pause()
+            assert app.control.drain_retries("llm") is None
+
+    asyncio.run(exercise())
