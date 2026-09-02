@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from helpers import executable
 
 from code_analyzer.analysis import AnalysisEvent, AnalysisRequest, run_analysis
@@ -90,8 +91,20 @@ def test_the_formatter_never_raises() -> None:
     weird = AnalysisEvent("unit", "failed", "x", tool="t", unit="u", timestamp=float("nan"), data={1: object(), "deep": {"a": {"b": {"c": {"d": 1}}}}, "many": {f"k{i}": i for i in range(40)}})
     line = format_line(weird)
     assert line.startswith("1970-01-01T00:00:00.000Z  ERROR  unit") and len(line) < 1500
+    # A timestamp that is not a number is not a reason to lose the line.
     broken = AnalysisEvent("unit", "failed", "x", timestamp="soon")  # type: ignore[arg-type]
-    assert "unformattable" in format_line(broken)
+    assert format_line(broken).startswith("1970-01-01T00:00:00.000Z  ERROR  unit")
+
+
+def test_a_formatter_bug_becomes_a_line_not_an_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    from code_analyzer import runlog
+
+    def boom(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("formatter bug")
+
+    monkeypatch.setattr(runlog, "_format_line", boom)
+    line = format_line(_event("unit", "failed", "x", tool="t", unit="u"))
+    assert "unformattable" in line and "RuntimeError: formatter bug" in line
 
 
 def test_the_verdict_survives_any_level(tmp_path: Path) -> None:
