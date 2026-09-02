@@ -51,12 +51,28 @@ from .config import (
     set_config_value,
     validate_config,
 )
+from .control import RunControl
 from .errors import UserError
 from .flow import WIDE_BREAKPOINT, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
 from .progress import animation_disabled_by_env, single_line
-from .runlog import format_line
+from .runlog import LEVELS, format_line, level_of
 from .tools import TOOL_NAMES
+
+# Actions that only mean something while a scan runs; check_action keeps
+# their keys free for the form otherwise.
+RUN_ONLY_ACTIONS = frozenset({
+    "cycle_pane", "cycle_filter", "toggle_pause_llm", "toggle_pause_static", "skip_selected",
+    "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail",
+})
+PANES = ("log", "llm", "problems")
+PANE_LABELS = {"log": "日志", "llm": "LLM 明细", "problems": "问题"}
+LOG_FILTERS = ("all", "warn", "error", "selected")
+FILTER_LABELS = {"all": "全部", "warn": "警告+", "error": "仅错误", "selected": "仅所选"}
+# How many queued events one 5 Hz tick folds at most; liveness events
+# (heartbeat, step, output) are dropped first when the queue overflows.
+DRAIN_PER_TICK = 5000
+LIVENESS_QUEUE = 5000
 
 TUI_FIELDS = (
     "run.output_root",
@@ -181,6 +197,16 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("escape", "escape", "返回", priority=True),
         Binding("f1", "grading_info", "分级说明"),
         Binding("f2", "toggle_flow", "流程图"),
+        Binding("f3", "cycle_pane", "面板"),
+        Binding("f4", "cycle_filter", "过滤"),
+        Binding("p", "toggle_pause_llm", "暂停LLM", show=False),
+        Binding("P", "toggle_pause_static", "暂停静态", show=False),
+        Binding("s", "skip_selected", "跳过", show=False),
+        Binding("plus", "jobs_up", "并发+", show=False),
+        Binding("minus", "jobs_down", "并发-", show=False),
+        Binding("up", "cursor_up", "上一节点", show=False),
+        Binding("down", "cursor_down", "下一节点", show=False),
+        Binding("enter", "node_detail", "节点详情", show=False),
     ]
     CSS = """
     Screen { background: $surface; }
@@ -214,10 +240,20 @@ class AnalyzerApp(App[TuiOutcome]):
     #run-body { height: 1fr; layout: vertical; }
     #run-flow { height: auto; border: round $accent; background: $surface-darken-1;
                 padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #run-side { height: 1fr; layout: vertical; }
     #run-log { height: 1fr; border: round $primary; background: $surface-darken-1; }
+    #run-llm { display: none; height: auto; max-height: 10; border: round $accent; background: $surface-darken-1;
+               padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #run-problems { display: none; height: 1fr; border: round $warning; background: $surface-darken-1; }
+    .pane-llm #run-llm { display: block; }
+    .pane-llm #run-log { display: none; }
+    .pane-problems #run-problems { display: block; }
+    .pane-problems #run-log { display: none; }
     .wide #run-body { layout: horizontal; }
     .wide #run-flow { width: 58; height: 1fr; margin-right: 1; }
-    .wide #run-log { width: 1fr; }
+    .wide #run-side { width: 1fr; }
+    .wide.llm-lane #run-llm { display: block; }
+    .wide.pane-llm #run-log { display: block; }
     .flow-hidden #run-flow { display: none; }
     #run-stop-hint { height: 1; color: $warning; }
     #result { display: none; height: 1fr; padding: 1 2; }
@@ -270,6 +306,16 @@ class AnalyzerApp(App[TuiOutcome]):
         self._flow_capacity = 7
         # The CLI honours these switches and the TUI used to ignore them.
         self._flow_animated = not animation_disabled_by_env()
+        # The operator's hand on the run, and the queues the worker fills:
+        # state events are never dropped, liveness events may be.
+        self.control: RunControl | None = None
+        self._pending_events: deque[AnalysisEvent] = deque()
+        self._liveness_events: deque[AnalysisEvent] = deque(maxlen=LIVENESS_QUEUE)
+        self._events_lock = threading.Lock()
+        self._cursor: str | None = None
+        self._pane = "log"
+        self._log_filter = "all"
+        self._problems_snapshot = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -308,7 +354,10 @@ class AnalyzerApp(App[TuiOutcome]):
             yield ProgressBar(total=100, id="run-progress")
             with Vertical(id="run-body"):
                 yield Static("", id="run-flow")
-                yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
+                with Vertical(id="run-side"):
+                    yield Static("", id="run-llm")
+                    yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
+                    yield RichLog(max_lines=500, auto_scroll=False, wrap=True, markup=False, id="run-problems")
             yield Static("Ctrl+C 请求安全停止；将停止调度并回收当前进程组。", id="run-stop-hint")
         with Vertical(id="result"):
             yield Static("", id="result-status")
@@ -393,6 +442,111 @@ class AnalyzerApp(App[TuiOutcome]):
         """Give the log its rows back on a small terminal."""
         self.toggle_class("flow-hidden")
         self._flow_dirty = True
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in RUN_ONLY_ACTIONS:
+            return self.running
+        return True
+
+    # --- the operator's hand ------------------------------------------------
+
+    def action_cycle_pane(self) -> None:
+        order = [name for name in PANES if name != "llm" or (self.flow is not None and self.flow.llm_enabled)]
+        index = order.index(self._pane) if self._pane in order else 0
+        self._set_pane(order[(index + 1) % len(order)])
+
+    def _set_pane(self, pane: str) -> None:
+        self._pane = pane
+        running = self.query_one("#running")
+        for name in PANES:
+            running.set_class(name == pane, f"pane-{name}")
+        self._flow_dirty = True
+        self._repaint_flow()
+
+    def action_cycle_filter(self) -> None:
+        index = LOG_FILTERS.index(self._log_filter)
+        self._log_filter = LOG_FILTERS[(index + 1) % len(LOG_FILTERS)]
+        self.query_one("#run-log", RichLog).border_title = f"实时日志 · {FILTER_LABELS[self._log_filter]}"
+        self._flow_dirty = True
+
+    def action_toggle_pause_llm(self) -> None:
+        if self.control is not None:
+            self.control.toggle_pause("llm", "tui")
+            self._flow_dirty = True
+
+    def action_toggle_pause_static(self) -> None:
+        if self.control is not None:
+            self.control.toggle_pause("static", "tui")
+            self._flow_dirty = True
+
+    def action_jobs_up(self) -> None:
+        if self.control is not None:
+            self.control.set_jobs("llm", self.control.jobs("llm") + 1, "tui")
+            self._flow_dirty = True
+
+    def action_jobs_down(self) -> None:
+        if self.control is not None:
+            self.control.set_jobs("llm", self.control.jobs("llm") - 1, "tui")
+            self._flow_dirty = True
+
+    def _selected_node(self) -> str | None:
+        if self.flow is None:
+            return None
+        ids = self.flow.producer_ids()
+        if not ids:
+            return None
+        if self._cursor in ids:
+            return self._cursor
+        running = [node.id for node in self.flow.nodes.values() if node.kind in {"static", "llm"} and node.state == "running"]
+        return running[0] if running else ids[0]
+
+    def _move_cursor(self, step: int) -> None:
+        if self.flow is None:
+            return
+        ids = self.flow.producer_ids()
+        if not ids:
+            return
+        current = self._selected_node()
+        index = ids.index(current) if current in ids else 0
+        self._cursor = ids[(index + step) % len(ids)]
+        self._flow_dirty = True
+        self._repaint_flow()
+
+    def action_cursor_up(self) -> None:
+        self._move_cursor(-1)
+
+    def action_cursor_down(self) -> None:
+        self._move_cursor(1)
+
+    def action_node_detail(self) -> None:
+        node_id = self._selected_node()
+        if self.flow is None or node_id is None:
+            return
+        lines = self.flow.node_detail(node_id, time.time())
+        self.push_screen(InfoScreen(f"节点详情 · {node_id}", "\n".join(lines)))
+
+    def action_skip_selected(self) -> None:
+        node_id = self._selected_node()
+        if self.control is None or node_id is None or self.flow is None:
+            return
+        node = self.flow.nodes[node_id]
+        if node.state not in {"pending", "running"}:
+            self.query_one("#run-stop-hint", Static).update(f"{node_id} 已结束，无需跳过")
+            return
+        remaining = "" if node.total is None else f"（约 {max(0, node.total - node.done)} 个单元）"
+        self.push_screen(
+            ConfirmScreen(
+                f"跳过 {node_id}？",
+                f"将把 {node_id} 尚未开始的单元{remaining}标记为 unscheduled（skipped by operator）；已有证据保留，正在运行的单元会完成。",
+                yes="跳过",
+            ),
+            lambda confirmed, name=node_id: self._skip_confirmed(confirmed, name),
+        )
+
+    def _skip_confirmed(self, confirmed: bool, name: str) -> None:
+        if confirmed and self.control is not None:
+            self.control.skip(name, "tui")
+            self._flow_dirty = True
 
     def action_grading_info(self) -> None:
         self.push_screen(InfoScreen("评分分级说明", GRADING_NOTE))
@@ -628,17 +782,18 @@ class AnalyzerApp(App[TuiOutcome]):
         source, config = self._pending_run
         self.last_request = AnalysisRequest(source, config)
         self.cancel_token = CancellationToken()
+        self.control = RunControl(self.cancel_token, llm_jobs=int(config["llm"].get("jobs") or 1))
         self.running = True
         self._reset_run_display()
         self.add_class("running")
         self._set_controls_disabled(True)
         self.query_one("#run-progress", ProgressBar).update(progress=1)
-        self._analysis_worker(self.last_request, self.cancel_token)
+        self._analysis_worker(self.last_request, self.cancel_token, self.control)
 
     @work(thread=True, exclusive=True, group="analysis")
-    def _analysis_worker(self, request: AnalysisRequest, token: CancellationToken) -> None:
+    def _analysis_worker(self, request: AnalysisRequest, token: CancellationToken, control: RunControl) -> None:
         try:
-            result = run_analysis(request, events=self._event_from_worker, cancellation=token)
+            result = run_analysis(request, events=self._event_from_worker, cancellation=token, control=control)
         except Exception as exc:
             self.call_from_thread(self._analysis_failed, str(exc))
         else:
@@ -658,9 +813,33 @@ class AnalyzerApp(App[TuiOutcome]):
         self.push_screen(InfoScreen("扫描失败", message))
 
     def _event_from_worker(self, event: AnalysisEvent) -> None:
+        """Called on the worker thread -- and, for control events, on the app thread.
+
+        Nothing here crosses threads: the event is queued under a lock and the
+        5 Hz ticker folds it.  A real run used to make one ``call_from_thread``
+        per event (520 000 in an hour), and a control event raised from the
+        app thread would have been refused outright.
+        """
         self._queue_log_event(event)
-        if event.phase != "output":
-            self.call_from_thread(self._analysis_event, event)
+        if event.phase == "output":
+            return
+        with self._events_lock:
+            if event.status in {"heartbeat", "step", "info"}:
+                self._liveness_events.append(event)
+            else:
+                self._pending_events.append(event)
+
+    def _drain_events(self) -> int:
+        """Fold the queued events; returns how many were folded."""
+        with self._events_lock:
+            batch = []
+            while self._pending_events and len(batch) < DRAIN_PER_TICK:
+                batch.append(self._pending_events.popleft())
+            while self._liveness_events and len(batch) < DRAIN_PER_TICK:
+                batch.append(self._liveness_events.popleft())
+        for event in batch:
+            self._analysis_event(event)
+        return len(batch)
 
     def _analysis_event(self, event: AnalysisEvent) -> None:
         # Repainting here would redraw once per event; during the LLM phase
@@ -673,6 +852,8 @@ class AnalyzerApp(App[TuiOutcome]):
     def _tick_flow(self) -> None:
         if not self.running or not self.is_mounted:
             return
+        if self._drain_events():
+            self._flow_dirty = True
         if self._flow_animated:
             self._flow_frame += 1
         elif not self._flow_dirty:
@@ -701,9 +882,70 @@ class AnalyzerApp(App[TuiOutcome]):
         heading.update(headline.title)
         details.update(headline.detail)
         frame = self._flow_frame if self._flow_animated else -1
-        rows = self.flow.rows(capacity=self._flow_capacity, now=now, frame=frame)
+        rows = self.flow.rows(capacity=self._flow_capacity, now=now, frame=frame, selected=self._selected_node())
         panel.border_title = f"扫描流程 · {self.flow.run_name}" if self.flow.run_name else "扫描流程"
         panel.update(self._flow_text(rows))
+        self._repaint_side()
+
+    def _repaint_side(self) -> None:
+        """The control bar, the LLM panel and the problems pane."""
+        if self.flow is None:
+            return
+        try:
+            bar = self.query_one("#run-stop-hint", Static)
+            llm_panel = self.query_one("#run-llm", Static)
+            problems = self.query_one("#run-problems", RichLog)
+        except NoMatches:
+            return
+        bar.update(self._control_bar_text())
+        if self.flow.llm_enabled:
+            llm_panel.border_title = "LLM 扫描"
+            llm_panel.update(self._llm_text())
+        snapshot = "\n".join(
+            f"{'✕' if item.level == 'error' else '◐'} {item.tool:<24} {item.reason} ×{item.count}"
+            for item in self.flow.problems()
+        )
+        if snapshot != self._problems_snapshot:
+            self._problems_snapshot = snapshot
+            problems.border_title = "问题"
+            problems.clear()
+            for line in snapshot.splitlines() or ["（暂无失败原因）"]:
+                problems.write(line)
+
+    def _control_bar_text(self) -> str:
+        if self.flow is None:
+            return ""
+        if self.flow.stopping:
+            return "已请求安全停止；正在等待当前进程终止并回收，请勿强制退出。"
+        parts = []
+        if self.flow.llm_enabled:
+            parts.append(("LLM ⏸" if self.flow.paused["llm"] else "LLM ▶") + f" 并发 {self.flow.llm_jobs}")
+        parts.append("静态 ⏸" if self.flow.paused["static"] else "静态 ▶")
+        if self.flow.pending_decisions:
+            parts.append(f"待决策 {len(self.flow.pending_decisions)}")
+        keys = "p/P 暂停 · s 跳过 · +/- 并发 · ↑↓⏎ 详情 · F3 面板 · F4 过滤 · Ctrl+C 停止"
+        return " · ".join(parts) + " · " + keys
+
+    def _llm_text(self) -> Text:
+        """The per-scanner panel, built segment by segment like the flow."""
+        text = Text(no_wrap=True, overflow="ellipsis")
+        text.append(self.flow.llm_summary() if self.flow else "", style="dim")
+        for row in (self.flow.llm_rows() if self.flow else []):
+            text.append("\n")
+            glyph = {"success": "✓", "partial": "◐", "failed": "✕", "running": "⏸" if row.paused else "●", "pending": "○"}[row.state]
+            text.append(glyph + " ", style=_STATE_STYLES[row.state])
+            text.append(f"{row.producer:<26} {row.counted:<12}")
+            extras = []
+            if row.failures:
+                extras.append(f"{row.failures} 失败")
+            if row.unscheduled:
+                extras.append(f"{row.unscheduled} 未调度")
+            if row.findings is not None:
+                extras.append(f"{row.findings} findings")
+            if row.step:
+                extras.append(row.step)
+            text.append(" " + " · ".join(extras), style="dim")
+        return text
 
     def _flow_text(self, rows: list[Any]) -> Text:
         """Built segment by segment, never from markup.
@@ -715,10 +957,11 @@ class AnalyzerApp(App[TuiOutcome]):
         for index, row in enumerate(rows):
             if index:
                 text.append("\n")
+            marker = "▶" if row.selected else " "
             if row.spine:
-                text.append(row.spine + " ", style=_SPINE_STYLES[row.pulse % len(_SPINE_STYLES)])
+                text.append(row.spine + marker, style=_SPINE_STYLES[row.pulse % len(_SPINE_STYLES)])
             else:
-                text.append("  ")
+                text.append(" " + marker)
             if row.glyph:
                 text.append(row.glyph + " ", style=_STATE_STYLES[row.state])
             text.append(row.label.ljust(_LABEL_WIDTH) if row.detail else row.label)
@@ -726,7 +969,19 @@ class AnalyzerApp(App[TuiOutcome]):
                 text.append(" " + row.detail, style="dim")
         return text
 
+    def _log_wanted(self, event: AnalysisEvent) -> bool:
+        """The F4 filter, applied when a line is queued, not when it is drawn."""
+        if self._log_filter == "all":
+            return True
+        if self._log_filter == "selected":
+            selected = self._selected_node()
+            return selected is not None and event.tool == selected
+        level = LEVELS.index(level_of(event))
+        return level >= LEVELS.index("warning" if self._log_filter == "warn" else "error")
+
     def _queue_log_event(self, event: AnalysisEvent) -> None:
+        if not self._log_wanted(event):
+            return
         line = self._format_log_event(event)
         with self._log_lock:
             if len(self._pending_log_lines) >= 2000:
@@ -767,14 +1022,29 @@ class AnalyzerApp(App[TuiOutcome]):
         with self._log_lock:
             self._pending_log_lines.clear()
             self._log_overflowed = False
+        with self._events_lock:
+            self._pending_events.clear()
+            self._liveness_events.clear()
         self.query_one("#run-log", RichLog).clear()
+        self.query_one("#run-problems", RichLog).clear()
+        self._problems_snapshot = ""
         self._run_started_at = time.monotonic()
         self.flow = RunFlow(self.config, preflight=self._last_preflight)
+        if self.control is None:
+            self.control = RunControl(self.cancel_token or CancellationToken(), llm_jobs=int(self.config["llm"].get("jobs") or 1))
+        self._cursor = None
+        self._log_filter = "all"
+        self.query_one("#run-log", RichLog).border_title = "实时日志 · 全部"
+        self.set_class(self.flow.llm_enabled, "llm-lane")
+        self._set_pane("log")
+        # No widget holds the focus during a run, so the arrow keys and Enter
+        # reach the app's own bindings instead of scrolling a form.
+        self.screen.set_focus(None)
         self._flow_frame = 0
         self._flow_dirty = True
         self.query_one("#run-heading", Static).update("正在启动扫描…")
         self.query_one("#run-details", Static).update("0% · 已运行 00:00")
-        self.query_one("#run-stop-hint", Static).update("Ctrl+C 请求安全停止 · F2 隐藏流程图")
+        self.query_one("#run-stop-hint", Static).update(self._control_bar_text())
         self._repaint_flow()
 
     def _elapsed_text(self) -> str:
@@ -796,6 +1066,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._repaint_flow()
 
     def _analysis_done(self, result: AnalysisResult) -> None:
+        self._drain_events()
         self._flush_log_queue()
         # The ticker stops with the run, so paint the terminal states once more
         # before it does; otherwise the panel keeps its second-to-last frame.
@@ -823,10 +1094,14 @@ class AnalyzerApp(App[TuiOutcome]):
             marker = {
                 "completed": "tool-ok",
                 "not_applicable": "tool-skip",
+                "skipped": "tool-skip",
                 "partial": "tool-warn",
                 "timed_out": "tool-warn",
             }.get(tool_status, "tool-fail")
-            rows.append(Static(f"{name:<12} {tool_status}", classes=f"tool-row {marker}"))
+            rows.append(Static(_result_line(name, value), classes=f"tool-row {marker}"))
+        llm = manifest.get("llm") or {}
+        if llm.get("requested"):
+            rows.append(Static(_result_line("llm", llm), classes="tool-row " + {"completed": "tool-ok", "partial": "tool-warn"}.get(str(llm.get("status")), "tool-fail")))
         tools_box.mount_all(rows or [Static("—", classes="tool-skip")])
         self.add_class("completed")
 
@@ -842,12 +1117,16 @@ class AnalyzerApp(App[TuiOutcome]):
 
     def _cancel_confirmed(self, confirmed: bool) -> None:
         if confirmed and self.cancel_token:
-            self.cancel_token.cancel()
+            # Through the control so the stop is journalled like every other
+            # operator action; the token it wraps is the same one.
+            if self.control is not None:
+                self.control.cancel("tui")
+            else:
+                self.cancel_token.cancel()
             if self.flow is not None:
                 self.flow.mark_stopping()
             self.query_one("#run-heading", Static).update("正在安全停止…")
             self.query_one("#run-stop-hint", Static).update("已请求安全停止；正在等待当前进程终止并回收，请勿强制退出。")
-            self._queue_log_event(AnalysisEvent("analysis", "stopping", "已请求安全停止；正在终止并回收当前进程"))
 
     def _exit_with_last(self) -> None:
         if self.last_result:
@@ -857,6 +1136,25 @@ class AnalyzerApp(App[TuiOutcome]):
 
 def _widget_id(path: str) -> str:
     return "field-" + path.replace(".", "-").replace("_", "-")
+
+
+def _result_line(name: str, record: dict[str, Any]) -> str:
+    """One producer on the result screen: status, then why, then what it analysed."""
+    parts = [f"{name:<12} {record.get('status', '—')}"]
+    reason = record.get("reason")
+    if reason:
+        parts.append(single_line(str(reason))[:120])
+    counts = record.get("unit_counts") or {}
+    coverage = record.get("coverage") or {}
+    if counts.get("planned"):
+        parts.append(f"单元 {counts.get('completed', 0)}/{counts['planned']}")
+        if counts.get("failed"):
+            parts.append(f"{counts['failed']} 失败")
+        if counts.get("unscheduled"):
+            parts.append(f"{counts['unscheduled']} 未调度")
+    if coverage.get("analysis_reached") is not None and coverage.get("effective_total"):
+        parts.append(f"实际分析 {coverage['analysis_reached']}/{coverage['effective_total']}")
+    return " · ".join(parts)
 
 
 def run_tui(source: Path, explicit_config: Path | None = None) -> TuiOutcome:

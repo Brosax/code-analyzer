@@ -83,6 +83,11 @@ DEFAULTS: dict[str, Any] = {
         "scanners": list(LLM_PRODUCERS),
         "temperature": 0.0,
         "seed": 0,
+        # How much the model may think before it answers.  "off" is what an
+        # Ollama-served Qwen needs (it rejects any other spelling); a model that
+        # always thinks (GLM-5.x) rejects "off" and wants low/high/max, and its
+        # thinking counts against max_completion_tokens.
+        "reasoning": "off",
         "max_completion_tokens": 2000,
         "max_steps": 4,
         "max_turns": 8,
@@ -147,6 +152,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 LOG_LEVELS: tuple[str, ...] = ("debug", "info", "warning")
+REASONING_LEVELS: tuple[str, ...] = ("off", "low", "medium", "high", "max")
 ASSIST_MODES: tuple[str, ...] = ("off", "propose", "auto")
 SPLINT_MODES: tuple[str, ...] = ("strict", "checks", "standard", "weak")
 OVERRIDE_KEYS: tuple[str, ...] = ("match", "include", "system_include", "define", "undefine")
@@ -209,6 +215,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.scanners", "list", "启用的 Scanner", "LLM 专家 scanner 名称列表。", advanced=True),
     FieldSpec("llm.temperature", "float", "采样温度", "0 表示尽可能确定的输出。", minimum=0.0, advanced=True),
     FieldSpec("llm.seed", "int", "随机种子", "端点支持时用于复现采样。", minimum=0, advanced=True),
+    FieldSpec("llm.reasoning", "choice", "推理强度", "模型作答前的思考量：off 关闭（Ollama/Qwen 需要）；始终思考的模型（GLM-5.x）用 low/high/max，思考 token 计入生成上限。", choices=REASONING_LEVELS, advanced=True),
     FieldSpec("llm.max_completion_tokens", "int", "单次生成上限", "单个单元的最大生成 token 数。", minimum=1, advanced=True),
     FieldSpec("llm.max_steps", "int", "Agent 步数上限", "单个单元内 agent 的最大步数。", minimum=1, advanced=True),
     FieldSpec("llm.max_turns", "int", "模型往返上限", "单个单元内的最大模型往返次数。", minimum=1, advanced=True),
@@ -544,6 +551,9 @@ def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
     parse_overrides(llm["risk_overrides"])
     if llm["risk_profile"] not in RISK_PROFILES:
         raise UserError("llm.risk_profile must be " + ", ".join(RISK_PROFILES))
+    _expect(llm["reasoning"], str, "llm.reasoning")
+    if llm["reasoning"] not in REASONING_LEVELS:
+        raise UserError("llm.reasoning must be " + ", ".join(REASONING_LEVELS))
     if llm["min_tier"] not in RISK_TIERS:
         raise UserError("llm.min_tier must be " + ", ".join(RISK_TIERS))
     for key in (

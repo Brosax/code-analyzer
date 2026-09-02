@@ -26,6 +26,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, ContextManager
 
+from ..control import (
+    CANCELLED,
+    LLM_JOBS_CEILING,
+    RUN,
+    SKIP_PRODUCER,
+    SKIP_UNIT,
+    AdjustableSemaphore,
+)
 from ..errors import UserError
 from ..harness.cordis import cordis_document, tool_allowlist, write_cordis_config
 from ..harness.runtime import (
@@ -80,6 +88,7 @@ def run(
     output_event: Callable[[str, str, str, str], None] | None = None,
     open_runtime: OpenRuntime | None = None,
     phase_event: Callable[..., None] | None = None,
+    control: Any = None,
 ) -> dict[str, Any]:
     """Run every selected scanner over every planned unit.
 
@@ -153,6 +162,7 @@ def run(
             cancelled=cancelled,
             open_runtime=open_runtime,
             phase_event=phase_event,
+            control=control,
         )
         records, rounds = _rounds(state, plan, units, scanners, config, progress, phase_event)
 
@@ -551,9 +561,11 @@ class _Phase:
         cancelled: Callable[[], bool] | None,
         open_runtime: OpenRuntime | None,
         phase_event: Callable[..., None] | None = None,
+        control: Any = None,
     ) -> None:
         self.source = source
         self.phase_event = phase_event
+        self.control = control
         self.run_dir = run_dir
         self.settings = settings
         self.grace = grace
@@ -568,6 +580,9 @@ class _Phase:
         self.cancelled = cancelled
         self.open_runtime = open_runtime or self._runtime
         self.jobs = max(1, int(settings["jobs"]))
+        # The gate the operator adjusts live; the pool is sized to the ceiling
+        # so a "+" can add a worker, and the gate decides how many run.
+        self.gate = control.semaphore("llm") if control is not None else AdjustableSemaphore(self.jobs)
         self.heartbeat_seconds = float(settings["heartbeat_seconds"])
         self.deadline = time.monotonic() + float(settings["total_timeout_seconds"])
         self.prompt_budget = int(settings["total_prompt_tokens"])
@@ -605,7 +620,7 @@ class _Phase:
     def execute_all(self, tasks: list[Task]) -> list[dict[str, Any]]:
         self.total = len(tasks)
         completed: dict[int, dict[str, Any]] = {}
-        jobs = min(self.jobs, max(1, len(tasks)))
+        jobs = min(LLM_JOBS_CEILING if self.control is not None else self.jobs, max(1, len(tasks)))
         if jobs == 1 or len(tasks) <= 1:
             for task in tasks:
                 if self.is_cancelled():
@@ -647,6 +662,27 @@ class _Phase:
         return records
 
     def execute(self, task: Task) -> dict[str, Any]:
+        index, producer, unit = task
+        unit_id = unit["unit_id"]
+        if self.is_cancelled():
+            return self._report(task, self._unstarted(task, "interrupted", "run interrupted"))
+        action = self.control.checkpoint("llm", producer, unit_id) if self.control is not None else RUN
+        if action == CANCELLED:
+            return self._report(task, self._unstarted(task, "interrupted", "run interrupted"))
+        if action in {SKIP_PRODUCER, SKIP_UNIT}:
+            return self._report(task, self._unstarted(task, "unscheduled", "skipped by operator"))
+        # Everything from here runs under the concurrency gate: the pool is
+        # sized to the ceiling so the operator can add workers, and the gate
+        # is what makes "jobs" true -- including for the budget, the deadline
+        # and the breaker, which must be judged one unit at a time.
+        if not self.gate.acquire(self.is_cancelled):
+            return self._report(task, self._unstarted(task, "interrupted", "run interrupted"))
+        try:
+            return self._execute_gated(task)
+        finally:
+            self.gate.release()
+
+    def _execute_gated(self, task: Task) -> dict[str, Any]:
         index, producer, unit = task
         unit_id = unit["unit_id"]
         if self.is_cancelled():

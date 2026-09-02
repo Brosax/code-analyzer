@@ -125,7 +125,10 @@ def fan_out(*sinks: EventSink | None) -> EventSink:
     this one is about the sequence the sinks agree on.
     """
     targets = [sink for sink in sinks if sink is not None]
-    lock = threading.Lock()
+    # Reentrant on purpose: a sink that reacts to an event by acting on the run
+    # (a pause taken inside an event callback) journals that action as another
+    # event on the same thread, and a plain lock would deadlock it.
+    lock = threading.RLock()
 
     def deliver(event: AnalysisEvent) -> None:
         with lock:

@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
+from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
@@ -28,6 +29,7 @@ def run(
     unit_event: Callable[[str, str, str, float | None], None] | None = None,
     output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
+    control: Any = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
     unit_event = unit_event or (lambda *_args, **_kwargs: None)
@@ -48,7 +50,11 @@ def run(
     for index, (name, pass_args, files) in enumerate(passes, 1):
         evidence_context = "build-aware" if name == "compile-db" else "source-only"
         facts = {"index": index, "total": len(passes), "label": name, "files": len(files)}
-        if cancelled is not None and cancelled():
+        action = control.checkpoint("static", "cppcheck", name) if control is not None else RUN
+        if action in {SKIP_PRODUCER, SKIP_UNIT}:
+            units.append({"id": name, "status": "unscheduled", "input_files": files, "valid_report": False, "reason": "skipped by operator", "evidence_context": evidence_context, "artifacts": []})
+            continue
+        if (cancelled is not None and cancelled()) or action == CANCELLED:
             units.append({"id": name, "status": "interrupted", "input_files": files, "valid_report": False, "reason": "run interrupted", "evidence_context": evidence_context, "artifacts": []})
             for later_name, _, later_files in passes[index:]:
                 units.append({"id": later_name, "status": "interrupted", "input_files": later_files, "valid_report": False, "reason": "run interrupted", "evidence_context": "build-aware" if later_name == "compile-db" else "source-only", "artifacts": []})
@@ -233,7 +239,7 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries,
         ctx.compile_db.covered_set, ctx.config, ctx.progress,
         cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
-        output_budget=ctx.output_budget,
+        output_budget=ctx.output_budget, control=ctx.control,
     )
 
 

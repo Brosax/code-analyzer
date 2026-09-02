@@ -429,6 +429,14 @@ def endpoint_context_length(settings: dict[str, Any], *, timeout: float = 5.0) -
     return None
 
 
+# Bound read-only into the sandbox when present: DNS, hosts, the resolver
+# order and the CA certificates.  Nothing else under /etc is exposed.
+NAME_SERVICE_FILES: tuple[Path, ...] = (
+    Path("/etc/resolv.conf"), Path("/etc/hosts"), Path("/etc/nsswitch.conf"), Path("/etc/gai.conf"),
+    Path("/etc/ssl"), Path("/etc/ca-certificates"), Path("/etc/pki"),
+)
+
+
 def _runtime_binary() -> Path:
     """The bundled runtime binary, resolved exactly as the SDK resolves it."""
     try:
@@ -588,6 +596,12 @@ class HarnessRuntime:
         assert self.session_root is not None and self.cordis_path is not None
         self.session_root.mkdir(parents=True, exist_ok=True)
         read_only = [str(self.cwd), str(binary.parent), str(self.cordis_path.parent), *skill_dirs]
+        # The name service and the certificate store: without them the
+        # confined runtime cannot resolve a hostname or trust a TLS peer, so
+        # every request to a remote endpoint fails as TRANSPORT even though the
+        # runner's own probe, outside the sandbox, succeeded.  A loopback
+        # endpoint never noticed.
+        read_only.extend(str(path) for path in NAME_SERVICE_FILES if path.exists())
         lines = [
             "#!/bin/sh",
             "# Generated per run: confines the scanner runtime to the scanned tree (design 11.4).",

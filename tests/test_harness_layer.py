@@ -762,7 +762,7 @@ def test_the_tree_is_the_verified_spine_in_boot_order(tmp_path: Path, settings) 
     # "off" carrying "none" is what Ollama's /v1 honours; the other levels are
     # declared so pi-ai does not pin them to unsupported.
     assert model["reasoningEfforts"]["off"] == "none"
-    assert set(model["reasoningEfforts"]) == {"off", "minimal", "low", "medium", "high"}
+    assert set(model["reasoningEfforts"]) == {"off", "minimal", "low", "medium", "high", "max"}
     spine = _package(document, cordis.AGENT_SPINE_PACKAGE)["config"]
     # Verified to hang dsh-tool-skill; the explicit catalog confines discovery.
     assert "skills" not in spine and spine["workspaceContext"] is False
@@ -1005,3 +1005,28 @@ def test_a_non_finite_usage_number_is_measured_as_zero_not_raised() -> None:
 
     events = [{"data": {"chunk": {"type": "usage", "usage": {"inputTokens": float("inf"), "outputTokens": 3}}}}]
     assert measured_usage(events) == {"prompt_tokens": 0, "completion_tokens": 3, "requests": 1}
+
+
+def test_the_reasoning_effort_is_the_operators_choice(tmp_path: Path, settings) -> None:
+    """A Qwen on Ollama needs "off"; a GLM that always thinks rejects it and wants low/high/max."""
+    document = cordis.cordis_document({**settings, "reasoning": "low"}, skill_dir=tmp_path, session_root=tmp_path / "sessions")
+    route = _package(document, cordis.LLM_PACKAGE)["config"]["providers"][cordis.PROVIDER_ID]
+    assert route["reasoning"] == "low"
+    assert route["models"][0]["reasoningEfforts"]["low"] == "low" and route["models"][0]["reasoningEfforts"]["max"] == "max"
+
+
+def test_the_sandbox_can_resolve_a_hostname_and_trust_a_certificate(tmp_path: Path, settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A confined runtime without /etc/resolv.conf fails every remote request as TRANSPORT."""
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
+    monkeypatch.setattr(runtime, "_runtime_binary", lambda: tmp_path / "bin" / "dsh")
+    (tmp_path / "bin").mkdir()
+    document = cordis.cordis_document(settings, skill_dir=tmp_path / "skills", session_root=tmp_path / "sessions")
+    path = cordis.write_cordis_config(tmp_path / "llm", document)
+    confined = runtime.HarnessRuntime(settings, cwd=scanned_tree(tmp_path), cordis_path=path, session_root=tmp_path / "sessions")
+    confined.confine()
+    script = (tmp_path / "llm" / "runtime-sandbox.sh").read_text(encoding="utf-8")
+    present = [entry for entry in runtime.NAME_SERVICE_FILES if entry.exists()]
+    assert present, "this host has no name service files to test with"
+    for entry in present:
+        assert f"--ro-bind {entry} {entry}" in script
+    assert "--ro-bind /etc /etc" not in script, "only the name service and certificates are exposed, never all of /etc"

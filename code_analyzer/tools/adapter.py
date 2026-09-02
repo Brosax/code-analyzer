@@ -94,6 +94,9 @@ class RunContext:
     unit_event: UnitEvent
     output_event: UnitEvent | None = None
     output_budget: OutputBudget | None = None
+    # The operator's RunControl (checkpoint at unit boundaries); None in a
+    # direct adapter call.
+    control: Any | None = None
 
 
 @dataclass(frozen=True)

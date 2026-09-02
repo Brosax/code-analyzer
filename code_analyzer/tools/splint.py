@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..compile_db import splint_flags
+from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
@@ -120,6 +121,7 @@ def run(
     unit_event: Callable[[str, str, str, float | None], None] | None = None,
     output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
+    control: Any = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
     unit_event = unit_event or (lambda *_args, **_kwargs: None)
@@ -181,6 +183,11 @@ def run(
         if is_cancelled():
             # Announced once for the whole batch after the pool drains.
             return index, _unstarted(unit_id, relative, "interrupted", "run interrupted", evidence_context), []
+        action = control.checkpoint("static", "splint", unit_id) if control is not None else RUN
+        if action == CANCELLED:
+            return index, _unstarted(unit_id, relative, "interrupted", "run interrupted", evidence_context), []
+        if action in {SKIP_PRODUCER, SKIP_UNIT}:
+            return index, _unstarted(unit_id, relative, "unscheduled", "skipped by operator", evidence_context), []
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return index, _unstarted(unit_id, relative, "unscheduled", "total budget exhausted", evidence_context), []
@@ -529,6 +536,7 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.compile_db.entries, ctx.config, ctx.progress,
         compile_db_present=ctx.compile_db.present, cancelled=ctx.cancelled,
         unit_event=ctx.unit_event, output_event=ctx.output_event, output_budget=ctx.output_budget,
+        control=ctx.control,
     )
 
 

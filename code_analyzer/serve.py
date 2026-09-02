@@ -27,6 +27,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from .analysis import AnalysisEvent, AnalysisRequest, CancellationToken, run_analysis
+from .control import LANES, RunControl
 from .errors import UserError
 from .events import RUN_DIRECTORY_PHASE, clean_data
 from .persist import json_bytes
@@ -86,9 +87,13 @@ def _phase_state(manifest: dict[str, Any], phase: str) -> str:
 class LiveRun:
     """What the handlers read: the run directory plus, in --analyze mode, the token."""
 
-    def __init__(self, report_directory: Path | None, *, cancellation: CancellationToken | None = None) -> None:
+    def __init__(
+        self, report_directory: Path | None, *, cancellation: CancellationToken | None = None,
+        control: RunControl | None = None,
+    ) -> None:
         self.report_directory = report_directory
         self.cancellation = cancellation
+        self.control = control
         self.exit_code: int | None = None
         self.error: str | None = None
         self._lock = threading.Lock()
@@ -155,8 +160,43 @@ class LiveRun:
     def cancel(self) -> bool:
         if self.cancellation is None:
             return False
-        self.cancellation.cancel()
+        if self.control is not None:
+            self.control.cancel("serve")
+        else:
+            self.cancellation.cancel()
         return True
+
+    def apply_control(self, body: dict[str, Any]) -> tuple[bool, str]:
+        """One operator action from the page; ``(ok, reason)``."""
+        control = self.control
+        if control is None:
+            return False, "view-only"
+        action = str(body.get("action") or "")
+        lane = str(body.get("lane") or "llm")
+        if lane not in LANES:
+            return False, f"unknown lane {lane}"
+        if action == "pause":
+            control.pause(lane, "serve")
+        elif action == "resume":
+            control.resume(lane, "serve")
+        elif action == "skip":
+            name = str(body.get("name") or "")
+            if not name:
+                return False, "skip needs a producer name"
+            control.skip(name, "serve")
+        elif action == "jobs":
+            try:
+                control.set_jobs(lane, int(body.get("value")), "serve")
+            except (TypeError, ValueError):
+                return False, "jobs needs an integer value"
+        elif action == "decide":
+            answer = str(body.get("answer") or "reject")
+            selected = tuple(int(item) for item in body.get("selected") or [])
+            if not control.decide(str(body.get("id") or ""), answer, selected, "serve"):
+                return False, "no such pending decision"
+        else:
+            return False, f"unknown action {action}"
+        return True, ""
 
 
 def _event_dict(event: AnalysisEvent) -> dict[str, Any]:
@@ -189,23 +229,45 @@ def make_handler(run: LiveRun, page: str) -> type[BaseHTTPRequestHandler]:
                 self._send(HTTPStatus.OK, "application/json", json_bytes({
                     "report_directory": str(run.report_directory) if run.report_directory else None,
                     "cancellable": run.cancellation is not None, "exit_code": run.exit_code, "error": run.error,
+                    "control": run.control.state() if run.control is not None else None,
+                    "pending": [
+                        {"id": item.id, "kind": item.kind, "summary": item.summary, "items": list(item.items)}
+                        for item in (run.control.pending() if run.control is not None else [])
+                    ],
                 }))
             else:
                 self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"not found")
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != "/cancel":
+            path = urlsplit(self.path).path
+            if path not in {"/cancel", "/control"}:
                 self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"not found")
                 return
             origin = self.headers.get("Origin", "")
             host = self.headers.get("Host", "")
             if not origin or urlsplit(origin).netloc != host:
-                self._send(HTTPStatus.FORBIDDEN, "text/plain; charset=utf-8", b"cancel requires a same-origin request")
+                self._send(HTTPStatus.FORBIDDEN, "text/plain; charset=utf-8", b"control requires a same-origin request")
                 return
-            if run.cancel():
-                self._send(HTTPStatus.OK, "application/json", b'{"cancelled": true}')
-            else:
-                self._send(HTTPStatus.CONFLICT, "application/json", b'{"cancelled": false, "reason": "view-only"}')
+            if path == "/cancel":
+                if run.cancel():
+                    self._send(HTTPStatus.OK, "application/json", b'{"cancelled": true}')
+                else:
+                    self._send(HTTPStatus.CONFLICT, "application/json", b'{"cancelled": false, "reason": "view-only"}')
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except (UnicodeError, json.JSONDecodeError):
+                body = None
+            if not isinstance(body, dict):
+                self._send(HTTPStatus.BAD_REQUEST, "application/json", b'{"ok": false, "reason": "body must be a JSON object"}')
+                return
+            ok, reason = run.apply_control(body)
+            state = run.control.state() if run.control is not None else None
+            self._send(
+                HTTPStatus.OK if ok else HTTPStatus.CONFLICT, "application/json",
+                json_bytes({"ok": ok, "reason": reason or None, "control": state}),
+            )
 
         def _stream(self) -> None:
             self.send_response(HTTPStatus.OK)
@@ -256,7 +318,10 @@ def serve(
     if report_directory is None and analyze is None:
         raise UserError("serve needs a report directory or --analyze SOURCE")
     cancellation = CancellationToken() if analyze is not None else None
-    run = LiveRun(report_directory, cancellation=cancellation)
+    control = None
+    if analyze is not None:
+        control = RunControl(cancellation, llm_jobs=int(analyze[1]["llm"].get("jobs") or 1))
+    run = LiveRun(report_directory, cancellation=cancellation, control=control)
     server = ThreadingHTTPServer((BIND_HOST, port), make_handler(run, page()))
     server.daemon_threads = True
     bound_port = server.server_address[1]
@@ -270,7 +335,7 @@ def serve(
         if analyze is not None:
             source, config = analyze
             try:
-                result = run_analysis(AnalysisRequest(source, config), events=run.record, cancellation=cancellation)
+                result = run_analysis(AnalysisRequest(source, config), events=run.record, cancellation=cancellation, control=control)
             except UserError as exc:
                 run.error = str(exc)
                 run.exit_code = 2
@@ -323,6 +388,8 @@ button[disabled]{opacity:.5;cursor:default}
 <h1>code-analyzer · <span id="title">live</span> <span class="muted small" id="state"></span></h1>
 <div class="bar"><div class="track"><div class="fill" id="fill"></div></div><span id="pct">0%</span>
 <button id="cancel" disabled>取消 / Cancel</button><a id="report" hidden href="#">index.html</a></div>
+<div class="bar" id="controls" hidden><button id="pause-llm">暂停 LLM</button><button id="pause-static">暂停静态</button>
+<button id="jobs-down">并发 −</button><span id="jobs">并发 -</span><button id="jobs-up">并发 +</button><span class="muted small" id="control-state"></span></div>
 <h2>DAG</h2><div class="dag" id="dag"></div>
 <h2>Events</h2><div class="log" id="log"></div>
 <p class="muted small">此页面只读取 events.jsonl 与 manifest.json；节点状态是 manifest 的投影，不是另一份事实。</p>
@@ -348,9 +415,22 @@ button[disabled]{opacity:.5;cursor:default}
     $("state").textContent = g.run.status ? g.run.status + (g.run.exit_code !== null && g.run.exit_code !== undefined ? " · exit " + g.run.exit_code : "") : "";
     if (g.nodes.some(n => n.id === "dashboard" && n.state === "success")) { $("report").hidden = false; }
   };
+  const post = async (body) => fetch("/control", { method: "POST", headers: { "Origin": window.location.origin, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let lanes = null;
+  $("pause-llm").onclick = () => post({ action: lanes && lanes.llm.paused ? "resume" : "pause", lane: "llm" }).then(pollState);
+  $("pause-static").onclick = () => post({ action: lanes && lanes.static.paused ? "resume" : "pause", lane: "static" }).then(pollState);
+  $("jobs-up").onclick = () => post({ action: "jobs", lane: "llm", value: (lanes ? lanes.llm.jobs : 1) + 1 }).then(pollState);
+  $("jobs-down").onclick = () => post({ action: "jobs", lane: "llm", value: Math.max(1, (lanes ? lanes.llm.jobs : 1) - 1) }).then(pollState);
   const pollState = async () => {
     const r = await fetch("/state"); if (!r.ok) return; const s = await r.json();
     $("cancel").disabled = !s.cancellable || ended;
+    if (s.control && !ended) {
+      lanes = s.control.lanes; $("controls").hidden = false;
+      $("pause-llm").textContent = lanes.llm.paused ? "继续 LLM" : "暂停 LLM";
+      $("pause-static").textContent = lanes.static.paused ? "继续静态" : "暂停静态";
+      $("jobs").textContent = "并发 " + lanes.llm.jobs;
+      $("control-state").textContent = (s.control.skipped.length ? "已跳过 " + s.control.skipped.join(", ") : "") + (s.pending.length ? " · 待决策 " + s.pending.length : "");
+    } else { $("controls").hidden = true; }
     if (s.report_directory) { $("title").textContent = s.report_directory.split("/").pop(); $("report").href = "file://" + s.report_directory + "/index.html"; }
   };
   $("cancel").onclick = async () => { $("cancel").disabled = true; await fetch("/cancel", { method: "POST", headers: { "Origin": window.location.origin } }); };

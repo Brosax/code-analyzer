@@ -274,3 +274,103 @@ def test_pre_cancelled_headless_request_has_no_report(tmp_path: Path) -> None:
     result = run_analysis(AnalysisRequest(tmp_path, config), events=events.append, cancellation=token)
     assert result.exit_code == 130 and result.report_directory is None and result.manifest is None
     assert [event.status for event in events] == ["started", "interrupted"]
+
+
+# --- the operator's hand (milestone 4) --------------------------------------------
+
+
+def test_run_keys_pause_skip_and_jobs_reach_the_control(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            assert app.control is not None and not app.control.paused("llm")
+            await pilot.press("p")
+            await pilot.pause()
+            assert app.control.paused("llm")
+            await pilot.press("p")
+            await pilot.pause()
+            assert not app.control.paused("llm")
+            jobs = app.control.jobs("llm")
+            await pilot.press("plus")
+            await pilot.pause()
+            assert app.control.jobs("llm") == jobs + 1
+            await pilot.press("minus")
+            await pilot.pause()
+            assert app.control.jobs("llm") == jobs
+            # The cursor walks the producers and the marker follows it.
+            before = app._selected_node()
+            await pilot.press("down")
+            await pilot.pause()
+            selected = app._selected_node()
+            assert selected in app.flow.producer_ids() and selected != before
+            marked = app._flow_text(app.flow.rows(capacity=20, now=0.0, frame=-1, selected=selected)).plain
+            assert "▶" in marked and marked.count("▶") == 1
+            _feed(app, AnalysisEvent("tool", "started", "cppcheck starting", tool="cppcheck"))
+            app._cursor = "flawfinder"
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.click("#yes")  # confirm the skip dialog
+            await pilot.pause()
+            assert app.control.skipped("flawfinder")
+            _feed(app, AnalysisEvent("control", "skipped", "flawfinder skipped by operator", data={"name": "flawfinder"}))
+            assert "已跳过" in _panel(app)
+
+    asyncio.run(exercise())
+
+
+def test_f3_cycles_one_side_pane_at_a_time_and_f4_filters_the_log(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            _running(app)
+            await pilot.pause()
+            log, problems, llm = app.query_one("#run-log"), app.query_one("#run-problems"), app.query_one("#run-llm")
+            assert log.display and not problems.display and not llm.display
+            await pilot.press("f3")
+            await pilot.pause()
+            # The LLM lane is off in this config, so the next pane is 问题.
+            assert problems.display and not log.display and app.query_one("#run-flow").display
+            assert problems.region.y + problems.region.height <= 24
+            await pilot.press("f3")
+            await pilot.pause()
+            assert log.display and not problems.display
+            await pilot.press("f4")
+            await pilot.pause()
+            assert app._log_filter == "warn"
+            app._queue_log_event(AnalysisEvent("tool", "started", "cppcheck starting", tool="cppcheck"))
+            app._queue_log_event(AnalysisEvent("unit", "partial", "partial in 0.02s", tool="splint", unit="u1"))
+            assert len(app._pending_log_lines) == 1 and "partial" in app._pending_log_lines[0]
+
+    asyncio.run(exercise())
+
+
+def test_events_queue_on_the_worker_and_fold_on_the_tick(tmp_path: Path) -> None:
+    """No call_from_thread per event: the worker queues, the 5 Hz tick folds."""
+
+    async def exercise() -> None:
+        app = AnalyzerApp(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            _running(app)
+            await pilot.pause()
+            for _index in range(3000):
+                app._event_from_worker(AnalysisEvent(
+                    "unit", "heartbeat", "heartbeat; elapsed 1.0s", tool="cppcheck", unit="fallback",
+                    data={"index": 1, "total": 1},
+                ))
+            app._event_from_worker(AnalysisEvent("tool", "started", "cppcheck starting", tool="cppcheck"))
+            app._event_from_worker(AnalysisEvent(
+                "unit", "started", "scanning 8 files", tool="cppcheck", unit="fallback", data={"index": 1, "total": 4, "label": "fallback"},
+            ))
+            assert app.flow.nodes["cppcheck"].state == "pending", "nothing folds until the tick"
+            app._tick_flow()
+            assert app.flow.nodes["cppcheck"].state == "running" and app.flow.nodes["cppcheck"].total == 4
+            assert not app._pending_events and not app._liveness_events
+            # A control event raised on the app thread takes the same path.
+            app.control.pause("llm", "tui")
+            app._event_from_worker(AnalysisEvent("control", "paused", "llm lane paused", data={"lane": "llm"}))
+            app._tick_flow()
+            assert app.flow.paused["llm"]
+
+    asyncio.run(exercise())

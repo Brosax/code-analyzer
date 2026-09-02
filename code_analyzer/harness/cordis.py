@@ -99,7 +99,7 @@ PROVIDER_KEY_ENV = "DEEPSEEK_API_KEY"
 # wire -- the one spelling Ollama's /v1 honours (verified: "off" is HTTP 400,
 # "low"/"minimal" still think, and the stock DeepSeek adapter sends "off").
 REASONING_EFFORTS: dict[str, str] = {
-    "off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+    "off": "none", "minimal": "minimal", "low": "low", "medium": "medium", "high": "high", "max": "max",
 }
 AGENT_SPINE_PACKAGE = "@deepseek-ai/dsh-agent-spine-demo"
 SESSIONS_PACKAGE = "@deepseek-ai/dsh-session-persistence-jsonl"
@@ -373,7 +373,10 @@ def _spine(settings: dict[str, Any], session_root: Path) -> list[dict[str, Any]]
                 "apiKeyEnv": PROVIDER_KEY_ENV,
                 "api": "openai-completions",
                 "baseURL": endpoint,
-                "reasoning": "off",
+                # [llm] reasoning: "off" for a Qwen on Ollama (any other
+                # spelling is HTTP 400 there); a model that always thinks
+                # (GLM-5.x) rejects "off" and wants low/high/max instead.
+                "reasoning": str(settings.get("reasoning") or "off"),
                 # pi-ai sends the newer max_completion_tokens unless told
                 # otherwise; Ollama honours only max_tokens and otherwise
                 # generates unbounded (verified: 2495 tokens past a 1200 cap).

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
 from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
@@ -48,6 +49,7 @@ def run(
     unit_event: Callable[[str, str, str, float | None], None] | None = None,
     output_budget: Any = None,
     output_event: Callable[[str, str, str], None] | None = None,
+    control: Any = None,
 ) -> dict[str, Any]:
     progress = progress or (lambda _message: None)
     unit_event = unit_event or (lambda *_args, **_kwargs: None)
@@ -81,7 +83,11 @@ def run(
     for index, paths in enumerate(shards, 1):
         name = f"shard-{index:04d}"
         facts = {"index": index, "total": len(shards), "label": name, "files": len(paths)}
-        if cancelled is not None and cancelled():
+        action = control.checkpoint("static", "flawfinder", name) if control is not None else RUN
+        if action in {SKIP_PRODUCER, SKIP_UNIT}:
+            units.append({"id": name, "status": "unscheduled", "input_files": paths, "valid_report": False, "reason": "skipped by operator", "evidence_context": "source-only", "artifacts": []})
+            continue
+        if (cancelled is not None and cancelled()) or action == CANCELLED:
             units.append({"id": name, "status": "interrupted", "input_files": paths, "valid_report": False, "reason": "run interrupted", "evidence_context": "source-only", "artifacts": []})
             break
         directory = run_dir / "tools" / "flawfinder" / name
@@ -187,7 +193,7 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
     return run(
         executable, ctx.source, ctx.run_dir, ctx.inventory, ctx.config, ctx.progress,
         cancelled=ctx.cancelled, unit_event=ctx.unit_event, output_event=ctx.output_event,
-        output_budget=ctx.output_budget,
+        output_budget=ctx.output_budget, control=ctx.control,
     )
 
 

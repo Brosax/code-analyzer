@@ -75,20 +75,27 @@ def run_analysis(
     *,
     events: EventSink | None = None,
     cancellation: CancellationToken | None = None,
+    control: Any | None = None,
 ) -> AnalysisResult:
     """Run analysis without terminal output, reporting structured events.
 
     Every event also lands in the run-level events.jsonl (see events.py);
-    ``[run] events_file`` relocates it.
+    ``[run] events_file`` relocates it.  ``control`` is the operator's
+    ``RunControl``; it wraps the cancellation token and journals every
+    action into the same event stream.
     """
+    from .control import RunControl
     from .events import JsonlEventSink, events_file, fan_out
     from .runlog import RunLogger
     from .runner import AnalysisCancelled, _analyze
 
-    token = cancellation or CancellationToken()
+    if control is None:
+        control = RunControl(cancellation, llm_jobs=int(request.config["llm"].get("jobs") or 1))
+    token = control.cancellation
     started = time.monotonic()
     with JsonlEventSink(events_file(request.config)) as log, RunLogger(request.config["run"]["log_level"]) as run_log:
         sink = fan_out(log, run_log, events)
+        control.attach(lambda phase, status, text, data: sink(AnalysisEvent(phase, status, text, data=data)))
         sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0, data=started_data()))
         if token.cancelled:
             sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before start", progress=1.0))
@@ -107,6 +114,7 @@ def run_analysis(
                 progress,
                 cancellation=token,
                 event_sink=sink,
+                control=control,
             )
         except AnalysisCancelled:
             sink(AnalysisEvent("analysis", "interrupted", "analysis cancelled before report creation", progress=1.0))

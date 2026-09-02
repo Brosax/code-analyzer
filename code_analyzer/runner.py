@@ -29,6 +29,7 @@ from .audit import (
 )
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
+from .control import CANCELLED, SKIP_PRODUCER, RunControl
 from .doctor import verify_canary
 from .errors import UserError
 from .events import fan_out
@@ -178,12 +179,14 @@ def analyze(
 ) -> tuple[int, Path]:
     """Terminal entry point: progress strings to stderr, structured events to the sink."""
     started = time.monotonic()
+    control = RunControl(CancellationToken(), llm_jobs=int(config["llm"].get("jobs") or 1))
     with RunLogger(config["run"]["log_level"]) as run_log:
         sink = fan_out(event_sink, run_log)
+        control.attach(lambda phase, status, text, data: sink(AnalysisEvent(phase, status, text, data=data)))
         sink(AnalysisEvent("analysis", "started", "analysis started", progress=0.0, data=started_data()))
         with ProgressDisplay(sys.stderr) as display:
             exit_code, run_dir = _analyze(
-                source, config, display.emit, event_sink=sink, live_events=event_sink is not None,
+                source, config, display.emit, event_sink=sink, live_events=event_sink is not None, control=control,
             )
         status = "interrupted" if exit_code == 130 else "finished"
         sink(AnalysisEvent(
@@ -209,8 +212,12 @@ def _analyze(
     cancellation: CancellationToken | None = None,
     event_sink: EventSink | None = None,
     live_events: bool | None = None,
+    control: RunControl | None = None,
 ) -> tuple[int, Path]:
-    cancellation = cancellation or CancellationToken()
+    # The operator's controls wrap the cancellation token; one object, one
+    # source of truth for "should this unit run".
+    control = control or RunControl(cancellation, llm_jobs=int(config["llm"].get("jobs") or 1))
+    cancellation = control.cancellation
     # Whether a front end is listening for the analyzers' raw output lines;
     # the log sinks alone do not want them.
     live_events = (event_sink is not None) if live_events is None else live_events
@@ -370,7 +377,19 @@ def _analyze(
             tool_prefix = f"tool {tool_index}/{len(requested_names)} {name}"
             started_fraction = (tool_index - 1) / tool_count
             finished_fraction = tool_index / tool_count
-            if interrupted or cancellation.cancelled:
+            # Waits out a paused static lane; says whether this tool runs.
+            action = control.checkpoint("static", name)
+            if action == SKIP_PRODUCER:
+                with manifest_lock:
+                    manifest["tools"][name] = _preflight_state("skipped", inventory, name, "skipped by operator")
+                    save_manifest()
+                progress(f"{tool_prefix}: skipped by operator")
+                window.event(
+                    STATIC, finished_fraction, "tool", "skipped", "skipped by operator",
+                    tool=name, data={"reason": "skipped by operator"},
+                )
+                continue
+            if interrupted or cancellation.cancelled or action == CANCELLED:
                 interrupted = True
                 with manifest_lock:
                     manifest["tools"][name] = _preflight_state("interrupted", inventory, name, "run interrupted before tool start")
@@ -438,7 +457,7 @@ def _analyze(
                 ),
                 config=config, progress=unit_progress, cancelled=cancellation.is_cancelled,
                 unit_event=structured_unit, output_event=streamed_output if live_events else None,
-                output_budget=output_budget,
+                output_budget=output_budget, control=control,
             )
             try:
                 result = adapter(name).run(resolved, context)
@@ -488,7 +507,7 @@ def _analyze(
             record = llm_scan.run(
                 source, run_dir, inventory, config, progress,
                 cancelled=cancellation.is_cancelled, unit_event=llm_unit, phase_event=llm_phase,
-                output_event=llm_output if live_events else None,
+                output_event=llm_output if live_events else None, control=control,
             )
         except InterruptedError:
             record = llm_scan.failed(llm_settings, "run interrupted")

@@ -76,6 +76,39 @@ class Row:
     detail: str
     state: str
     pulse: int = 0
+    selected: bool = False
+
+
+@dataclass(frozen=True)
+class LlmRow:
+    """One scanner's line in the LLM panel."""
+
+    producer: str
+    state: str
+    counted: str
+    failures: int
+    unscheduled: int
+    step: str
+    findings: int | None
+    paused: bool
+
+
+@dataclass(frozen=True)
+class Problem:
+    """One reason units ended badly, aggregated per producer."""
+
+    level: str
+    tool: str
+    reason: str
+    count: int
+
+
+# Step words the LLM phase emits, and what the panel shows for them.
+STEP_LABELS: dict[str, str] = {
+    "prompting": "提示词构造", "replaying": "缓存回放", "waiting": "等待模型", "retry": "重试",
+    "streaming": "接收中", "reading": "读取", "parsing": "解析响应", "validating": "校验", "caching": "写入缓存",
+}
+_ERROR_REASONS = frozenset({"failed", "timed_out", "interrupted", "transport", "provider", "csv", "tool", "ceiling", "timeout"})
 
 
 @dataclass(frozen=True)
@@ -107,6 +140,9 @@ class Node:
     in_flight: dict[str, str] = field(default_factory=dict)
     # Why units ended the way they did: failure class (or status word) -> count.
     reasons: dict[str, int] = field(default_factory=dict)
+    # Where each in-flight unit is (LLM steps); unit -> step label.
+    steps: dict[str, str] = field(default_factory=dict)
+    skipped: bool = False
 
     @property
     def counted(self) -> str:
@@ -176,6 +212,16 @@ class RunFlow:
         self.token_budget = int(llm.get("total_prompt_tokens") or 0) if llm.get("enabled") else 0
         self.llm_jobs = int(llm.get("jobs") or 0) if llm.get("enabled") else 0
         self.model = str(llm.get("model") or "") if llm.get("enabled") else ""
+        self.llm_enabled = bool(llm.get("enabled"))
+        # What the operator did, folded from control/decision events.
+        self.paused: dict[str, bool] = {"static": False, "llm": False}
+        self.pending_decisions: list[dict[str, Any]] = []
+        self.eta_seconds: float | None = None
+        self.tok_s: float | None = None
+        self.eta_basis: str = ""
+        self.llm_in_flight = 0
+        self.breaker: str = ""
+        self.cache_hits = 0
         self._method_from_config(tools)
         self._seed_from_preflight(preflight)
 
@@ -308,7 +354,10 @@ class RunFlow:
             if tasks is not None:
                 self.llm_total = max(self.llm_total or 0, tasks)
             return
-        if event.status in {"replan", "breaker_open"}:
+        if event.status == "breaker_open":
+            self.breaker = _clean(event.message)
+            return
+        if event.status == "replan":
             return
         # The phase's own terminal word settles every scanner still running;
         # a scanner that finished its own units has already settled itself.
@@ -342,11 +391,20 @@ class RunFlow:
                 token = self._unit_token(node, unit, event)
                 node.in_flight[unit] = token
                 node.method = token
-            elif event.status == "step" and unit in node.in_flight:
-                node.in_flight[unit] = self._unit_token(node, unit, event) + " · " + _clean(event.message)
+                node.steps.pop(unit, None)
+            elif event.status == "step":
+                step = str(data.get("step") or "")
+                detail = data.get("detail")
+                label = STEP_LABELS.get(step, step)
+                node.steps[unit] = _clean(f"{label} {detail}" if detail else label)
+            elif event.status == "heartbeat" and node.kind == "llm":
+                self._absorb_rate(data)
             self._absorb_tokens(data)
             return
         node.in_flight.pop(unit, None)
+        node.steps.pop(unit, None)
+        if data.get("cache_hit"):
+            self.cache_hits += 1
         node.done += 1
         if event.status != "completed":
             node.failures += 1
@@ -390,6 +448,34 @@ class RunFlow:
             if node.kind == "llm":
                 self.llm_done += count
         self._remember_reason(node, str(data.get("reason") or event.status), count)
+
+    def _on_control(self, event: AnalysisEvent) -> None:
+        data = event.data or {}
+        lane = str(data.get("lane") or "")
+        if event.status == "paused" and lane in self.paused:
+            self.paused[lane] = True
+        elif event.status == "resumed" and lane in self.paused:
+            self.paused[lane] = False
+        elif event.status == "skipped":
+            node = self.nodes.get(str(data.get("name") or ""))
+            if node is not None and not data.get("unit"):
+                node.skipped = True
+        elif event.status == "jobs" and lane == "llm":
+            jobs = _count(data.get("value"))
+            if jobs is not None:
+                self.llm_jobs = jobs
+        elif event.status == "cancel":
+            self.stopping = True
+
+    def _on_decision(self, event: AnalysisEvent) -> None:
+        data = event.data or {}
+        identity = str(data.get("id") or "")
+        if event.status == "requested":
+            self.pending_decisions.append({
+                "id": identity, "kind": str(data.get("kind") or ""), "summary": _clean(event.message),
+            })
+        else:
+            self.pending_decisions = [item for item in self.pending_decisions if item["id"] != identity]
 
     def _on_stability(self, event: AnalysisEvent) -> None:
         self._phase_event("stability", event)
@@ -465,6 +551,113 @@ class RunFlow:
         if spent is not None:
             self.tokens_spent = max(self.tokens_spent, spent)
 
+    def _absorb_rate(self, data: dict[str, Any]) -> None:
+        eta = data.get("eta_seconds")
+        if isinstance(eta, (int, float)) and not isinstance(eta, bool):
+            self.eta_seconds = float(eta)
+        rate = data.get("tok_s")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+            self.tok_s = float(rate)
+        if data.get("basis"):
+            self.eta_basis = _clean(data["basis"])
+        in_flight = _count(data.get("in_flight"))
+        if in_flight is not None:
+            self.llm_in_flight = in_flight
+        jobs = _count(data.get("jobs"))
+        if jobs is not None:
+            self.llm_jobs = jobs
+
+    # --- what the panes ask for -----------------------------------------------
+
+    def producer_ids(self) -> list[str]:
+        return [node.id for node in self._producers()]
+
+    def llm_rows(self) -> list[LlmRow]:
+        rows = []
+        for node in self.nodes.values():
+            if node.kind != "llm":
+                continue
+            step = ""
+            if node.state == "running":
+                if self.paused["llm"] and not node.in_flight:
+                    step = "已暂停"
+                else:
+                    unit = next(iter(node.in_flight), "")
+                    if unit:
+                        step = node.steps.get(unit) or STEP_LABELS["waiting"]
+                        step = f"{step} · {node.in_flight[unit]}"
+            elif node.skipped:
+                step = "已跳过"
+            rows.append(LlmRow(
+                node.id, node.state, node.counted or "等待", node.failures, node.unscheduled,
+                _clean(step), node.findings, self.paused["llm"] and node.state == "running",
+            ))
+        return rows
+
+    def llm_summary(self) -> str:
+        parts = []
+        if self.model:
+            parts.append(self.model)
+        parts.append(f"并发 {self.llm_jobs}")
+        if self.llm_in_flight:
+            parts.append(f"在途 {self.llm_in_flight}")
+        if self.tok_s is not None:
+            parts.append(f"{self.tok_s:.1f} tok/s")
+        if self.eta_seconds is not None:
+            parts.append(f"ETA {_clock(0.0, self.eta_seconds)}")
+        if self.cache_hits:
+            parts.append(f"缓存 {self.cache_hits} 命中")
+        if self.breaker:
+            parts.append("断路器 打开")
+        if self.paused["llm"]:
+            parts.append("⏸ 已暂停")
+        return _clean(" · ".join(parts))
+
+    def problems(self, limit: int = 500) -> list[Problem]:
+        """Why units ended badly, per producer, worst first."""
+        result: list[Problem] = []
+        for node in self._producers():
+            for reason, count in sorted(node.reasons.items(), key=lambda item: (-item[1], item[0])):
+                level = "error" if reason in _ERROR_REASONS else "warning"
+                result.append(Problem(level, node.id, reason, count))
+            if node.excluded:
+                result.append(Problem("warning", node.id, "encoding", node.excluded))
+        result.sort(key=lambda item: (item.level != "error", -item.count, item.tool))
+        return result[:limit]
+
+    def node_detail(self, node_id: str, now: float) -> list[str]:
+        """Everything one node knows, for the detail screen."""
+        node = self.nodes.get(node_id)
+        if node is None:
+            return [f"未知节点：{node_id}"]
+        lines = [f"{node.label} · 状态 {node.status} ({node.state})"]
+        if node.counted:
+            lines.append(node.counted)
+        if node.method:
+            lines.append(f"方式：{node.method}")
+        if node.findings is not None:
+            lines.append(f"{node.findings} findings")
+        if node.failures or node.unscheduled or node.excluded:
+            lines.append(" · ".join(part for part in (
+                f"{node.failures} 失败" if node.failures else "",
+                f"{node.unscheduled} 未调度" if node.unscheduled else "",
+                f"{node.excluded} 文件编码排除" if node.excluded else "",
+            ) if part))
+        if node.started_at is not None:
+            lines.append(f"已运行 {_clock(node.started_at, node.finished_at or now)}")
+        if node.reasons:
+            lines.append("原因：")
+            for reason, count in sorted(node.reasons.items(), key=lambda item: (-item[1], item[0]))[:10]:
+                lines.append(f"  {reason} ×{count}")
+        if node.in_flight:
+            lines.append("在途：")
+            for unit, token in list(node.in_flight.items())[:10]:
+                step = node.steps.get(unit)
+                lines.append(f"  {token}" + (f" · {step}" if step else ""))
+        if node.detail:
+            lines.append(node.detail)
+        return [_clean(line) for line in lines]
+
     # --- rendering ----------------------------------------------------------
 
     def headline(self, now: float) -> Headline:
@@ -488,21 +681,29 @@ class RunFlow:
             if self.llm_unscheduled:
                 llm += f"（{self.llm_unscheduled} 未调度）"
             parts.append(llm)
+        if self.eta_seconds is not None and not self.finished:
+            parts.append(f"ETA {_clock(0.0, self.eta_seconds)}")
         if self.token_budget:
             parts.append(f"prompt {_thousands(self.tokens_spent)}/{_thousands(self.token_budget)}（估算：字符/4）")
+        if self.paused["llm"]:
+            parts.append("LLM ⏸")
+        if self.paused["static"]:
+            parts.append("静态 ⏸")
+        if self.pending_decisions:
+            parts.append(f"待决策 {len(self.pending_decisions)}")
         return Headline(title=_clean(title), detail=" · ".join(parts), percent=int(self.percent * 100))
 
-    def rows(self, *, capacity: int, now: float, frame: int) -> list[Row]:
+    def rows(self, *, capacity: int, now: float, frame: int, selected: str | None = None) -> list[Row]:
         """The panel's lines, most important first when space runs out."""
         head = self.nodes["discovery"]
         rows = [Row("discovery", "", self._glyph(head, frame), head.label, self._detail(head, now), head.state)]
         producers = self._producers()
         room = max(0, capacity - 2)
-        shown, omitted = self._select(producers, room)
+        shown, omitted = self._select(producers, room, keep=selected)
         for index, node in enumerate(shown):
             rows.append(Row(
                 node.id, "├", self._glyph(node, frame), node.label, self._detail(node, now),
-                node.state, (frame + index) % SPINE_RAMP,
+                node.state, (frame + index) % SPINE_RAMP, node.id == selected,
             ))
         if omitted:
             rows.append(Row("", "│", " ", f"… 另外 {len(omitted)} 个", _summarise(omitted), "pending"))
@@ -512,12 +713,14 @@ class RunFlow:
     def _producers(self) -> list[Node]:
         return [node for node in self.nodes.values() if node.kind in {"static", "llm"}]
 
-    def _select(self, producers: list[Node], room: int) -> tuple[list[Node], list[Node]]:
-        """Running nodes are never hidden -- they are why this panel exists."""
+    def _select(self, producers: list[Node], room: int, keep: str | None = None) -> tuple[list[Node], list[Node]]:
+        """Running nodes are never hidden -- they are why this panel exists; nor is the selected one."""
         if len(producers) <= room:
             return producers, []
         rank = {"running": 0, "failed": 1, "partial": 1, "success": 2, "pending": 3}
-        ordered = sorted(producers, key=lambda node: (rank.get(node.state, 3), -(node.finished_at or 0), node.order))
+        ordered = sorted(producers, key=lambda node: (
+            0 if node.id == keep else 1, rank.get(node.state, 3), -(node.finished_at or 0), node.order,
+        ))
         keep = ordered[: max(0, room - 1)]
         kept = {node.id for node in keep}
         return (
@@ -555,13 +758,18 @@ class RunFlow:
             token = node.method or next(iter(node.in_flight.values()), "")
             if token:
                 parts.append(token)
+            step = next((node.steps[unit] for unit in node.in_flight if unit in node.steps), "")
+            if step:
+                parts.append(step)
             if node.detail and node.detail not in parts:
                 parts.append(node.detail)
+            if self.paused.get("llm" if node.kind == "llm" else "static") and not node.in_flight:
+                parts.append("⏸")
             elapsed = _clock(node.started_at, now)
             if elapsed != "00:00":
                 parts.append(elapsed)
         elif node.state == "pending":
-            parts.append("等待")
+            parts.append("已跳过" if node.skipped else "等待")
             if node.method:
                 parts.append(node.method)
         else:
