@@ -145,7 +145,10 @@ def run_loop(ctx: LoopContext) -> str:
                 llm_block = proposal.as_dict()
                 public = {k: v for k, v in llm_block.items() if k not in {"problems", "unresolved"}}
                 if proposal.used:
-                    patch.items = (patch.items + proposal.items)[:configure.MAX_ITEMS]
+                    # Both lists are already capped; the union is not capped
+                    # again, or a tree with 64 proven roots would silently
+                    # drop every item the model added (seen live).
+                    patch.items = patch.items + proposal.items
                     bc("consulted", f"{name}: {model} proposed {len(proposal.items)} item(s) ({len(proposal.problems)} dropped, {len(proposal.unresolved)} left unresolved)" + (f"; {proposal.reason}" if proposal.reason and not proposal.items else ""), tool=name, round=round_index, **public)
                 else:
                     bc("consulted", f"{name}: configurator {proposal.status}: {proposal.reason}; the deterministic patch proceeds alone", tool=name, round=round_index, **public)

@@ -215,6 +215,28 @@ def test_the_loop_merges_the_models_items_after_the_deterministic_ones_and_recor
     assert len(fake.calls_for(configure.PRODUCER)) == 1
 
 
+def test_the_models_items_survive_a_deterministic_patch_at_the_cap(tmp_path: Path, monkeypatch) -> None:
+    from code_analyzer import build_context, reconfigure
+
+    source = _tree(tmp_path)
+    proposal = json.dumps({"schema_version": 1, "items": [{"op": "add_define", "value": "BOARD_A=1", "rationale": "x"}], "unresolved": []})
+    _live(tmp_path, monkeypatch, response(proposal))
+    real_infer = build_context.infer_patch
+
+    def padded(*args, **kwargs):
+        patch = real_infer(*args, **kwargs)
+        # A tree with more proven roots than the dialog cap.
+        patch.items = patch.items + [build_context.PatchItem("add_define", f"PAD_{index}=1") for index in range(build_context.MAX_ITEMS)]
+        return patch
+
+    monkeypatch.setattr(reconfigure, "infer_patch", padded)
+    config = _run_config(tmp_path, source, "propose")
+    config["llm"].update({"endpoint": "http://127.0.0.1:1/v1", "model": "fake"})
+    result = run_analysis(AnalysisRequest(source, config), events=lambda _e: None, control=RunControl(CancellationToken(), decider=auto_yes))
+    patch = json.loads((result.report_directory / "inputs/build-context/r1/patch.json").read_text(encoding="utf-8"))
+    assert len(patch["items"]) > build_context.MAX_ITEMS and patch["items"][-1]["origin"] == "llm"
+
+
 def test_auto_never_applies_a_patch_with_model_items_on_its_own(tmp_path: Path, monkeypatch) -> None:
     source = _tree(tmp_path)
     proposal = json.dumps({"schema_version": 1, "items": [{"op": "add_define", "value": "BOARD_A=1", "rationale": "x"}], "unresolved": []})
