@@ -199,6 +199,10 @@ class AnalyzerApp(App[TuiOutcome]):
         # Questions a worker is blocked on, by block id.
         self._waiting: dict[str, tuple[threading.Event, dict[str, Answer]]] = {}
         self._busy = False
+        # What a model proposed and the operator has not yet ticked, and the
+        # commands a ticked proposal turned into.
+        self._pending_steps: list[Any] = []
+        self._queued: list[str] = []
 
     # --- the screen ---------------------------------------------------------
 
@@ -278,9 +282,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._set_config(intent.values["path"], intent.values["raw"])
             return
         if intent.kind == ASK:
-            self._mount(self.dialogue.say(
-                "/ask 还没接线（M6）。目前请用 /help 里的命令。",
-            ))
+            self._ask_model(intent.values.get("utterance") or intent.text)
             return
         if intent.kind == AMBIGUOUS:
             lines = [f"  /{name} {' '.join(intent.argv) or ''}".rstrip() for name in intent.candidates]
@@ -371,6 +373,98 @@ class AnalyzerApp(App[TuiOutcome]):
             lines=["  （未保存，Ctrl+S 写入 TOML 快照）"],
         )))
         self._update_status()
+
+    # --- /ask: the model proposes, the operator ticks ------------------------
+
+    def _ask_model(self, utterance: str) -> None:
+        if not utterance.strip():
+            self._mount(self.dialogue.failed("用法：/ask <一句话>"))
+            return
+        if self._busy:
+            self._mount(self.dialogue.failed("有操作在跑；等它结束再问"))
+            return
+        self._busy = True
+        self._mount(self.dialogue.say("正在把这句话交给模型…（Ctrl+C 打断）"))
+        self._propose_worker(utterance)
+
+    @work(thread=True, exclusive=True, group="ask")
+    def _propose_worker(self, utterance: str) -> None:
+        from .llm.propose import propose
+
+        try:
+            proposal = propose(
+                utterance, self.dialogue.config,
+                source=self.dialogue.source, report_directory=self.dialogue.report_directory,
+                cancelled=(self.cancel_token.is_cancelled if self.cancel_token else None),
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self._proposed, None, f"{type(exc).__name__}: {single_line(str(exc))}")
+            return
+        self.call_from_thread(self._proposed, proposal, "")
+
+    def _proposed(self, proposal: Any, error: str) -> None:
+        """Render what the model suggested: unticked, itemised, with its reasons."""
+        from .dialogue import ProposalBlock
+
+        self._busy = False
+        if proposal is None or proposal.status == "failed":
+            self._mount(self.dialogue.failed(
+                f"模型没能回答：{error or proposal.reason}", ["确定性命令不受影响，/help 列出全部"]))
+            return
+        if proposal.status == "skipped":
+            # Provider down is a gate, not a failure: everything else still works.
+            self._mount(self.dialogue.say(
+                f"模型不可达：{proposal.reason}",
+                ["确定性命令不受影响：/scan /doctor /config /preflight …，/help 列出全部"]))
+            return
+        notes = []
+        if proposal.unclear:
+            notes.append(f"  模型说不确定的地方：{proposal.unclear}")
+        for item in proposal.dropped:
+            notes.append(f"  已丢弃：{item}")
+        if not proposal.steps:
+            self._mount(self.dialogue.say("模型没有提出可执行的操作。", notes))
+            return
+        steps = [
+            {"action": step.action, "label": step.label(),
+             "impact": tuple(filter(None, [step.why, *by_name(step.action).impact]))}
+            for step in proposal.steps
+        ]
+        block = ProposalBlock(text="模型建议的操作（默认都不勾选）：", steps=steps, lines=notes)
+        self.dialogue.add(block)
+        self._mount(block)
+        self._pending_steps = proposal.steps
+        self._mount(self.dialogue.ask(Question(
+            "ask.steps", "select", "要执行哪些？输入编号（如 1,2），或直接回车全部拒绝： ",
+            options=tuple(step["label"] for step in steps),
+        )))
+
+    def _run_proposed(self, text: str) -> None:
+        """Turn the ticked steps into the very commands the operator could type."""
+        chosen: list[int] = []
+        for piece in text.replace("，", ",").split(","):
+            piece = piece.strip()
+            if piece.isdigit() and 1 <= int(piece) <= len(self._pending_steps):
+                chosen.append(int(piece) - 1)
+        steps, self._pending_steps = self._pending_steps, []
+        if not chosen:
+            self._mount(self.dialogue.say("全部拒绝，什么也没执行。"))
+            return
+        for index in chosen:
+            step = steps[index]
+            line = f"/{step.action}"
+            if step.subject is not None:
+                line += f" {step.subject}"
+            self._queued.append(line)
+            for path, value in step.changes.items():
+                self._queued.insert(len(self._queued) - 1, f"/set {path} {value}")
+        self._drain_queue()
+
+    def _drain_queue(self) -> None:
+        """One queued command at a time; the next starts when this one ends."""
+        while self._queued and not self._busy:
+            self.submit(self._queued.pop(0))
 
     # --- running an action ---------------------------------------------------
 
@@ -478,6 +572,7 @@ class AnalyzerApp(App[TuiOutcome]):
         self.control = None
         self.cancel_token = None
         self._update_status()
+        self._drain_queue()
 
     # --- the two seams a worker reaches back through -------------------------
 
@@ -535,6 +630,9 @@ class AnalyzerApp(App[TuiOutcome]):
             done, box = waiting
             box["answer"] = answer
             done.set()
+        elif self._pending_steps and getattr(question, "question", None) is not None \
+                and question.question.id == "ask.steps":
+            self._run_proposed(text)
         self._update_status()
 
     def _decider(self) -> Any:
