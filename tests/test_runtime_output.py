@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import stat
 import sys
@@ -8,13 +7,10 @@ import textwrap
 import time
 from pathlib import Path
 
-from textual.widgets import RichLog
-
 from code_analyzer.analysis import AnalysisEvent, AnalysisRequest, run_analysis
 from code_analyzer.config import load_config
 from code_analyzer.process import MAX_LIVE_LINE_CHARS, run_process
 from code_analyzer.tools import cppcheck, flawfinder, splint
-from code_analyzer.tui import AnalyzerApp
 
 
 def _executable(path: Path, body: str) -> Path:
@@ -200,35 +196,9 @@ def test_headless_service_emits_output_metadata_without_using_logs_as_status(tmp
     assert progress_values == sorted(progress_values)
 
 
-def test_running_page_batches_and_bounds_log_lines(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        app = AnalyzerApp(tmp_path)
-        async with app.run_test(size=(120, 40)) as pilot:
-            app.running = True
-            app._reset_run_display()
-            app.add_class("running")
-            await pilot.pause()
-            assert app.query_one("#running").display
-            assert not app.query_one("#workspace").display
-            log = app.query_one("#run-log", RichLog)
-            assert log.max_lines == 2000 and log.auto_scroll and log.wrap
-
-            for index in range(2100):
-                app._queue_log_event(AnalysisEvent(
-                    "output", "running", f"line {index}", tool="cppcheck", unit="fallback", stream="stderr"
-                ))
-            assert len(app._pending_log_lines) == 2000
-            assert sum("界面日志过载" in line for line in app._pending_log_lines) == 1
-
-            before = len(app._pending_log_lines)
-            app._flush_log_queue()
-            assert before - len(app._pending_log_lines) == 200
-
-            app._reset_run_display()
-            assert not app._pending_log_lines
-            assert not log.lines
-
-    asyncio.run(exercise())
+# The log batching this file used to assert on lives with the interface that
+# draws it: tests/test_tui.py::test_the_run_block_batches_and_bounds_log_lines
+# keeps every one of its numbers (2000 cap, one overload marker, 200 a flush).
 
 
 def test_a_runaway_tool_is_capped_without_being_blocked(tmp_path: Path) -> None:

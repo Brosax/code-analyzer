@@ -139,10 +139,10 @@ class ConfigBlock(Block):
     changes: list[tuple[str, Any, Any]] = field(default_factory=list)
 
     def render(self) -> list[str]:
-        lines = list(self.lines)
-        for path, before, after in self.changes:
-            lines.append(f"  {path}: {before!r} → {after!r}")
-        return lines
+        # The change first, then whatever is said about it: a note that reads
+        # "not saved yet" above the line it refers to reads as a non sequitur.
+        lines = [f"  {path}: {before!r} → {after!r}" for path, before, after in self.changes]
+        return lines + list(self.lines)
 
 
 @dataclass

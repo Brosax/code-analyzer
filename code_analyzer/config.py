@@ -319,6 +319,22 @@ def _merge_with_sources(
                 sources[path] = label
 
 
+def apply_overrides(
+    config: dict[str, Any], overrides: dict[str, Any], *,
+    sources: dict[str, str] | None = None, label: str = "session",
+) -> dict[str, Any]:
+    """Layer a nested override dict onto a config already in hand.
+
+    ``load_config_with_sources`` builds a config from the four layers starting
+    at DEFAULTS.  A conversation needs the other direction: it already holds a
+    config the operator has been editing with ``/set``, and a command's own
+    flags go on top of *that*.  Rebuilding from DEFAULTS would silently throw
+    away every session edit -- which is exactly what a live run caught.
+    """
+    _merge_with_sources(config, overrides, sources if sources is not None else {}, label)
+    return validate_config(config)
+
+
 def _read(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
