@@ -219,7 +219,7 @@ def test_config_reaches_every_one_of_the_eighty_three_leaves(tmp_path: Path) -> 
     asyncio.run(exercise())
 
 
-def test_an_unresolvable_line_is_a_block_and_never_takes_the_screen(tmp_path: Path) -> None:
+def test_a_refusal_is_a_block_and_never_takes_the_screen(tmp_path: Path) -> None:
     """InfoScreen was the universal error channel; an error is now scrollable."""
 
     async def exercise() -> None:
@@ -227,14 +227,56 @@ def test_an_unresolvable_line_is_a_block_and_never_takes_the_screen(tmp_path: Pa
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             app.submit("/nonsense")
-            app.submit("帮我看看哪些单元最值得先扫")
+            app.submit(str(tmp_path / "definitely-not-here"))
             await pilot.pause()
             text = _transcript(app)
             assert "没有 /nonsense 这个命令" in text
-            assert "没看懂这句话" in text
+            assert "路径不存在" in text
             # Still one screen, still able to type.
             assert app.query_one("#prompt").display
             assert not app.query("ModalScreen")
+
+    asyncio.run(exercise())
+
+
+def test_a_sentence_goes_to_the_model_with_no_prefix_and_the_box_says_so(tmp_path: Path) -> None:
+    """The inversion, at the front end: no `/ask`, no keyword table.
+
+    The autouse fixture stubs the provider, so what is asserted here is the
+    routing and the refusal wording -- not a live answer.
+    """
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("帮我看看哪些单元最值得先扫")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._busy:
+                    break
+            text = _transcript(app)
+            assert "正在把这句话交给模型" in text
+            # Provider off in the suite: it degrades and names what still works.
+            assert "模型不可达" in text
+            assert "/help" in text and "确定性命令不受影响" in text
+
+    asyncio.run(exercise())
+
+
+def test_a_sentence_that_looks_like_a_path_because_chinese_has_no_spaces(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("扫描~/fw")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._busy:
+                    break
+            # Routed as a sentence, not refused as a missing directory.
+            assert "路径不存在" not in _transcript(app)
+            assert "模型不可达" in _transcript(app)
 
     asyncio.run(exercise())
 

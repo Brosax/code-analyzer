@@ -1,18 +1,34 @@
-"""What the operator typed, resolved to an action -- deterministically.
+"""What the operator typed: a command, a path, or something to be understood.
 
-This is the trunk of the conversation, and it never reaches a model.  A slash
-command, a bare path and a short phrase all name something in the registry;
-anything this file cannot resolve is reported as unresolved rather than
-guessed, and only then may the operator hand it to a model with ``/ask``.
+Two shapes resolve here, instantly and offline, because both are unambiguous:
+a **slash command** and a **bare path**.  Everything else is a sentence, and a
+sentence goes to the model automatically -- no prefix, no `/ask`, no keyword
+table pretending to understand it.
 
-The reason for the split is latency and honesty in equal measure.  Measured
-against the operator's own provider on 2026-09-03, the first token of a reply
-takes 18-52 s; an interface that asked a model what "pause" meant would take
-half a minute to pause.  And a parser that guesses is worse than one that asks:
-two readings of one phrase is a coin flip the operator can settle instantly.
+There used to be a third shape: a closed table of keywords matched as
+substrings anywhere in the line, so "扫描" won a scan and "配置一下扫描" won an
+argument with itself.  It is deleted.  It was imitating comprehension with a
+lookup, and once the model is on the main path there is nothing left for it to
+do except disagree with the model about what a word means.
 
-Nothing here imports textual, the harness or ``llm.*`` -- a test asserts it,
-the way ``tests/test_flow.py`` asserts the flow model imports no UI.
+What stays deterministic, and why each one earns it:
+
+* **A slash command** is the operator naming an action.  Its tail is parsed by
+  the very argparse subparser the CLI builds for that subcommand, so it accepts
+  exactly what `code-analyzer analyze` accepts.
+* **A path that exists** is a subject, not a sentence.  Handing it to a model
+  would spend seconds arriving at the reading the filesystem already gave us.
+* **A path that does not exist** is a typo.  The intent model has no
+  filesystem (`allowed-tools: []`), so it cannot repair `~/fwm`; routing the
+  commonest keyboard error to the most expensive operation would be absurd.
+* **A directory holding a manifest.json** has five readings and four of them
+  write.  The model would receive exactly what this parser received and choose
+  among the same five.  The presentation is upgraded; the reader is not.
+
+Nothing here imports textual, the harness or ``llm.*``.  ``ASK`` is returned as
+*data* -- this module never calls ``gate()`` or ``propose()``, so the trunk
+still answers with nothing installed and nothing reachable, and a test asserts
+it the way ``tests/test_flow.py`` asserts the flow model imports no UI.
 """
 from __future__ import annotations
 
@@ -56,12 +72,15 @@ META_COMMANDS: dict[str, str] = {
     "clear": "折叠已结束的块",
 }
 
-# Shorthand is a closed lexical table, not a classifier.  It resolves a verb
-# and a subject and nothing else: no flags, no negation.  Anything richer is
-# either a slash command (explicit) or /ask (a model that can say what it
-# understood) -- widening this table is where a deterministic parser starts to
-# claim a comprehension it does not have.
-_MIN_KEYWORD = 2
+# CJK needs no spaces, so "扫描~/fw" is ONE token containing "/" and "~" and
+# would otherwise be claimed by the bare-path lane and die on 路径不存在 --
+# which is the primary input form of the operator this tool is written for.
+_CJK = (
+    (0x3000, 0x30FF),   # punctuation and kana
+    (0x3400, 0x4DBF),   # extension A
+    (0x4E00, 0x9FFF),   # unified ideographs
+    (0xF900, 0xFAFF),   # compatibility ideographs
+)
 
 
 @dataclass(frozen=True)
@@ -103,7 +122,9 @@ def parse(text: str, state: State | None = None) -> Intent:
     bare = _bare_path(line, state)
     if bare is not None:
         return bare
-    return _shorthand(line, state)
+    # Everything else is a sentence.  Returned as data: resolving it is the
+    # front end's business, and this module still reaches no provider.
+    return Intent(ASK, text=line, values={"utterance": line}, confidence="model")
 
 
 # --- slash commands ---------------------------------------------------------
@@ -253,9 +274,13 @@ def coerce(path: str, raw: str) -> Any:
 # --- bare paths -------------------------------------------------------------
 
 
+def _has_cjk(line: str) -> bool:
+    return any(any(low <= ord(ch) <= high for low, high in _CJK) for ch in line)
+
+
 def _bare_path(line: str, state: State) -> Intent | None:
     """A path on its own line names a subject, and never runs by itself."""
-    if len(line.split()) != 1 or line.startswith("-"):
+    if len(line.split()) != 1 or line.startswith("-") or _has_cjk(line):
         return None
     candidate = Path(line).expanduser()
     looks_like_path = any(mark in line for mark in ("/", "\\", "~", ".")) or candidate.exists()
@@ -264,7 +289,7 @@ def _bare_path(line: str, state: State) -> Intent | None:
     if not candidate.exists():
         return Intent(UNKNOWN, text=line, problem=f"路径不存在：{candidate}")
     if candidate.is_file() and candidate.name == "compile_commands.json":
-        return Intent(ACTION, action="scan", text=line, confidence="shorthand",
+        return Intent(ACTION, action="scan", text=line, confidence="path",
                       argv=(str(candidate.parent), "--compile-db", str(candidate)))
     if not candidate.is_dir():
         return Intent(UNKNOWN, text=line, problem=f"不是一个目录：{candidate}")
@@ -272,48 +297,13 @@ def _bare_path(line: str, state: State) -> Intent | None:
         # A finished run has five things one might want from it; guessing
         # between them would be a coin flip.
         return Intent(
-            AMBIGUOUS, text=line, confidence="shorthand",
+            AMBIGUOUS, text=line, confidence="path",
             candidates=("llm-resume", "assess", "tools-resume", "recover-report", "serve"),
             values={"report_directory": candidate},
             problem=f"{candidate.name} 是一次已完成的运行；你想对它做什么？",
         )
-    return Intent(ACTION, action="scan", text=line, confidence="shorthand",
+    return Intent(ACTION, action="scan", text=line, confidence="path",
                   argv=(str(candidate),), values={"source": candidate})
-
-
-# --- shorthand --------------------------------------------------------------
-
-
-def _shorthand(line: str, state: State) -> Intent:
-    lowered = line.lower()
-    matched = [
-        action for action in REGISTRY
-        if any(word and len(word) >= _MIN_KEYWORD and word.lower() in lowered for word in action.keywords)
-    ]
-    subject = _subject_in(line)
-    if len(matched) > 1:
-        return Intent(AMBIGUOUS, text=line, confidence="shorthand",
-                      candidates=tuple(action.name for action in matched),
-                      problem="这句话同时像 " + "、".join(action.name for action in matched) + "；你指哪一个？")
-    if not matched:
-        return Intent(UNKNOWN, text=line,
-                      problem="没看懂这句话。/help 列出全部命令，/ask 可以交给模型理解。")
-    action = matched[0]
-    argv: list[str] = []
-    if subject is not None:
-        argv.append(str(subject))
-    return Intent(ACTION, action=action.name, text=line, confidence="shorthand",
-                  argv=tuple(argv), values={"source": subject} if subject else {})
-
-
-def _subject_in(line: str) -> Path | None:
-    for token in line.split():
-        if not any(mark in token for mark in ("/", "~", ".")):
-            continue
-        candidate = Path(token).expanduser()
-        if candidate.exists():
-            return candidate
-    return None
 
 
 def help_lines() -> list[str]:
@@ -328,7 +318,7 @@ def help_lines() -> list[str]:
         lines.append(f"  /{name:<33} {summary}")
     lines.append("")
     lines.append("  /set <配置路径> <值>                 改一项配置")
-    lines.append("  /ask <一句话>                        交给模型理解")
     lines.append("")
-    lines.append("也可以直接输入一个目录（提议扫描它），或用简写，例如「扫描 ~/fw」。")
+    lines.append("其余的直接说就行——不认识的输入会自动交给模型理解，不需要前缀。")
+    lines.append("直接输入一个目录会提议扫描它。`/ask <一句话>` 可以强制走模型。")
     return lines

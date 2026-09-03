@@ -86,7 +86,9 @@ def test_a_bare_existing_directory_reads_as_a_scan_and_names_its_subject(tmp_pat
     source = _tree(tmp_path)
     intent = parse(str(source))
     assert intent.kind == ACTION and intent.action == "scan"
-    assert intent.confidence == "shorthand" and intent.values["source"] == source
+    # "path", not "shorthand": the CLI reads this to decide whether naming a
+    # directory may start a scan headlessly (it may not).
+    assert intent.confidence == "path" and intent.values["source"] == source
 
 
 def test_an_absolute_path_is_a_path_and_not_a_missing_slash_command(tmp_path: Path) -> None:
@@ -121,25 +123,20 @@ def test_a_compile_database_names_the_tree_it_belongs_to(tmp_path: Path) -> None
 # --- shorthand --------------------------------------------------------------
 
 
-def test_a_shorthand_verb_resolves_with_the_path_in_the_same_line(tmp_path: Path) -> None:
-    source = _tree(tmp_path)
-    intent = parse(f"扫描 {source}")
-    assert intent.action == "scan" and intent.confidence == "shorthand"
-    assert intent.values["source"] == source
+def test_a_sentence_the_parser_cannot_resolve_reaches_the_model_without_being_asked_to() -> None:
+    """The inversion: no prefix, no keyword table, no "没看懂这句话"."""
+    for line in ("帮我看看哪些单元最值得先扫", "扫描 ~/fw", "先体检一下", "asdf"):
+        intent = parse(line)
+        assert intent.kind == ASK, line
+        assert intent.confidence == "model" and intent.values["utterance"] == line
 
 
-def test_a_shorthand_matching_two_verbs_is_reported_as_ambiguous_rather_than_guessed() -> None:
-    """Two readings is a coin flip the operator can settle instantly."""
-    intent = parse("配置一下扫描")
-    assert intent.kind == AMBIGUOUS
-    assert set(intent.candidates) == {"scan", "config"}
-    assert "你指哪一个" in intent.problem
-
-
-def test_text_the_parser_cannot_resolve_is_never_executed_silently() -> None:
-    intent = parse("帮我看看哪些单元最值得先扫")
-    assert intent.kind == UNKNOWN and not intent.resolved
-    assert "/ask" in intent.problem
+def test_routing_a_sentence_to_the_model_is_not_running_it() -> None:
+    """`parse` returns ASK as data and reaches no provider to do it."""
+    intent = parse("帮我把所有东西都删掉")
+    assert intent.kind == ASK and intent.resolved
+    # No action, no argv: nothing here can be executed by itself.
+    assert intent.action == "" and intent.argv == ()
 
 
 def test_an_empty_line_is_not_a_command() -> None:
@@ -272,20 +269,79 @@ def test_an_ambiguous_line_lists_the_readings_as_runnable_commands(
         assert f"code-analyzer {candidate} {run}" in error
 
 
-def test_ask_never_reaches_a_provider_from_a_non_interactive_command_line(
+def test_a_sentence_never_reaches_a_provider_from_a_command_line(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """An outage must not be able to change a headless exit code."""
+    """An outage must not be able to change a headless exit code.
+
+    The surface grew with the inversion -- from one literal `/ask` to every
+    unrecognised line -- so the refusal has to name the way in.
+    """
     from code_analyzer import cli
 
-    assert cli.main(["/ask", "随便问点什么"]) == 2
-    assert "interactive session" in capsys.readouterr().err
+    for argv in (["/ask", "随便问点什么"], ["帮我看看内存安全"], ["扫描", "这个目录"]):
+        assert cli.main(argv) == 2, argv
+        assert "code-analyzer tui" in capsys.readouterr().err
 
 
-def test_an_unresolvable_line_is_a_usage_error_and_never_a_traceback(
-    capsys: pytest.CaptureFixture[str],
+def test_the_shapes_that_still_fail_deterministically_say_why(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path,
 ) -> None:
+    """Not everything routes to the model: a typo is still answered in 0ms."""
     from code_analyzer import cli
 
-    assert cli.main(["帮我看看哪些单元最值得先扫"]) == 2
-    assert "没看懂这句话" in capsys.readouterr().err
+    assert cli.main([str(tmp_path / "definitely-not-here")]) == 2
+    assert "路径不存在" in capsys.readouterr().err
+    assert cli.main(["/doctar"]) == 2
+    assert "你是指" in capsys.readouterr().err
+
+
+def test_a_chinese_verb_glued_to_a_path_is_a_sentence_and_not_a_missing_directory(
+    tmp_path: Path,
+) -> None:
+    """Chinese needs no space, so 「扫描~/fw」 is one path-shaped token.
+
+    Without the CJK guard the bare-path lane claims it and the operator's
+    primary input form dead-ends on 路径不存在.
+    """
+    source = _tree(tmp_path)
+    for line in (f"扫描{source}", "扫描~/fw", "看看./src"):
+        intent = parse(line)
+        assert intent.kind == ASK, line
+    # An ASCII path with no verb is still a path.
+    assert parse(str(source)).kind == ACTION
+
+
+def test_a_path_shaped_token_that_does_not_exist_stays_instant_and_never_costs_a_round_trip(
+    tmp_path: Path,
+) -> None:
+    """The intent model has no filesystem; it cannot repair a typo."""
+    intent = parse(str(tmp_path / "fwm"))
+    assert intent.kind == UNKNOWN and "路径不存在" in intent.problem
+    assert intent.kind != ASK
+
+
+def test_a_finished_run_directory_still_names_its_five_readings_instead_of_asking_a_model(
+    tmp_path: Path,
+) -> None:
+    """The operator typed a path, not a sentence; four of the five readings write."""
+    run = tmp_path / "20260903T000000Z-abcdef"
+    run.mkdir()
+    (run / "manifest.json").write_text("{}", encoding="utf-8")
+    intent = parse(str(run))
+    assert intent.kind == AMBIGUOUS and len(intent.candidates) == 5
+
+
+def test_a_slash_command_never_reaches_a_provider_even_when_one_is_configured(
+    tmp_path: Path,
+) -> None:
+    source = _tree(tmp_path)
+    for line in (f"/scan {source}", "/help", "/config", "/set llm.jobs 4", f"/preflight {source}"):
+        assert parse(line).kind != ASK, line
+
+
+def test_help_says_that_anything_else_is_simply_said() -> None:
+    text = "\n".join(help_lines())
+    assert "不认识的输入会自动交给模型理解，不需要前缀" in text
+    # The old advice to use a keyword shorthand is gone with the table.
+    assert "简写" not in text

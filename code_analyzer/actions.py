@@ -152,7 +152,6 @@ class Action:
     subject: str
     run: Callable[[ActionContext], ActionOutcome]
     aliases: tuple[str, ...] = ()
-    keywords: tuple[str, ...] = ()
     params: tuple[Param, ...] = ()
     long_running: bool = False
     interactive: bool = False
@@ -412,13 +411,13 @@ def _run_config(ctx: ActionContext) -> ActionOutcome:
 
 DOCTOR = Action(
     name="doctor", summary="探测分析器与运行环境", subject=SUBJECT_NONE, run=_run_doctor,
-    aliases=("体检",), keywords=("体检", "环境", "doctor"), cli_command="doctor",
+    aliases=("体检",), cli_command="doctor",
     # Writes only a canary.c inside a TemporaryDirectory (doctor.py:70-72).
     impact=("只读：探测三个分析器的版本与能力；只在临时目录里编译一个探针，不写任何会留下的文件。",),
 )
 LLM_DOCTOR = Action(
     name="llm-doctor", summary="探测 LLM 提供方并估算一次完整扫描", subject=SUBJECT_SOURCE,
-    run=_run_llm_doctor, aliases=("模型体检",), keywords=("模型", "provider", "端点"),
+    run=_run_llm_doctor, aliases=("模型体检",),
     cli_command="llm-doctor",
     # Writes nothing, but it is a real generation: tokens, money on a metered
     # provider, and 18-52s of time.  Typed is consent; inferred is not.
@@ -427,12 +426,12 @@ LLM_DOCTOR = Action(
 )
 PREFLIGHT = Action(
     name="preflight", summary="运行前的只读检查", subject=SUBJECT_SOURCE, run=_run_preflight,
-    aliases=("预检",), keywords=("预检", "检查", "preflight"), cli_command="preflight",
+    aliases=("预检",), cli_command="preflight",
     impact=("只读：校验配置、探测工具、预测 include 缺失；不写任何文件。",),
 )
 COMPILE_DB = Action(
     name="compile-db", summary="发现或生成 JSON compilation database", subject=SUBJECT_SOURCE,
-    run=_run_compile_db, aliases=("cdb", "编译数据库"), keywords=("编译数据库", "compile_commands"),
+    run=_run_compile_db, aliases=("cdb", "编译数据库"),
     long_running=True, interactive=True, cli_command="compile-db",
     # Two corrections: the log does NOT go under the report directory (it goes
     # under the process CWD, compile_db_wizard.py:349-357) and the build tree
@@ -443,7 +442,7 @@ COMPILE_DB = Action(
 )
 SCAN = Action(
     name="scan", summary="对一个 C/C++ 源码树执行完整扫描", subject=SUBJECT_SOURCE, run=_run_scan,
-    aliases=("analyze", "扫描"), keywords=("扫描", "分析", "跑一遍", "scan"),
+    aliases=("analyze", "扫描"),
     params=(Param("source", kind="path", label="源码根目录", required=True),),
     long_running=True, interactive=True, cli_command="analyze",
     writes=("{output_root}/<报告目录>/…", "{output_root}/.llm-cache"),
@@ -452,7 +451,7 @@ SCAN = Action(
 )
 LLM_RESUME = Action(
     name="llm-resume", summary="续扫一次运行里未调度或被中断的单元", subject=SUBJECT_REPORT,
-    run=_run_llm_resume, aliases=("续扫",), keywords=("续扫", "resume", "接着跑"),
+    run=_run_llm_resume, aliases=("续扫",),
     long_running=True, cli_command="llm-resume",
     writes=("{report}/llm/…", "{report}/review/summary.{json,md,sarif}",
             "{report}/audit/assessment.json", "{report}/manifest.json", "{report}/index.html"),
@@ -462,7 +461,7 @@ LLM_RESUME = Action(
 )
 TOOLS_RESUME = Action(
     name="tools-resume", summary="对已完成的运行继续构建上下文修补循环", subject=SUBJECT_REPORT,
-    run=_run_tools_resume, aliases=("补构建上下文",), keywords=("构建上下文", "补丁", "splint 失败"),
+    run=_run_tools_resume, aliases=("补构建上下文",),
     long_running=True, interactive=True, cli_command="tools-resume",
     writes=("{report}/manifest.json", "{report}/inputs/build-context/…",
             "{report}/suggested-config.toml", "{report}/tools/…"),
@@ -475,7 +474,7 @@ TOOLS_RESUME = Action(
 )
 ASSESS = Action(
     name="assess", summary="用验证器复核已关联的候选项", subject=SUBJECT_REPORT, run=_run_assess,
-    aliases=("验证",), keywords=("验证", "复核", "assess"),
+    aliases=("验证",),
     long_running=True, cli_command="assess",
     writes=("{report}/llm/…", "{report}/audit/assessment.json",
             "{report}/manifest.json", "{report}/index.html"),
@@ -484,7 +483,7 @@ ASSESS = Action(
 )
 REBUILD_DASHBOARD = Action(
     name="rebuild-dashboard", summary="从已有报告重建 index.html", subject=SUBJECT_REPORT,
-    run=_run_rebuild_dashboard, aliases=("重建报告页",), keywords=("重建", "dashboard"),
+    run=_run_rebuild_dashboard, aliases=("重建报告页",),
     cli_command="rebuild-dashboard",
     # It also rewrites manifest.json -- the only source of node truth
     # (dashboard.py:70).  The old string omitted that and the old policy was
@@ -494,7 +493,7 @@ REBUILD_DASHBOARD = Action(
 )
 RECOVER_REPORT = Action(
     name="recover-report", summary="从原生证据重建全部派生产物", subject=SUBJECT_REPORT,
-    run=_run_recover_report, aliases=("恢复报告",), keywords=("恢复", "recover"),
+    run=_run_recover_report, aliases=("恢复报告",),
     cli_command="recover-report",
     # Also manifest.json, audit/assessment.json, and one new timestamped ZIP
     # per call -- unconditionally (recovery.py:82), so it grows without bound.
@@ -505,7 +504,7 @@ RECOVER_REPORT = Action(
 )
 SERVE = Action(
     name="serve", summary="用浏览器看一次运行的实时视图", subject=SUBJECT_NONE, run=_run_serve,
-    aliases=("实时页",), keywords=("实时", "浏览器", "serve"),
+    aliases=("实时页",),
     long_running=True, cli_command="serve",
     # Never returns on its own: serve.serve loops until a `stop` event that
     # _run_serve does not yet pass (serve.py:352-355).  Out of the catalogue
@@ -515,7 +514,7 @@ SERVE = Action(
 )
 CONFIG = Action(
     name="config", summary="查看或修改本次会话的配置", subject=SUBJECT_NONE, run=_run_config,
-    aliases=("配置",), keywords=("配置", "设置"),
+    aliases=("配置",),
     cli_command="config",
     # _run_config cannot write; the config write is /save, which confirms.
     impact=("只读：列出当前配置与它们的来源。写入 TOML 是 /save，另行确认。",),

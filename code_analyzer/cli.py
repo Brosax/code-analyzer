@@ -274,14 +274,19 @@ def _spoken(raw_argv: list[str], root_parser: argparse.ArgumentParser) -> int:
 
     A resolved action with a subject runs exactly as the equivalent subcommand
     would.  A bare path does not: a scan is not a side effect, so off a
-    terminal it prints the argv it would have run and exits 2.
+    terminal it prints the argv it would have run and exits 2.  A sentence is
+    refused outright -- see the ASK branch.
     """
     from .intent import ACTION, AMBIGUOUS, ASK, Intent, parse
 
     line = " ".join(raw_argv)
     intent: Intent = parse(line)
     if intent.kind == ASK:
-        print("code-analyzer: error: /ask needs an interactive session; type it in the conversation",
+        # Every unrecognised line now lands here, not just a literal `/ask`.
+        # A headless run must never call a provider and a provider outage must
+        # never move an exit code, so this is refused on a terminal too: a
+        # one-shot argv is not a conversation.
+        print("code-analyzer: error: 这句话需要一个模型来读；在交互式会话里说它：code-analyzer tui",
               file=sys.stderr)
         return 2
     if intent.kind == AMBIGUOUS:
@@ -294,7 +299,7 @@ def _spoken(raw_argv: list[str], root_parser: argparse.ArgumentParser) -> int:
         return 2
     action = by_name(intent.action)
     equivalent = [action.cli_command or action.name, *intent.argv]
-    if intent.confidence == "shorthand" and not _has_tty():
+    if intent.confidence == "path" and not _has_tty():
         print("code-analyzer: error: that reads as:", file=sys.stderr)
         print(f"  code-analyzer {' '.join(equivalent)}", file=sys.stderr)
         print("code-analyzer: run it explicitly, or say it in an interactive session", file=sys.stderr)
