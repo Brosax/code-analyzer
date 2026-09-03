@@ -73,25 +73,53 @@ is a turn you answer in the same place. All of it stays scrollable.
 ▼ 正在扫描 · llm-memory-safety copy.c · 85% · 已运行 03:32 · 静态 3/3 · LLM 1/2
 ```
 
-**What understands you is deterministic.** A slash command, a bare path or a
-short phrase resolves instantly, offline, with nothing reachable. A slash
-command hands its tail to the very parser `code-analyzer analyze` uses, so
-`/scan ~/fw --llm-jobs 4` accepts exactly what the subcommand accepts and
-refuses `--llm-jobs 0` in the same words. What the parser cannot resolve it
-reports as unresolved — a phrase matching two verbs comes back with both
-named, and a directory holding a `manifest.json` comes back with all five
-things one might want from a finished run, because choosing between them is a
-coin flip you can settle instantly.
+**Say anything; the model reads it.** Two shapes resolve instantly and
+offline, because both are unambiguous: a **slash command** and a **bare path
+that exists**. Everything else is a sentence and goes to the model
+automatically — no prefix. A slash command hands its tail to the very parser
+`code-analyzer analyze` uses, so `/scan ~/fw --llm-jobs 4` accepts exactly what
+the subcommand accepts and refuses `--llm-jobs 0` in the same words.
 
-**`/ask` hands a sentence to the model**, and is the only thing here that
-needs a provider. The model may propose any action in the registry, each shown
-unticked with what it would do; a proposed action outside the catalogue is
-dropped by name, a proposed setting is dropped unless `validate_config`
-accepts it, and every drop says why. A ticked step becomes the very command
-you could have typed. The model is given the catalogue, the current paths and
-the settings that differ from default — never a finding, never analyzer
-output, never source. When the provider is unreachable `/ask` says so and
-everything else keeps working.
+Three edges stay deterministic because routing them would be worse. A path
+that does not exist is a typo, and the intent model has no filesystem, so it
+cannot repair one — sending the commonest keyboard error to the most expensive
+operation would be absurd. A directory holding a `manifest.json` has five
+readings and four of them write, and the model would receive exactly what the
+parser received. And `扫描~/fw` is one token — Chinese needs no space — so a
+CJK check keeps it from dead-ending on "no such path".
+
+**What the model may do with what it understood.** It proposes actions from a
+catalogue generated from the registry, so a name it uses is a name that exists.
+An action outside it is dropped by name; a setting is dropped unless
+`validate_config` accepts it; `llm.profile`, `llm.endpoint` and `llm.api_key_env`
+are refused outright, because all three pass validation while silently
+repointing the session at a metered provider. Every drop says why.
+
+A step whose action **writes nothing, spends nothing and blocks on nothing**
+runs immediately — that is `doctor`, `preflight` and `config`, and the set is
+computed from declared effects rather than asserted. Everything else confirms,
+naming the files it is about to replace. A step that changes configuration
+always waits to be ticked, whatever its action's policy. What runs is the very
+command you could have typed, so the one place that confirms cannot be
+bypassed. The model is given the catalogue, the current paths and the settings
+that differ from default — never a finding, never analyzer output, never
+source.
+
+**A minute is a long time, so the wait is honest.** One round trip is 21–31
+seconds measured. While it thinks you see elapsed seconds, which phase it is
+in, and how long the *last* question took — a measurement, labelled as one.
+There is no ETA, because nothing has measured this one. `Ctrl+C` abandons it
+and says plainly that the request may still be running at the provider and its
+answer will be dropped; the first tokens are genuinely uninterruptible and
+pretending otherwise would be a lie. You can keep typing meanwhile — sentences
+queue, slash commands never do, and `Esc` drops the queue.
+
+When the provider is unreachable it says so once, names what still works, and
+offers the command your sentence began with if it began with one. Three
+sentences at a dead host cost one probe (6s), not three (90s). Only free text
+needs a provider: every command, every alias, `/set`, `/config`, bare paths and
+the whole CLI work with nothing reachable, and `CODE_ANALYZER_NO_MODEL=1`
+turns the lane off for good.
 
 **Configuration is part of the conversation.** `/config` lists what is set and
 where it came from, `/config --all` includes the 59 advanced fields, and
@@ -109,6 +137,11 @@ the provider reports its own `outputTokens` it becomes output tokens over
 session seconds, labelled *测量*. When the run settles the block collapses to
 one line with the exit code, the duration and the report directory, and the
 history stays above it.
+
+`code-analyzer <a sentence>` on the command line is refused, on a terminal or
+off one: a headless run must never call a provider, and a provider outage must
+never move an exit code. Naming a directory there prints the command it would
+have run rather than running it — a scan is not a side effect.
 
 `/pause`, `/resume`, `/skip`, `/jobs`, `/retry` and `/decide` steer a run while
 it runs — the single letters that used to do this are now names you can
