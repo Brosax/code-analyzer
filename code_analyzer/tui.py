@@ -896,7 +896,7 @@ class AnalyzerApp(App[TuiOutcome]):
         if question is not None and getattr(question, "question", None) is not None:
             spec = question.question
             if spec.kind == "select":
-                answer = Answer(text=text, selected=spec.preselected if text.strip().lower() in {"y", "yes"} else ())
+                answer = Answer(text=text, selected=self._ticked(spec, text))
         self.dialogue.answer(block_id, answer)
         if self.journal is not None:
             self.journal.answered(block_id, text)
@@ -917,6 +917,25 @@ class AnalyzerApp(App[TuiOutcome]):
             self._run_proposed(text)
         self._update_status()
 
+    @staticmethod
+    def _ticked(spec: Any, text: str) -> tuple[int, ...]:
+        """Which items a select answer names.
+
+        ``y`` keeps its historical meaning -- the pre-ticked set, which is
+        exactly what the build-context dialog's own prompt offers -- and
+        numbers, ranges and `全部` reach the items the dialog draws *unticked*.
+        Without them the checkbox dialog was a yes/no question with checkboxes
+        painted on it: a stub header is offered per item and deliberately never
+        pre-ticked, so until now it could not be accepted at all, in the one
+        front end whose documentation calls this a checkbox dialog.
+        """
+        answer = text.strip().lower()
+        if answer in {"y", "yes", "确认"}:
+            return tuple(spec.preselected)
+        if answer in {"全部", "all", "都要", "都跑"}:
+            return tuple(range(len(spec.options)))
+        return tuple(AnalyzerApp._chosen(text, len(spec.options)))
+
     def _decider(self) -> Any:
         """The build-context patch, asked as the conversation asks anything."""
         from .ask import question_from_decision
@@ -926,6 +945,12 @@ class AnalyzerApp(App[TuiOutcome]):
 
         def decide(request: Any) -> Decision:
             answer = asker(question_from_decision(request))
+            # What the operator ticked, not what the dialog opened with: a
+            # bare `y` still means the pre-ticked set, because `_ticked` says
+            # so, but an answer naming items now reaches the patch instead of
+            # being computed and thrown away.
+            if answer.selected:
+                return Decision("apply", tuple(answer.selected), decided_by="tui")
             if answer.yes:
                 return Decision("apply", tuple(request.preselected), decided_by="tui")
             return Decision("reject", decided_by="tui", note="declined in the conversation")

@@ -1490,3 +1490,57 @@ def test_the_model_thinking_out_loud_reaches_the_wait_block(tmp_path: Path) -> N
             assert "这句属于上一轮" not in _transcript(app)
 
     asyncio.run(exercise())
+
+
+def test_the_checkbox_dialog_accepts_the_items_it_draws_unticked(tmp_path: Path) -> None:
+    """A stub header is offered per item and never pre-ticked.
+
+    Until the answer could name items, the one front end whose documentation
+    calls this a checkbox dialog could only ever accept the pre-ticked subset,
+    so an item the run deliberately left unticked was unreachable.
+    """
+    from code_analyzer.ask import SELECT, Question
+
+    spec = Question(
+        "build-context.r1", SELECT, "Apply the pre-ticked items and re-run? [y/N] ",
+        options=("include root interface/include", "define PLATFORM=1", "stub header psa/crypto.h"),
+        preselected=(0, 1),
+    )
+
+    assert AnalyzerApp._ticked(spec, "y") == (0, 1)
+    assert AnalyzerApp._ticked(spec, "") == ()
+    assert AnalyzerApp._ticked(spec, "n") == ()
+    # The item the dialog drew unticked, and every item.
+    assert AnalyzerApp._ticked(spec, "3") == (2,)
+    assert AnalyzerApp._ticked(spec, "1,3") == (0, 2)
+    assert AnalyzerApp._ticked(spec, "1-3") == (0, 1, 2)
+    assert AnalyzerApp._ticked(spec, "全部") == (0, 1, 2)
+
+
+def test_a_ticked_item_reaches_the_patch_instead_of_being_thrown_away(tmp_path: Path) -> None:
+    from code_analyzer.ask import Answer
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+
+            class _Request:
+                id, kind, summary = "r1", "build-context", "3 item(s)"
+                items = ({"label": "a"}, {"label": "b"}, {"label": "c"})
+                round, probe, evidence_path = 1, None, None
+                preselected = (0, 1)
+
+            answers = iter([
+                Answer(text="全部", selected=(0, 1, 2)),
+                Answer(text="y", selected=(0, 1)),
+                Answer(text="n"),
+            ])
+            app._asker = lambda: (lambda _question: next(answers))  # type: ignore[method-assign]
+            decide = app._decider()
+
+            assert decide(_Request()).selected == (0, 1, 2)
+            assert decide(_Request()).selected == (0, 1)
+            assert decide(_Request()).answer == "reject"
+
+    asyncio.run(exercise())

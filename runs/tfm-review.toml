@@ -53,6 +53,10 @@ scanners = [
   "llm-logic",
 ]
 jobs = 4
+# Measured, not assumed: llm-doctor reports the endpoint serving 24576 while
+# the default config asks for 32768, and a prompt past the served window is
+# truncated silently -- which lowers finding quality invisibly.
+context_window = 24576
 reasoning = "off"
 intent_reasoning = "low"
 max_completion_tokens = 2000
