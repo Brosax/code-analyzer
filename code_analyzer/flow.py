@@ -660,6 +660,15 @@ class RunFlow:
             lanes.append(Lane("llm", "LLM 扫描", fraction, detail))
         return lanes
 
+    def running_producers(self) -> list[str]:
+        """Which producers are running right now, in the panel's own order.
+
+        The collapsed run block names them in one line instead of drawing the
+        whole fan-out.  Reaching into ``nodes`` from a front end is what
+        ``_selected_node`` already does and should not be copied.
+        """
+        return [node.id for node in self._producers() if node.state == "running"]
+
     def llm_active(self) -> bool:
         """Whether any scanner can still take a retry: the LLM lane has not settled."""
         return any(node.kind == "llm" and node.state in {"pending", "running"} for node in self.nodes.values())
