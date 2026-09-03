@@ -206,6 +206,14 @@ class AnalyzerApp(App[TuiOutcome]):
         self._pending_steps: list[Any] = []
         self._queued: list[str] = []
         self._pending_save: Path | None = None
+        # One outstanding provider request per session.  `_ask_generation` is
+        # bumped on abandon so a late answer can be identified and dropped;
+        # `_ask_inflight` stays true until the worker thread actually returns,
+        # because abandoning detaches rather than kills (the SDK exposes no
+        # cancel handle and the runtime only polls between notifications).
+        self._ask_generation = 0
+        self._ask_inflight = False
+        self._last_ask_seconds: float | None = None
 
     # --- the screen ---------------------------------------------------------
 
@@ -266,11 +274,25 @@ class AnalyzerApp(App[TuiOutcome]):
             return
 
         intent = parse(line, self.dialogue.state())
+        by = "model" if intent.kind == ASK else "parser"
+        # A slash command answers in 0 ms and never waits behind a model, so
+        # /cancel and /help stay reachable while one is thinking.  Anything
+        # that would occupy the one busy slot queues instead of being refused.
+        if intent.kind not in {META, CONFIG_SET, CONFIG_SHOW, EMPTY} and self._occupied():
+            self._queued.append(line)
+            self._mount(self.dialogue.said(line, queued=len(self._queued)))
+            if self.journal is not None:
+                self.journal.read_as("queued", intent.action, intent.argv)
+            return
         if self.journal is not None:
-            self.journal.read_as(intent.kind, intent.action, intent.argv)
+            self.journal.read_as(intent.kind, intent.action, intent.argv, by=by)
         reading = "" if intent.confidence == "exact" else (intent.action or "")
-        self._mount(self.dialogue.said(line, reading=reading))
+        self._mount(self.dialogue.said(line, reading=reading, by=by))
         self._route(intent)
+
+    def _occupied(self) -> bool:
+        """Is the one slot that runs things taken?"""
+        return self._busy or self._ask_inflight
 
     def _route(self, intent: Any) -> None:
         if intent.kind == EMPTY:
@@ -383,43 +405,64 @@ class AnalyzerApp(App[TuiOutcome]):
         if not utterance.strip():
             self._mount(self.dialogue.failed("用法：/ask <一句话>"))
             return
-        if self._busy:
-            self._mount(self.dialogue.failed("有操作在跑；等它结束再问"))
+        if self._occupied():
+            self._queued.append(utterance)
+            self._mount(self.dialogue.said(utterance, queued=len(self._queued)))
             return
         self._busy = True
-        self._mount(self.dialogue.say("正在把这句话交给模型…（Ctrl+C 打断）"))
-        self._propose_worker(utterance)
+        self._ask_inflight = True
+        self.cancel_token = CancellationToken()
+        block = self.dialogue.thinking(utterance, last_seconds=self._last_ask_seconds)
+        self._mount(block)
+        self._propose_worker(utterance, self._ask_generation)
 
     @work(thread=True, exclusive=True, group="ask")
-    def _propose_worker(self, utterance: str) -> None:
+    def _propose_worker(self, utterance: str, generation: int) -> None:
         from .llm.propose import propose
 
+        token = self.cancel_token
         try:
             proposal = propose(
                 utterance, self.dialogue.config,
                 source=self.dialogue.source, report_directory=self.dialogue.report_directory,
-                cancelled=(self.cancel_token.is_cancelled if self.cancel_token else None),
+                cancelled=(token.is_cancelled if token else None),
             )
         except Exception as exc:
             self.call_from_thread(
-                self._proposed, None, f"{type(exc).__name__}: {single_line(str(exc))}")
+                self._proposed, None, f"{type(exc).__name__}: {single_line(str(exc))}", generation)
             return
-        self.call_from_thread(self._proposed, proposal, "")
+        self.call_from_thread(self._proposed, proposal, "", generation)
 
-    def _proposed(self, proposal: Any, error: str) -> None:
+    def _proposed(self, proposal: Any, error: str, generation: int = 0) -> None:
         """Render what the model suggested: unticked, itemised, with its reasons."""
         from .dialogue import ProposalBlock
 
+        # Checked first, before any state is touched: an answer to a question
+        # the operator already abandoned must change nothing at all.
+        self._ask_inflight = False
+        if generation != self._ask_generation:
+            self._drain_queue()
+            return
         self._busy = False
+        self.cancel_token = None
+        thinking = self.dialogue.live_thinking()
+        if thinking is not None:
+            thinking.settled = True
+            thinking.summary = ""
+            self._repaint_block(thinking.block_id)
+        if proposal is not None and proposal.duration_seconds:
+            self._last_ask_seconds = proposal.duration_seconds
         if proposal is None or proposal.status == "failed":
             self._mount(self.dialogue.failed(
                 f"模型没能回答：{error or proposal.reason}", ["确定性命令不受影响，/help 列出全部"]))
+            self._drain_queue()
             return
         if proposal.status == "skipped":
             # Provider down is a gate, not a failure: everything else still works.
             self._mount(self.dialogue.say(
                 f"模型不可达：{proposal.reason}",
                 ["确定性命令不受影响：/scan /doctor /config /preflight …，/help 列出全部"]))
+            self._drain_queue()
             return
         notes = []
         if proposal.unclear:
@@ -428,7 +471,11 @@ class AnalyzerApp(App[TuiOutcome]):
             notes.append(f"  已丢弃：{item}")
         if not proposal.steps:
             self._mount(self.dialogue.say("模型没有提出可执行的操作。", notes))
+            self._drain_queue()
             return
+        if self.journal is not None:
+            self.journal.proposed(proposal.steps, proposal.dropped, proposal.unclear,
+                                  proposal.duration_seconds, proposal.model)
         steps = [
             {"action": step.action, "label": step.label(),
              "impact": tuple(filter(None, [step.why, *by_name(step.action).impact]))}
@@ -483,8 +530,10 @@ class AnalyzerApp(App[TuiOutcome]):
             return
         self._busy = True
         block_id = ""
+        # Every action gets a token, because Ctrl+C has to mean cancel for all
+        # of them; only a long-running one gets a RunControl and a run block.
+        self.cancel_token = CancellationToken()
         if action.long_running:
-            self.cancel_token = CancellationToken()
             self.control = RunControl(self.cancel_token,
                                       llm_jobs=int(request.config["llm"].get("jobs") or 1))
             # From the config this run will actually use, not from the session's.
@@ -693,6 +742,15 @@ class AnalyzerApp(App[TuiOutcome]):
 
     @staticmethod
     def _block_text(block: Block) -> Text:
+        from .dialogue import ThinkingBlock
+
+        if isinstance(block, ThinkingBlock):
+            text = Text()
+            for index, line in enumerate(block.render()):
+                if index:
+                    text.append("\n")
+                text.append(line, style="dim" if block.settled else "bold yellow")
+            return text
         style = _BLOCK_STYLES.get(block.kind, "")
         text = Text()
         for index, line in enumerate(block.render()):
@@ -725,6 +783,10 @@ class AnalyzerApp(App[TuiOutcome]):
         run = self.dialogue.live_run()
         if run is not None:
             self._repaint_run(run)
+        # A seconds counter does not need 5 Hz; the 0.2s tick is the run budget.
+        thinking = self.dialogue.live_thinking()
+        if thinking is not None:
+            self._repaint_block(thinking.block_id)
         self._update_status()
 
     def _drain_events(self) -> int:
@@ -866,7 +928,11 @@ class AnalyzerApp(App[TuiOutcome]):
             return
         parts: list[str] = []
         run = self.dialogue.live_run()
-        if run is not None and run.flow is not None:
+        thinking = self.dialogue.live_thinking()
+        if thinking is not None:
+            parts.append(f"模型思考中 {max(0, int(time.time() - thinking.started_at))}s")
+            parts.append("Ctrl+C 放弃")
+        elif run is not None and run.flow is not None:
             head = run.flow.headline(time.time())
             parts.append(f"{head.percent}%")
             if run.flow.llm_enabled:
@@ -876,6 +942,8 @@ class AnalyzerApp(App[TuiOutcome]):
             parts.append("等你回答上面的问题")
         else:
             parts.append(str(self.source))
+        if self._queued:
+            parts.append(f"排队 {len(self._queued)}")
         if self.dirty:
             parts.append("● 配置未保存")
         parts.append("/help")
@@ -936,7 +1004,19 @@ class AnalyzerApp(App[TuiOutcome]):
     # --- actions -------------------------------------------------------------
 
     def action_focus_prompt(self) -> None:
-        self.query_one("#prompt", Input).focus()
+        """Back to the box; on an empty box, drop whatever is queued.
+
+        The queue exists so a minute of thinking does not lock the operator
+        out.  It also needs an undo, or a line typed in haste runs a minute
+        later when they have changed their mind.
+        """
+        prompt = self.query_one("#prompt", Input)
+        if not prompt.value.strip() and self._queued:
+            dropped, self._queued = len(self._queued), []
+            self._mount(self.dialogue.say(f"已清空队列（{dropped} 条）。"))
+            self._update_status()
+        prompt.value = ""
+        prompt.focus()
 
     def action_help(self) -> None:
         self._mount(self.dialogue.say("", help_lines()))
@@ -988,9 +1068,23 @@ class AnalyzerApp(App[TuiOutcome]):
         self._update_status()
 
     def action_cancel_or_exit(self) -> None:
+        """Abandon, cancel, answer, exit -- in that order.
+
+        The old first branch tested ``self.control is not None``, which is None
+        for every action that is not long-running and for the ask lane. So
+        Ctrl+C during a model round trip fell all the way through and **exited
+        the application**, under a block that said 「Ctrl+C 打断」.
+        """
+        thinking = self.dialogue.live_thinking()
+        if thinking is not None:
+            self._abandon_thinking(thinking)
+            return
         run = self.dialogue.live_run()
-        if self._busy and self.control is not None:
-            self.control.cancel("tui")
+        if self._busy and self.cancel_token is not None:
+            if self.control is not None:
+                self.control.cancel("tui")
+            else:
+                self.cancel_token.cancel()
             if run is not None and run.flow is not None:
                 run.flow.mark_stopping()
             self._mount(self.dialogue.say("已请求安全停止；正在等待当前进程终止并回收。"))
@@ -1000,6 +1094,27 @@ class AnalyzerApp(App[TuiOutcome]):
             self._answer_pending(pending.block_id, "")
             return
         self._exit_with_last()
+
+    def _abandon_thinking(self, thinking: Any) -> None:
+        """Detach, which is not the same as killing it.
+
+        ``HarnessRuntime`` polls the cancel predicate only inside its
+        notification callback, and the SDK exposes no cancel handle, so the
+        measured 18-52s before the first token is genuinely uninterruptible.
+        We stop waiting, say so plainly, and drop the answer when it lands.
+        """
+        from .llm.profiles import third_party_warning
+
+        self._ask_generation += 1
+        if self.cancel_token is not None:
+            self.cancel_token.cancel()
+        thinking.settled = True
+        thinking.summary = "已放弃这次理解；请求可能仍在提供方那边跑，晚到的回答会被丢弃。"
+        if third_party_warning(self.dialogue.config["llm"]):
+            thinking.summary += "第三方计费仍会发生。"
+        self._repaint_block(thinking.block_id)
+        self._busy = False
+        self._update_status()
 
     def _exit_with_last(self) -> None:
         if self.journal is not None:

@@ -44,6 +44,7 @@ CONFIG = "config"
 QUESTION = "question"
 ERROR = "error"
 PROPOSAL = "proposal"
+THINKING = "thinking"
 
 # A settled run keeps its summary and lets its turns go: ten scans in one
 # session would otherwise hold ten transcripts of up to 240 turns each, and
@@ -86,11 +87,49 @@ class UserBlock(Block):
     kind: str = USER
     # How it was understood: the action name, or why it could not be.
     reading: str = ""
+    # Who read it -- "parser" or "model".  Worth recording now that both do:
+    # "was that my decision or the model's" is a question a session record
+    # should be able to answer.
+    by: str = "parser"
+    queued: int = 0
 
     def render(self) -> list[str]:
         lines = [f"› {single_line(self.text)}"]
-        if self.reading:
+        if self.queued:
+            lines.append(f"  ↳ 排队中（{self.queued}）")
+        elif self.by == "model":
+            lines.append(f"  ↳ → 模型{(' · ' + single_line(self.reading)) if self.reading else ''}")
+        elif self.reading:
             lines.append(f"  ↳ {single_line(self.reading)}")
+        return lines
+
+
+@dataclass
+class ThinkingBlock(Block):
+    """A model is reading one sentence; this is the only thing on screen.
+
+    It shows elapsed seconds and, once a session has measured one, how long the
+    last question took.  It never shows an ETA: nothing here has measured how
+    long *this* one will take, and the codebase does not invent measurements.
+    """
+
+    kind: str = THINKING
+    utterance: str = ""
+    started_at: float = field(default_factory=time.time)
+    phase: str = "探测端点"
+    last_seconds: float | None = None
+    settled: bool = False
+    abandoned: bool = False
+
+    def render(self, now: float | None = None) -> list[str]:
+        if self.settled:
+            return [f"  {self.summary}"] if self.summary else []
+        now = time.time() if now is None else now
+        elapsed = max(0, int(now - self.started_at))
+        line = f"  正在理解这句话… {elapsed}s · {self.phase} · Ctrl+C 放弃"
+        lines = [line]
+        if self.last_seconds is not None:
+            lines.append(f"     上次 {self.last_seconds:.1f}s（本会话测量）")
         return lines
 
 
@@ -242,8 +281,18 @@ class Dialogue:
             self.report_directory = block.report_directory
         return block
 
-    def said(self, text: str, reading: str = "") -> UserBlock:
-        return self.add(UserBlock(text=text, reading=reading))  # type: ignore[return-value]
+    def said(self, text: str, reading: str = "", by: str = "parser", queued: int = 0) -> UserBlock:
+        return self.add(UserBlock(text=text, reading=reading, by=by, queued=queued))  # type: ignore[return-value]
+
+    def thinking(self, utterance: str, last_seconds: float | None = None) -> ThinkingBlock:
+        return self.add(ThinkingBlock(  # type: ignore[return-value]
+            utterance=utterance, last_seconds=last_seconds, text=utterance))
+
+    def live_thinking(self) -> ThinkingBlock | None:
+        for block in reversed(self.blocks):
+            if isinstance(block, ThinkingBlock) and not block.settled:
+                return block
+        return None
 
     def say(self, text: str, lines: list[str] | None = None) -> SayBlock:
         return self.add(SayBlock(text=text, lines=list(lines or [])))  # type: ignore[return-value]
@@ -314,6 +363,7 @@ class Dialogue:
                 out.append(block.headline())
                 continue
             out.extend(multi_line(line) for line in block.render())
+        out = [line for line in out if line]
         return out[-limit:] if limit else out
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -256,7 +257,8 @@ def test_a_sentence_goes_to_the_model_with_no_prefix_and_the_box_says_so(tmp_pat
                 if not app._busy:
                     break
             text = _transcript(app)
-            assert "正在把这句话交给模型" in text
+            # The record says who read the line.
+            assert "› 帮我看看哪些单元最值得先扫" in text and "↳ → 模型" in text
             # Provider off in the suite: it degrades and names what still works.
             assert "模型不可达" in text
             assert "/help" in text and "确定性命令不受影响" in text
@@ -817,5 +819,141 @@ def test_saving_the_configuration_asks_before_it_replaces_the_file(tmp_path: Pat
             assert target.exists()
             assert "review" in target.read_text(encoding="utf-8")
             assert not app.dirty
+
+    asyncio.run(exercise())
+
+
+# --- waiting, interrupting, queueing -----------------------------------------
+
+
+def _thinking(app: AnalyzerApp, utterance: str = "帮我看看") -> object:
+    """Put the app into the state a real ask puts it in, without a provider."""
+    app._busy = True
+    app._ask_inflight = True
+    app.cancel_token = CancellationToken()
+    block = app.dialogue.thinking(utterance, last_seconds=app._last_ask_seconds)
+    app._mount(block)
+    return block
+
+
+def test_control_c_while_the_model_is_thinking_returns_the_box_and_does_not_exit_the_app(
+    tmp_path: Path,
+) -> None:
+    """It used to exit: the first branch tested `self.control`, which is None here."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            block = _thinking(app)
+            assert app.dialogue.live_thinking() is block
+
+            app.action_cancel_or_exit()
+            await pilot.pause()
+
+            assert app.is_running, "the app must still be up"
+            assert not app._busy and app.dialogue.live_thinking() is None
+            assert app.cancel_token.is_cancelled()
+            assert "已放弃这次理解" in _transcript(app)
+            # Detach, not kill: it says the request may still be running.
+            assert "晚到的回答会被丢弃" in _transcript(app)
+
+    asyncio.run(exercise())
+
+
+def test_an_abandoned_answer_that_arrives_late_is_dropped_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        from code_analyzer.llm.propose import Proposal, Step
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            generation = app._ask_generation
+            _thinking(app)
+            app.action_cancel_or_exit()
+            await pilot.pause()
+            before = len(app.dialogue.blocks)
+
+            # The worker returns after the operator walked away.
+            app._proposed(
+                Proposal("completed", steps=[Step(action="doctor", why="x")]), "", generation)
+            await pilot.pause()
+            assert len(app.dialogue.blocks) == before, "a late answer mounted something"
+            assert app.dialogue.pending_question() is None
+            assert not app._ask_inflight
+
+    asyncio.run(exercise())
+
+
+def test_a_sentence_typed_while_the_model_thinks_is_queued_and_runs_in_order(
+    tmp_path: Path,
+) -> None:
+    """Being locked out for a minute per line is not survivable; it queues."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            _thinking(app)
+
+            app.submit("再看看别的")
+            app.submit("/config")          # a command answers in 0ms, never queues
+            await pilot.pause()
+            assert app._queued == ["再看看别的"]
+            assert "排队中（1）" in _transcript(app)
+            assert "review.fail_on" in _transcript(app), "/config ran while thinking"
+
+            # /cancel stays reachable too, and releases the slot.
+            app.submit("/cancel")
+            await pilot.pause()
+            assert app.dialogue.live_thinking() is None
+
+    asyncio.run(exercise())
+
+
+def test_the_box_says_how_long_it_has_been_thinking_and_never_guesses_how_long_is_left(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._last_ask_seconds = 71.2
+            block = _thinking(app)
+            block.started_at = time.time() - 24
+            block.phase = "等待模型的第一个 token"
+            app._tick_clock()
+            await pilot.pause()
+
+            rendered = "\n".join(block.render())
+            assert "24s" in rendered and "等待模型的第一个 token" in rendered
+            assert "Ctrl+C 放弃" in rendered
+            # A measurement, labelled as one.  And no ETA anywhere.
+            assert "上次 71.2s（本会话测量）" in rendered
+            assert "剩余" not in rendered and "ETA" not in rendered
+            assert "模型思考中 24s" in app.query_one("#status").render().plain
+
+    asyncio.run(exercise())
+
+
+def test_escape_on_an_empty_box_drops_the_queue(tmp_path: Path) -> None:
+    """A line typed in haste must not run a minute later."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            _thinking(app)
+            app.submit("再看看别的")
+            app.submit("还有这个")
+            await pilot.pause()
+            assert len(app._queued) == 2
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._queued == []
+            assert "已清空队列（2 条）" in _transcript(app)
 
     asyncio.run(exercise())

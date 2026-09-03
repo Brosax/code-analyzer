@@ -78,6 +78,25 @@ class Journal:
     def answered(self, question_id: str, answer: str, *, refused: bool = False) -> None:
         self.write("answer", question=question_id, answer=answer, refused=refused)
 
+    def proposed(self, steps: Any, dropped: Any, unclear: str, seconds: Any, model: Any) -> None:
+        """What the model suggested, before anyone ticked anything."""
+        def label(step: Any) -> str:
+            shown = getattr(step, "label", None)
+            return shown() if callable(shown) else str(step)
+
+        self.write("proposal", model=str(model or ""), seconds=seconds,
+                   steps=[label(step) for step in steps or []],
+                   dropped=list(dropped or [])[:20], unclear=unclear or "")
+
+    def auto_ran(self, action: str, subject: Any, reason: str) -> None:
+        """Something ran without a second human beat; the permission is recorded.
+
+        An unattended act must be explicable afterwards, so the clause that
+        permitted it is written down rather than inferred from the registry as
+        it stands weeks later.
+        """
+        self.write("auto", action=action, subject=str(subject) if subject else None, reason=reason)
+
     def finished(self, action: str, exit_code: int, report_directory: Any = None) -> None:
         self.write("result", action=action, exit_code=exit_code,
                    run=str(report_directory) if report_directory else None)

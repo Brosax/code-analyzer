@@ -226,3 +226,37 @@ def test_a_journal_that_cannot_be_read_back_is_empty_rather_than_an_error() -> N
         path.write_text('{"t": "user"}\nnot json\n{"t": "result"}\n', encoding="utf-8")
         assert [record["t"] for record in read_session(path)] == ["user", "result"]
         assert read_session(Path(root) / "absent.jsonl") == []
+
+
+def test_the_session_record_says_whether_the_parser_or_the_model_read_the_line() -> None:
+    """Both read lines now, so "was that mine or the model's" needs an answer."""
+    with tempfile.TemporaryDirectory() as root:
+        journal = Journal(root=Path(root))
+        journal.said("/scan ~/fw")
+        journal.read_as("action", "scan", ("~/fw",), by="parser")
+        journal.said("先体检一下")
+        journal.read_as("ask", "", (), by="model")
+        journal.proposed([], ["目录里没有 'rm -rf' 这个 action"], "说不准", 24.5, "qwen3.8:27b")
+        journal.auto_ran("doctor", None, "auto_run: no writes, no spend, no block")
+        journal.close()
+
+        records = read_session(journal.path)
+        readings = [r for r in records if r["t"] == "intent"]
+        assert [r["by"] for r in readings] == ["parser", "model"]
+        proposal = next(r for r in records if r["t"] == "proposal")
+        assert proposal["model"] == "qwen3.8:27b" and proposal["seconds"] == 24.5
+        assert proposal["dropped"] and proposal["unclear"] == "说不准"
+        auto = next(r for r in records if r["t"] == "auto")
+        assert auto["action"] == "doctor" and "no writes" in auto["reason"]
+
+
+def test_a_thinking_block_never_invents_how_long_is_left() -> None:
+    from code_analyzer.dialogue import ThinkingBlock
+
+    block = ThinkingBlock(utterance="帮我看看", last_seconds=71.2)
+    block.started_at = block.started_at - 24
+    rendered = "\n".join(block.render())
+    assert "24s" in rendered and "上次 71.2s（本会话测量）" in rendered
+    assert "ETA" not in rendered and "剩余" not in rendered
+    # The first question of a session has nothing measured to report.
+    assert "上次" not in "\n".join(ThinkingBlock(utterance="x").render())
