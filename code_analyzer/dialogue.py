@@ -253,7 +253,10 @@ class ProposalBlock(Block):
     settled: bool = False
 
     def render(self) -> list[str]:
-        lines = list(self.lines)
+        # The heading says whether these are about to run or waiting to be
+        # ticked, which is the single most important thing on the block; it was
+        # being dropped because `text` was never rendered.
+        lines = ([self.text] if self.text else []) + list(self.lines)
         for index, step in enumerate(self.steps):
             tick = "x" if index in self.chosen else " "
             lines.append(f"  [{tick}] {step.get('label') or step.get('action')}")

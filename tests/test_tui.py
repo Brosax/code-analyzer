@@ -1064,3 +1064,121 @@ def test_everything_deterministic_still_works_with_no_provider(tmp_path: Path) -
             assert not app._busy
 
     asyncio.run(exercise())
+
+
+# --- consent -----------------------------------------------------------------
+
+
+def _proposal(*steps: object, **kwargs: object) -> object:
+    from code_analyzer.llm.propose import Proposal
+
+    return Proposal("completed", steps=list(steps), duration_seconds=21.0, **kwargs)
+
+
+def _step(action: str, subject: object = None, changes: object = None) -> object:
+    from code_analyzer.llm.propose import Step
+
+    return Step(action=action, subject=subject, changes=dict(changes or {}), why="因为")
+
+
+def test_a_proposal_of_only_read_only_steps_runs_without_a_second_human_beat(
+    tmp_path: Path,
+) -> None:
+    """E2, delivered: doctor / preflight / config need no tick."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._ask_inflight = True
+            app._proposed(_proposal(_step("doctor")), "", app._ask_generation)
+            for _ in range(60):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            text = _transcript(app)
+            assert "只读，直接执行" in text and "[x] /doctor" in text
+            assert app.dialogue.pending_question() is None, "it should not have asked"
+            # And it really ran: doctor reports on the environment.
+            assert "环境就绪" in text or "环境不满足" in text
+
+    asyncio.run(exercise())
+
+
+def test_a_proposal_that_changes_configuration_always_waits_to_be_ticked(
+    tmp_path: Path,
+) -> None:
+    """Config is the model's measured highest-frequency error mode."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._ask_inflight = True
+            # `config` is auto-runnable, but the step carries a /set.
+            app._proposed(_proposal(_step("config", changes={"llm.jobs": 4})), "", app._ask_generation)
+            await pilot.pause()
+            assert app.dialogue.pending_question() is not None
+            assert "默认都不勾选" in _transcript(app)
+
+    asyncio.run(exercise())
+
+
+def test_a_single_writing_step_is_confirmed_once_by_the_action_itself(tmp_path: Path) -> None:
+    """One sentence, one wait, one prompt -- the beats of typing it by hand."""
+
+    async def exercise() -> None:
+        source = tmp_path / "project"
+        (source / "src").mkdir(parents=True)
+        (source / "src" / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._ask_inflight = True
+            app._proposed(_proposal(_step("scan", subject=source)), "", app._ask_generation)
+            for _ in range(60):
+                await pilot.pause()
+                if app.dialogue.pending_question() is not None:
+                    break
+            question = app.dialogue.pending_question()
+            assert question is not None
+            # The action's own confirm, not the tick list.
+            assert question.question.id == "scan.confirm"
+            app.submit("n")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._busy:
+                    break
+
+    asyncio.run(exercise())
+
+
+def test_answering_all_of_them_runs_all_of_them_instead_of_rejecting_everything(
+    tmp_path: Path,
+) -> None:
+    """`y` used to map to an empty preselected set and silently run nothing."""
+    assert AnalyzerApp._chosen("y", 3) == [0, 1, 2]
+    assert AnalyzerApp._chosen("全部", 3) == [0, 1, 2]
+    assert AnalyzerApp._chosen("1,3", 3) == [0, 2]
+    assert AnalyzerApp._chosen("1、2", 3) == [0, 1]
+    assert AnalyzerApp._chosen("1-3", 3) == [0, 1, 2]
+    assert AnalyzerApp._chosen("", 3) == []
+    assert AnalyzerApp._chosen("n", 3) == []
+    assert AnalyzerApp._chosen("9", 3) == []
+
+
+def test_a_ticked_configuration_change_survives_a_value_containing_a_space(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._pending_steps = [_step("config", changes={"build.c_standard": "gnu11 extra"})]
+            app._run_proposed("1")
+            await pilot.pause()
+            # Quoted, so submit() -> shlex.split puts it back together.
+            assert any("'gnu11 extra'" in line for line in app._queued) or \
+                app.dialogue.config["build"]["c_standard"] == "gnu11 extra"
+
+    asyncio.run(exercise())

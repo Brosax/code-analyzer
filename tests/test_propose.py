@@ -381,3 +381,28 @@ def test_the_ttls_are_estimates_and_the_down_one_is_the_shorter() -> None:
     from code_analyzer.llm.propose import GATE_TTL_DOWN, GATE_TTL_OK
 
     assert GATE_TTL_DOWN < GATE_TTL_OK
+
+
+def test_a_model_may_not_repoint_the_session_at_a_different_provider(tmp_path: Path) -> None:
+    """A valid value can still be the wrong kind of change.
+
+    `validate_config` would accept `llm.profile = "openrouter"`; it would also
+    silently move every later request to a metered third party -- and that leaf
+    is what the billing warning reads, so the model could disarm the warning
+    about itself.
+    """
+    source = tmp_path / "project"
+    source.mkdir()
+    text = json.dumps({"steps": [{
+        "action": "scan", "subject": str(source),
+        "set": {"llm.profile": "openrouter", "llm.endpoint": "https://elsewhere/v1",
+                "llm.api_key_env": "STOLEN", "llm.jobs": 4},
+        "why": "更快",
+    }]})
+    ok, _reason, result, _counts = parse_proposal(
+        text, config=_config(), source=source, report_directory=None)
+    assert ok
+    assert result["steps"][0]["set"] == {"llm.jobs": 4}
+    dropped = " ".join(result["dropped"])
+    for leaf in ("llm.profile", "llm.endpoint", "llm.api_key_env"):
+        assert leaf in dropped and "不能由模型改动" in dropped

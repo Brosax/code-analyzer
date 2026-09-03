@@ -382,6 +382,13 @@ def _subject(action: Any, entry: Mapping[str, Any], source: Path | None,
     return candidate, ""
 
 
+# Settings a model may never propose, however valid the value.  A perfectly
+# legal `{"set": {"llm.profile": "openrouter"}}` silently repoints the session
+# at a metered third party -- and `llm.profile` is the very leaf the billing
+# warning reads, so the model could disarm the warning about itself.
+_NEVER_FROM_MODEL = frozenset({"llm.profile", "llm.endpoint", "llm.api_key_env"})
+
+
 def _changes(raw: Any, config: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Only real settings, only values ``validate_config`` accepts."""
     if not isinstance(raw, dict):
@@ -392,6 +399,9 @@ def _changes(raw: Any, config: Mapping[str, Any]) -> tuple[dict[str, Any], list[
         spec = FIELD_BY_PATH.get(str(path))
         if spec is None:
             problems.append(f"没有 {path} 这个配置项")
+            continue
+        if str(path) in _NEVER_FROM_MODEL:
+            problems.append(f"{path} 不能由模型改动（会改变请求发往哪里、由谁计费）")
             continue
         if spec.readonly or spec.kind == "table_list":
             problems.append(f"{path} 不能这样改")

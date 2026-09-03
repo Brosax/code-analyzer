@@ -22,6 +22,7 @@ The models this draws are unchanged: ``RunFlow``, ``chat.Transcript``,
 from __future__ import annotations
 
 import copy
+import shlex
 import threading
 import time
 from collections import deque
@@ -84,6 +85,10 @@ from .runlog import LEVELS, format_line, level_of
 # Keys that only mean something while something is running; check_action frees
 # them for the input box otherwise.
 RUN_ONLY_ACTIONS = frozenset({"cycle_filter", "toggle_prompts", "toggle_log"})
+
+# Whether a model-resolved read-only step runs without a second human beat.
+# One boolean, so the whole of that decision reverts by flipping it.
+AUTO_RUN_READ_ONLY = True
 
 # How many queued events one 5 Hz tick folds at most, and how many liveness
 # events may pile up before the oldest are dropped.  Unchanged.
@@ -483,14 +488,60 @@ class AnalyzerApp(App[TuiOutcome]):
              "impact": tuple(filter(None, [step.why, *by_name(step.action).impact]))}
             for step in proposal.steps
         ]
-        block = ProposalBlock(text="模型建议的操作（默认都不勾选）：", steps=steps, lines=notes)
+        # Every step is auto-runnable and none of them changes configuration:
+        # nothing here writes, spends or blocks, so a second human beat would
+        # be ceremony.  Anything else waits to be ticked.
+        automatic = AUTO_RUN_READ_ONLY and all(self._auto_runnable(step) for step in proposal.steps)
+        block = ProposalBlock(
+            text=("模型理解为（只读，直接执行）：" if automatic else "模型建议的操作（默认都不勾选）："),
+            steps=steps, lines=notes,
+            chosen=tuple(range(len(steps))) if automatic else (),
+        )
         self.dialogue.add(block)
+        block.settled = automatic
         self._mount(block)
+        if automatic:
+            for step in proposal.steps:
+                if self.journal is not None:
+                    self.journal.auto_ran(step.action, step.subject,
+                                          "auto_run: 不写入、不花钱、不阻塞")
+            self._pending_steps = proposal.steps
+            self._run_proposed(",".join(str(index + 1) for index in range(len(steps))))
+            return
         self._pending_steps = proposal.steps
+        if len(proposal.steps) == 1 and not proposal.steps[0].changes:
+            # One step, and it confirms for itself.  Asking to tick it and then
+            # asking again to run it is two prompts for one decision -- typing
+            # `/scan ~/fw` by hand is one, and this should not be worse.
+            block.text = "模型理解为（下面会各自确认）："
+            block.chosen = (0,)
+            block.settled = True
+            self._repaint_block(block.block_id)
+            self._run_proposed("1")
+            return
         self._mount(self.dialogue.ask(Question(
-            "ask.steps", "select", "要执行哪些？输入编号（如 1,2），或直接回车全部拒绝： ",
+            "ask.steps", "select",
+            "要执行哪些？输入编号（如 1,2）、`全部`，或直接回车全部拒绝： ",
             options=tuple(step["label"] for step in steps),
         )))
+
+    @staticmethod
+    def _auto_runnable(step: Any) -> bool:
+        """May a model-inferred step run without a second beat?
+
+        Two conditions, and the second is not implied by the first.  A step
+        that changes configuration never runs unattended whatever its action's
+        policy: configuration is the model's measured highest-frequency error
+        (live, it invented `llm.scanners=['memory-safety']`), and
+        `validate_config` catches an invented leaf but cannot catch a valid
+        value that is simply wrong for what the operator meant.
+        """
+        if getattr(step, "changes", None):
+            return False
+        try:
+            return by_name(step.action).auto_run
+        except UserError:
+            return False
 
     def _offline(self, reason: str, thinking: Any = None) -> None:
         """Provider down is a gate, not a failure -- and it is said once.
@@ -516,11 +567,7 @@ class AnalyzerApp(App[TuiOutcome]):
 
     def _run_proposed(self, text: str) -> None:
         """Turn the ticked steps into the very commands the operator could type."""
-        chosen: list[int] = []
-        for piece in text.replace("，", ",").split(","):
-            piece = piece.strip()
-            if piece.isdigit() and 1 <= int(piece) <= len(self._pending_steps):
-                chosen.append(int(piece) - 1)
+        chosen = self._chosen(text, len(self._pending_steps))
         steps, self._pending_steps = self._pending_steps, []
         if not chosen:
             self._mount(self.dialogue.say("全部拒绝，什么也没执行。"))
@@ -532,12 +579,42 @@ class AnalyzerApp(App[TuiOutcome]):
                 line += f" {step.subject}"
             self._queued.append(line)
             for path, value in step.changes.items():
-                self._queued.insert(len(self._queued) - 1, f"/set {path} {value}")
+                # Quoted, so a value containing a space survives the round trip
+                # through `submit()` -> `shlex.split`.
+                self._queued.insert(len(self._queued) - 1,
+                                    f"/set {path} {shlex.quote(str(value))}")
         self._drain_queue()
 
+    @staticmethod
+    def _chosen(text: str, total: int) -> list[int]:
+        """Which steps the answer names: numbers, ranges, or all of them.
+
+        `y` used to map to the question's `preselected`, which is empty for
+        this question -- so "yes, all of them" selected nothing at all and
+        silently ran nothing.
+        """
+        answer = text.strip().lower()
+        if not answer or answer in {"n", "no", "否", "不", "取消", "全部拒绝"}:
+            return []
+        if answer in {"y", "yes", "全部", "all", "都要", "都跑", "确认"}:
+            return list(range(total))
+        chosen: list[int] = []
+        for piece in answer.replace("，", ",").replace("、", ",").split(","):
+            piece = piece.strip()
+            if "-" in piece:
+                low, _, high = piece.partition("-")
+                if low.strip().isdigit() and high.strip().isdigit():
+                    for index in range(int(low), int(high) + 1):
+                        if 1 <= index <= total:
+                            chosen.append(index - 1)
+                continue
+            if piece.isdigit() and 1 <= int(piece) <= total:
+                chosen.append(int(piece) - 1)
+        return list(dict.fromkeys(chosen))
+
     def _drain_queue(self) -> None:
-        """One queued command at a time; the next starts when this one ends."""
-        while self._queued and not self._busy:
+        """One queued line at a time; the next starts when this one ends."""
+        while self._queued and not self._occupied():
             self.submit(self._queued.pop(0))
 
     # --- running an action ---------------------------------------------------
