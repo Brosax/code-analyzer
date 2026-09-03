@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import IO, Any
 
 from .analysis import AnalysisEvent, EventSink
+from .chat import CHAT_STREAMS
 from .errors import UserError
 from .persist import jsonl_bytes
-from .progress import single_line
+from .progress import multi_line, single_line
 
 EVENTS_FILE = "events.jsonl"
 # The runner announces the run directory with this phase/status pair; the
@@ -42,8 +43,18 @@ def event_record(event: AnalysisEvent) -> dict[str, Any]:
     ``tail -f`` of this file from rewriting the operator's terminal.  The
     ``data`` object gets the same treatment, leaf by leaf, plus size caps so
     one event cannot carry a whole report.
+
+    The model's own half of the conversation is the exception: a prompt preview
+    and an answer are blocks, and ``single_line`` used to collapse the
+    indentation of a source listing and every space of a JSON answer, so the
+    live page -- which reads this file, not the objects -- was showing the
+    operator a reply with its words run together.  Those messages keep their
+    newlines and spacing and lose the same control characters; the encoder
+    escapes the newline, so a ``tail -f`` is no worse off.
     """
-    return {**asdict(event), "message": single_line(event.message), "data": clean_data(event.data)}
+    faithful = event.phase == "output" and (event.stream or "") in CHAT_STREAMS
+    message = multi_line(event.message) if faithful else single_line(event.message)
+    return {**asdict(event), "message": message, "data": clean_data(event.data)}
 
 
 def clean_data(value: Any, *, depth: int = 0, key: str = "") -> Any:

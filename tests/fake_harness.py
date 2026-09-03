@@ -147,13 +147,17 @@ def transport_failed(*, delay: float = 0.0) -> Response:
 def steps(*kinds: str, text: str = "") -> tuple[dict[str, Any], ...]:
     """Script the SDK's step notifications for a display test: ``turn/start``, ``tool/call``, ...
 
-    ``text`` is what an ``assistant/chunk`` text chunk carries.
+    ``text`` is what an ``assistant/chunk`` text chunk carries.  The chunk is
+    shaped as the pinned runtime shapes it -- ``{"type": "text-delta", "text":
+    ..., "index": 0}``, verified against a live Ollama session on 2026-09-03.
+    A fake that scripted ``{"type": "text"}`` instead let the streaming path
+    pass this suite while never firing for a real provider.
     """
     scripted: list[dict[str, Any]] = []
     for index, kind in enumerate(kinds, 1):
         data: dict[str, Any] = {"turn": 1, "step": 1}
         if kind == "assistant/chunk":
-            data["chunk"] = {"type": "text", "text": text}
+            data["chunk"] = {"type": "text-delta", "text": text, "index": 0}
         elif kind == "tool/call":
             data["name"] = "read"
         elif kind == "llm/retry":

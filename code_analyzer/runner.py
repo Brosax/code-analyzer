@@ -533,8 +533,10 @@ def _analyze(
                 progress(f"llm {data['index']}/{data['total']} {producer} {data.get('path', unit)}: {message}")
         def llm_phase(status: str, message: str, data: dict[str, Any] | None = None) -> None:
             window.event(LLM, None, "llm", status, message, data=data)
-        def llm_output(producer: str, unit: str, stream: str, message: str) -> None:
-            event("output", "running", message, tool=producer, unit=unit, stream=stream)
+        def llm_output(
+            producer: str, unit: str, stream: str, message: str, data: dict[str, Any] | None = None,
+        ) -> None:
+            event("output", "running", message, tool=producer, unit=unit, stream=stream, data=data)
         try:
             record = llm_scan.run(
                 source, run_dir, inventory, config, progress,

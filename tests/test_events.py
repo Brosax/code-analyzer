@@ -24,8 +24,9 @@ from code_analyzer.config import (
     load_config,
     save_config_snapshot,
 )
-from code_analyzer.events import EVENTS_FILE, JsonlEventSink, fan_out
+from code_analyzer.events import EVENTS_FILE, JsonlEventSink, event_record, fan_out
 from code_analyzer.llm import scan as llm_scan
+from code_analyzer.persist import jsonl_bytes
 from code_analyzer.runner import _finish_interrupted, _running_state
 from code_analyzer.sanitize import EVENT_LOG_REASON
 
@@ -323,3 +324,23 @@ def test_finish_interrupted_rewrites_running_placeholders(tmp_path: Path) -> Non
     assert manifest["llm"]["status"] == "interrupted" and manifest["llm"]["reason"] == "run interrupted"
     persisted = json.loads((result.report_directory / "manifest.json").read_text(encoding="utf-8"))
     assert persisted["tools"]["cppcheck"]["status"] == "interrupted" and persisted["llm"]["status"] == "interrupted"
+
+
+def test_the_models_half_of_the_conversation_is_recorded_faithfully() -> None:
+    """The live page reads this file, not the objects the TUI folds."""
+    answer = AnalysisEvent(
+        "output", "running", '{\n  "findings": [\x1b[2J{"cwe": "CWE-787"}]\n}',
+        tool="llm-security", unit="u1", stream="answer",
+    )
+    record = event_record(answer)
+    # Indentation and newlines kept -- they are the only structure a JSON
+    # answer has -- and the escape sequence gone all the same.
+    assert record["message"] == '{\n  "findings": [ [2J{"cwe": "CWE-787"}]\n}'
+    # The encoder escapes the newline, so a tail -f still sees one line.
+    assert b"\\n" in jsonl_bytes(record) and jsonl_bytes(record).count(b"\n") == 1
+
+    # Every other message is still collapsed to one line, as the log needs.
+    noisy = AnalysisEvent("output", "running", "a\n  b\tc", tool="cppcheck", unit="u1", stream="stdout")
+    assert event_record(noisy)["message"] == "a b c"
+    unit = AnalysisEvent("unit", "completed", "completed;\n  2 finding(s)", tool="llm-security", unit="u1")
+    assert event_record(unit)["message"] == "completed; 2 finding(s)"

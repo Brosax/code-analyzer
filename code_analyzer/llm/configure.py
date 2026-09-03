@@ -319,7 +319,7 @@ def propose(
     source: Path, run_dir: Path, config: dict[str, Any], *, diagnosis: BuildDiagnosis, deterministic: ConfigPatch,
     inventory: Sequence[Mapping[str, Any]], index: IncludeIndex, round_no: int, samples: Sequence[str] = (),
     progress: Callable[[str], None] | None = None, unit_event: Callable[..., None] | None = None,
-    output_event: Callable[[str, str, str, str], None] | None = None, cancelled: Callable[[], bool] | None = None,
+    output_event: Callable[..., None] | None = None, cancelled: Callable[[], bool] | None = None,
     open_runtime: OpenRuntime | None = None,
 ) -> Proposal:
     """Ask the model once for this round; never raises for a model, endpoint or runtime problem."""

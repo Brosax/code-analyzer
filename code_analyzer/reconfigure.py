@@ -139,7 +139,7 @@ def run_loop(ctx: LoopContext) -> str:
                     index=include_index(inventory), round_no=round_index, samples=samples,
                     progress=lambda message, tool_name=name: progress(f"build-context {tool_name}: {message}"),
                     unit_event=consult_event,
-                    output_event=(lambda producer, unit_id, stream, message: ctx.emit("output", "running", message, tool=producer, unit=unit_id, stream=stream)) if ctx.live_events else None,
+                    output_event=(lambda producer, unit_id, stream, message, data=None: ctx.emit("output", "running", message, tool=producer, unit=unit_id, stream=stream, data=data)) if ctx.live_events else None,
                     cancelled=ctx.cancelled,
                 )
                 llm_block = proposal.as_dict()

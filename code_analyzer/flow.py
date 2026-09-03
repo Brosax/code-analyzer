@@ -117,6 +117,16 @@ _ERROR_REASONS = frozenset({"failed", "timed_out", "interrupted", "transport", "
 
 
 @dataclass(frozen=True)
+class Lane:
+    """One progress bar: an identity, a label, a fraction and what it counts."""
+
+    id: str
+    label: str
+    fraction: float
+    detail: str
+
+
+@dataclass(frozen=True)
 class Headline:
     title: str
     detail: str
@@ -231,6 +241,7 @@ class RunFlow:
         self.llm_in_flight = 0
         self.breaker: str = ""
         self.cache_hits = 0
+        self.measured: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
         self._method_from_config(tools)
         self._seed_from_preflight(preflight)
 
@@ -585,6 +596,15 @@ class RunFlow:
         spent = _count(data.get("prompt_tokens_estimated"))
         if spent is not None:
             self.tokens_spent = max(self.tokens_spent, spent)
+        # The provider's own counts, kept apart from the estimate above: the
+        # budget is reserved on an estimate and spent for real, and a bar that
+        # showed one as the other would be reporting a measurement nobody made.
+        measured = data.get("measured")
+        if isinstance(measured, dict):
+            for key in self.measured:
+                value = _count(measured.get(key))
+                if value is not None:
+                    self.measured[key] = max(self.measured[key], value)
 
     def _absorb_rate(self, data: dict[str, Any]) -> None:
         eta = data.get("eta_seconds")
@@ -617,6 +637,28 @@ class RunFlow:
                 if not transport_only or why in RETRYABLE_CLASSES:
                     ids.append(unit)
         return ids
+
+    def lanes(self) -> list[Lane]:
+        """One bar per lane: how much of it is done, and in what units.
+
+        The overall percent is a weighted window (see runner.WEIGHTS_*), which
+        is the right number for "how far is this run" and the wrong one for
+        "how far is the LLM".  Both are shown, so neither has to stand for the
+        other.
+        """
+        lanes = [Lane("total", "总进度", self.percent, f"{int(self.percent * 100)}%")]
+        static = [node for node in self.nodes.values() if node.kind == "static" and node.status != "disabled"]
+        if static:
+            done = sum(1 for node in static if node.state in {"success", "partial", "failed"})
+            lanes.append(Lane("static", "静态分析", done / len(static), f"{done}/{len(static)} 工具"))
+        if self.llm_enabled:
+            total = self.llm_total or self.llm_planned or 0
+            fraction = (min(self.llm_done, total) / total) if total else 0.0
+            detail = f"{self.llm_done}/{total} 单元" if total else "计划中"
+            if self.llm_unscheduled:
+                detail += f" · {self.llm_unscheduled} 未调度"
+            lanes.append(Lane("llm", "LLM 扫描", fraction, detail))
+        return lanes
 
     def llm_active(self) -> bool:
         """Whether any scanner can still take a retry: the LLM lane has not settled."""

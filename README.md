@@ -84,13 +84,50 @@ node; `F2` hides it entirely and gives the log its rows back.
 `CODE_ANALYZER_NO_ANIMATION=1` and `TERM=dumb` freeze the animation without
 hiding anything, exactly as they do for the CLI spinner.
 
+A run with a model in it opens on the conversation. One turn per scan unit:
+the answer streams in chunk by chunk, tool calls and retries are marked where
+they happened, and a footer settles the account once the session ends —
+throughput, time to the first token, the tokens in and out, the duration, the
+findings. Two speeds are reported and never conflated. While an answer is
+still arriving only its characters can be counted, so the pane divides them by
+the `4` the prompt budget already uses and labels the number *估算* (estimated);
+once the provider reports its own `outputTokens` the pane switches to output
+tokens over session seconds and labels it *测量* (measured). Showing one as the
+other would be reporting a throughput nobody measured. The header strip
+aggregates the same two ways — a 10-second window while answers stream, the
+mean of recent sessions when they do not, and nothing at all once the window
+expires, because a stalled provider must not read as a fast one.
+
+`F6` shows the prompt each unit was sent; it is off by default, because a
+prompt is a whole scan unit plus its context and the skill, and an operator
+watching answers arrive does not want the question repeated in front of every
+one of them. What the pane shows is a preview — 24 lines per block, 4000
+characters in all, each omission marked where it happened — and it points at
+`llm/units/<unit_id>.json`, which holds the prompt in full beside the
+`prompt_sha256` the session's `request.json` records. Prompt previews stay out
+of the log pane, where one of them would bury a page of one-row-per-event
+lines.
+
+Above the panes: the overall progress bar, then one bar per lane — static
+analysis by tool, the LLM lane by unit. The overall number is a weighted sum of
+the lanes, which answers "how far is this run" and cannot answer "how far is
+the LLM"; both are drawn so neither has to stand for the other.
+
 The run is controllable while it runs: `p`/`P` pause and resume the LLM or
 static lane at the next unit boundary, `s` skips the selected producer's
 remaining units, `+`/`-` change the LLM concurrency, `r` re-runs the LLM units
 that never got an answer as a round of their own, `d` reopens a deferred
-build-context patch dialog, `Enter` shows a node's reasons and steps, `F3`/`F4`
-switch the side pane and the log filter. Every action is journalled as a
-`control/*` line in `events.jsonl` and `logs/runner.log`.
+build-context patch dialog, `Enter` shows a node's reasons and steps,
+`F3`/`F4`/`F6` switch the side pane, the log filter and the prompts. Every
+action is journalled as a `control/*` line in `events.jsonl` and
+`logs/runner.log`.
+
+The transcript is a live view, not evidence: 240 turns, 400 answer lines each,
+older ones summarised as `… 更早的 N 个单元` and a turn still streaming never
+evicted. Under display overload answer chunks are dropped before state events,
+so a busy interface cannot make a counter lie. `code-analyzer serve` lays the
+same run out the same way in the browser, from the same events, with a
+checkbox where the TUI has `F6`.
 
 During a scan, `Ctrl+C` requests cooperative cancellation. Running process
 groups receive the same bounded TERM/KILL cleanup as the CLI; an existing run

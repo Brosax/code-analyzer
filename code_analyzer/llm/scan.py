@@ -71,6 +71,13 @@ TOKEN_ACCOUNTING = (
     "budget: estimated (prompt characters / 4, completion reserved at max_completion_tokens); "
     "measured: the provider's own per-request counts, summed"
 )
+# How much of a unit's prompt the live view is shown.  The whole prompt is a
+# skill, a source listing and its context; it is persisted per unit under
+# llm/units/ and digested in the session's request.json, and every event also
+# lands in events.jsonl -- so what travels through the event stream is a
+# bounded preview of each block, not the prompt itself.
+PROMPT_PREVIEW_BLOCK_LINES = 24
+PROMPT_PREVIEW_CHARS = 4000
 
 Task = tuple[int, str, dict[str, Any]]
 OpenRuntime = Callable[[str, str, dict[str, Any]], ContextManager[Any]]
@@ -85,7 +92,7 @@ def run(
     *,
     cancelled: Callable[[], bool] | None = None,
     unit_event: Callable[..., None] | None = None,
-    output_event: Callable[[str, str, str, str], None] | None = None,
+    output_event: Callable[..., None] | None = None,
     open_runtime: OpenRuntime | None = None,
     phase_event: Callable[..., None] | None = None,
     control: Any = None,
@@ -624,7 +631,7 @@ class _Phase:
         cache: _Cache,
         progress: Callable[[str], None],
         unit_event: Callable[[str, str, str, str, float | None], None],
-        output_event: Callable[[str, str, str, str], None] | None,
+        output_event: Callable[..., None] | None,
         cancelled: Callable[[], bool] | None,
         open_runtime: OpenRuntime | None,
         phase_event: Callable[..., None] | None = None,
@@ -787,6 +794,7 @@ class _Phase:
         )
         beat.start()
         self._step(producer, unit_id, "replaying" if cached is not None else "prompting")
+        self._prompt_event(producer, unit_id, blocks, prompt)
         try:
             runtime: ContextManager[Any] = (
                 _Replay(settings, cached) if cached is not None
@@ -1037,28 +1045,73 @@ class _Phase:
 
         def forward(event: dict[str, Any]) -> None:
             kind, data = _unwrap_notification(event)
-            text = None
+            # The stream names the kind of thing the model did, so a live view
+            # can lay the exchange out as a conversation instead of re-parsing
+            # a prefixed line: `answer` is the reply itself, `tool` is a call
+            # the agent made, `note` is anything said about the request.
+            stream = text = None
             if kind == "turn/start":
                 step("waiting")
             elif kind == "assistant/chunk":
                 chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
-                if chunk.get("type") == "text" and chunk.get("text"):
+                # "text-delta" is what the pinned runtime actually sends, one
+                # per token group (verified against a live Ollama session on
+                # 2026-09-03: 194 of them for one 776-character answer).
+                # "text" is accepted beside it because a chunk carrying a whole
+                # block in one piece is the same fact.
+                if chunk.get("type") in {"text-delta", "text"} and chunk.get("text"):
                     step("streaming")
-                    text = str(chunk["text"])[:2000]
+                    stream, text = "answer", str(chunk["text"])[:2000]
             elif kind.startswith("tool/call"):
                 name = str(data.get("name") or data.get("tool") or "")
                 step("reading", name)
-                text = f"tool {name}".strip()
+                stream, text = "tool", name.strip()
             elif kind == "llm/retry":
                 failure = data.get("failure") if isinstance(data.get("failure"), dict) else {}
                 step("retry", f"{data.get('retry')}/{data.get('maxRetries')} {failure.get('code') or ''}".strip())
+                stream = "note"
                 text = f"retry {data.get('retry')}/{data.get('maxRetries')}: {failure.get('code')} {failure.get('message')}"
             elif kind == "turn/end":
                 step("parsing")
             if text is not None and self.output_event is not None:
-                self.output_event(producer, unit_id, "agent", f"{kind}: {text}".strip())
+                self.output_event(producer, unit_id, stream, text, data={"event": kind})
 
         return forward
+
+    def _prompt_event(self, producer: str, unit_id: str, blocks: list[dict[str, Any]], prompt: str) -> None:
+        """Announce the prompt this unit was sent, block by block and bounded.
+
+        A preview, not the prompt: see PROMPT_PREVIEW_CHARS.  Each block keeps
+        its own head so the preview has the shape of the real thing -- skill,
+        unit header, context, source -- rather than being the skill alone,
+        which is what a flat head of a prompt this size always is.
+        """
+        if self.output_event is None:
+            return
+        lines: list[str] = []
+        omitted = 0
+        budget = PROMPT_PREVIEW_CHARS
+        for block in blocks:
+            body = str(block.get("text", "")).splitlines()
+            head = body[:PROMPT_PREVIEW_BLOCK_LINES]
+            kept = []
+            for line in head:
+                if budget - len(line) < 0:
+                    break
+                budget -= len(line) + 1
+                kept.append(line)
+            lines.extend(kept)
+            rest = len(body) - len(kept)
+            if rest > 0:
+                omitted += rest
+                lines.append(f"…（本段另有 {rest} 行）")
+        self.output_event(producer, unit_id, "prompt", "\n".join(lines), data={
+            "chars": len(prompt),
+            "lines": prompt.count("\n") + 1,
+            "omitted_lines": omitted,
+            "estimated_tokens": max(1, math.ceil(len(prompt) / CHARS_PER_TOKEN)),
+            "blocks": len(blocks),
+        })
 
     def _facts(self, index: int, unit: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1131,6 +1184,9 @@ class _Phase:
             "finding_count": record.get("finding_count", 0), "malformed_count": record.get("malformed_count", 0),
             "valid_report": record.get("valid_report"),
             "cache_hit": bool(cache.get("hit")), "source_run": cache.get("source_run"),
+            # The provider's own counts for this session, so a live view can
+            # state a measured throughput instead of an estimated one.
+            "usage": record.get("usage_measured"),
         })
         return record
 

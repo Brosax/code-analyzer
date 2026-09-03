@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 
 from code_analyzer.analysis import (
     AnalysisEvent,
@@ -448,5 +449,169 @@ def test_r_opens_the_retry_dialog_while_the_llm_lane_runs_and_asks_the_control(t
             await pilot.click("#retry")
             await pilot.pause()
             assert app.control.drain_retries("llm") is None
+
+    asyncio.run(exercise())
+
+
+def _llm_app(tmp_path: Path) -> AnalyzerApp:
+    app = AnalyzerApp(tmp_path)
+    app.config["llm"]["enabled"] = True
+    app.config["llm"]["scanners"] = ["llm-security"]
+    return app
+
+
+def test_a_run_with_a_model_opens_on_the_conversation_and_a_static_run_does_not(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = _llm_app(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            assert app._pane == "chat" and app.query_one("#run-chat").display
+            assert not app.query_one("#run-log").display
+            # F3 walks every pane and comes back; 对话 is one of them.
+            seen = [app._pane]
+            for _step in range(len(app._pane_order())):
+                await pilot.press("f3")
+                await pilot.pause()
+                seen.append(app._pane)
+            assert seen == ["chat", "log", "llm", "problems", "chat"]
+
+        static = AnalyzerApp(tmp_path)
+        async with static.run_test(size=(120, 40)) as pilot:
+            _running(static)
+            await pilot.pause()
+            # Nothing answers in a static-only run, so the log opens as before.
+            assert static._pane == "log" and static.query_one("#run-log").display
+            assert static._pane_order() == ["log", "problems"]
+
+    asyncio.run(exercise())
+
+
+def test_the_answer_streams_into_the_conversation_pane_and_the_prompt_waits_for_f6(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = _llm_app(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(app, AnalysisEvent("llm", "started", "llm starting", data={"model": "qwen3.8:27b"}))
+            _feed(app, AnalysisEvent(
+                "unit", "started", "scanning (high)", tool="llm-security", unit="a.c:f",
+                data={"index": 1, "total": 3, "path": "a.c", "tier": "high"},
+            ))
+            _feed(app, AnalysisEvent(
+                "output", "running", "# Scan unit\n\nfile: a.c", tool="llm-security", unit="a.c:f",
+                stream="prompt", data={"chars": 8000},
+            ))
+            _feed(app, AnalysisEvent(
+                "output", "running", '{"findings": []}', tool="llm-security", unit="a.c:f", stream="answer",
+            ))
+            await pilot.pause()
+            panel = app.query_one("#run-chat")
+            assert '{"findings": []}' in panel.render().plain
+            assert "file: a.c" not in panel.render().plain
+            assert "显示提示词" in str(panel.border_title)
+            # A prompt preview is thousands of characters of source: the log
+            # pane must not repeat it one row at a time.
+            assert not any("Scan unit" in line for line in app._pending_log_lines)
+
+            await pilot.press("f6")
+            await pilot.pause()
+            assert app._show_prompts and "file: a.c" in app.query_one("#run-chat").render().plain
+            assert "隐藏提示词" in str(app.query_one("#run-chat").border_title)
+
+    asyncio.run(exercise())
+
+
+def test_a_long_answer_is_wrapped_to_the_pane_and_the_tail_still_fits(tmp_path: Path) -> None:
+    """An answer is one JSON document on one line; the pane has to break it."""
+
+    async def exercise() -> None:
+        app = _llm_app(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(app, AnalysisEvent(
+                "unit", "started", "scanning", tool="llm-security", unit="a.c:f",
+                data={"index": 1, "total": 1, "path": "a.c"},
+            ))
+            _feed(app, AnalysisEvent(
+                "output", "running", '{"findings": [' + "x" * 4000 + "]}", tool="llm-security",
+                unit="a.c:f", stream="answer",
+            ))
+            await pilot.pause()
+            panel = app.query_one("#run-chat")
+            rendered = panel.render().plain.splitlines()
+            # Every row fits the pane, and there are no more rows than rows.
+            assert len(rendered) <= max(3, panel.size.height)
+            assert all(cell_len(row) <= panel.size.width for row in rendered)
+            # The tail is what is kept: the end of the answer, not its start.
+            assert rendered[-1].endswith("]}") or "tok" in rendered[-1]
+            assert "x" * 40 in panel.render().plain
+
+    asyncio.run(exercise())
+
+
+def test_the_lane_bars_and_the_speed_strip_report_what_was_measured(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = _llm_app(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            _feed(app, AnalysisEvent("llm", "started", "llm starting", data={"model": "qwen3.8:27b"}))
+            _feed(app, AnalysisEvent("llm", "planned", "planned", data={"units": 4, "tasks": 4, "scanners": 1}))
+            _feed(app, AnalysisEvent(
+                "tool", "completed", "cppcheck finished with status completed", tool="cppcheck", progress=0.3,
+            ))
+            _feed(app, AnalysisEvent(
+                "unit", "completed", "completed; 1 finding(s)", tool="llm-security", unit="a.c:f", progress=0.4,
+                data={"index": 1, "total": 4, "path": "a.c", "finding_count": 1, "duration_seconds": 2.0,
+                      "usage": {"prompt_tokens": 3000, "completion_tokens": 300, "requests": 1}},
+            ))
+            _feed(app, AnalysisEvent("unit", "heartbeat", "heartbeat", tool="llm-security", unit="b.c:g", data={
+                "measured": {"prompt_tokens": 3000, "completion_tokens": 300, "requests": 1},
+                "tok_s": 88.0, "eta_seconds": 90.0, "in_flight": 2,
+            }))
+            await pilot.pause()
+            bars = app.query_one("#run-bars").render().plain
+            # One bar per lane the overall percentage is a weighted sum of.
+            assert "静态分析" in bars and "1/3 工具" in bars
+            # The label column is padded by display width, so a CJK label and
+            # an ASCII one start their bars in the same terminal column --
+            # which is a count of cells, not of characters.
+            starts = {cell_len(line[: min(line.index("█") if "█" in line else 999, line.index("░"))])
+                      for line in bars.splitlines()}
+            assert starts == {12}
+            assert "LLM 扫描" in bars and "1/4 单元" in bars
+            assert "█" in bars and "░" in bars
+            speed = app.query_one("#run-speed").render().plain
+            assert "88.0 tok/s（会话均值）" in speed and "输出 300 tok（测量）" in speed
+            assert "在途 2" in speed and "ETA 01:30" in speed
+            # 300 output tokens over a 2.0s session: the peak is a measurement.
+            assert speed.startswith("⚡ qwen3.8:27b") and "峰值 150.0" in speed
+            assert speed.count("⚡") == 1
+
+    asyncio.run(exercise())
+
+
+def test_answer_chunks_queue_as_liveness_and_never_displace_a_state_event(tmp_path: Path) -> None:
+    """An overloaded display drops answer text, not the counters."""
+
+    async def exercise() -> None:
+        app = _llm_app(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            _running(app)
+            await pilot.pause()
+            for _index in range(6000):
+                app._event_from_worker(AnalysisEvent(
+                    "output", "running", "chunk", tool="llm-security", unit="a.c:f", stream="answer",
+                ))
+            app._event_from_worker(AnalysisEvent(
+                "unit", "completed", "completed", tool="llm-security", unit="a.c:f",
+                data={"index": 1, "total": 1, "finding_count": 3},
+            ))
+            assert len(app._liveness_events) == 5000 and len(app._pending_events) == 1
+            app._tick_flow()
+            await pilot.pause()
+            assert app.chat is not None and app.chat.turns()[0].findings == 3
 
     asyncio.run(exercise())

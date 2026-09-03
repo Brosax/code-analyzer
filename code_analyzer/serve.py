@@ -27,6 +27,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from .analysis import AnalysisEvent, AnalysisRequest, CancellationToken, run_analysis
+from .chat import CONVERSANTS
 from .control import LANES, RunControl
 from .errors import UserError
 from .events import RUN_DIRECTORY_PHASE, clean_data
@@ -362,8 +363,17 @@ def serve(
 
 
 def page() -> str:
-    """The live page with the shared state glyphs injected, so the two front ends agree."""
-    return PAGE.replace("__STATE_GLYPHS__", json.dumps(STATE_GLYPHS, ensure_ascii=False))
+    """The live page with the shared vocabularies injected, so the two front ends agree.
+
+    The state glyphs and the set of producers that talk to a model both come
+    from Python: two front ends that disagree about either would be showing
+    the operator two different runs.
+    """
+    return (
+        PAGE
+        .replace("__STATE_GLYPHS__", json.dumps(STATE_GLYPHS, ensure_ascii=False))
+        .replace("__CONVERSANTS__", json.dumps(sorted(CONVERSANTS), ensure_ascii=False))
+    )
 
 
 PAGE = r"""<!doctype html>
@@ -387,6 +397,16 @@ button[disabled]{opacity:.5;cursor:default}
 .node b{display:block;font-weight:600}.node span{color:var(--muted)}
 .log{background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:.6rem .8rem;max-height:22rem;overflow:auto;font-family:var(--mono);font-size:.8rem;white-space:pre-wrap}
 .muted{color:var(--muted)}.small{font-size:.8rem}a{color:inherit}
+.lanes{display:grid;gap:.35rem;margin:.6rem 0}
+.lane{display:flex;gap:.6rem;align-items:center;font-family:var(--mono);font-size:.8rem}
+.lane b{font-weight:600;min-width:6rem}.lane span{color:var(--muted);min-width:9rem}
+.turn{border-top:1px solid var(--line);padding:.5rem 0}.turn:first-child{border-top:0}
+.turn b{display:block;font-weight:600}
+.turn.bad b{color:var(--bad)}.turn.done b{color:var(--ok)}.turn.live b{color:var(--run)}
+.turn pre{margin:.3rem 0;white-space:pre-wrap;word-break:break-word}
+.turn .ask{margin:.3rem 0;padding:.3rem .5rem;border-left:3px solid var(--part);color:var(--muted);white-space:pre-wrap}
+.turn .meta{color:var(--muted)}
+#chat{max-height:30rem}
 </style></head><body><main>
 <h1>code-analyzer · <span id="title">live</span> <span class="muted small" id="state"></span></h1>
 <div class="bar"><div class="track"><div class="fill" id="fill"></div></div><span id="pct">0%</span>
@@ -394,16 +414,263 @@ button[disabled]{opacity:.5;cursor:default}
 <div class="bar" id="controls" hidden><button id="pause-llm">暂停 LLM</button><button id="pause-static">暂停静态</button>
 <button id="jobs-down">并发 −</button><span id="jobs">并发 -</span><button id="jobs-up">并发 +</button><button id="retry-llm">重试 LLM</button><span class="muted small" id="control-state"></span></div>
 <div class="log" id="decision" hidden></div>
+<div class="lanes" id="lanes"></div>
+<h2>对话 / Conversation <span class="muted small" id="chat-stats"></span></h2>
+<div class="bar"><span id="speed" class="muted">等待模型的第一个 token…</span>
+<label class="small"><input type="checkbox" id="show-prompts"> 显示发送给模型的提示词</label></div>
+<div class="log" id="chat"><span class="muted">等待模型的第一次回复…</span></div>
 <h2>DAG</h2><div class="dag" id="dag"></div>
 <h2>Events</h2><div class="log" id="log"></div>
-<p class="muted small">此页面只读取 events.jsonl 与 manifest.json；节点状态是 manifest 的投影，不是另一份事实。</p>
+<p class="muted small">此页面只读取 events.jsonl 与 manifest.json；节点状态是 manifest 的投影，不是另一份事实。
+提示词与回复均为预览：完整内容在报告目录的 llm/units/ 与 llm/sessions/ 下。</p>
 </main><script>
 (() => {
   const $ = id => document.getElementById(id);
   const line = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = String(text); return n; };
   // Injected from status.STATE_GLYPHS by serve.page(): one vocabulary for both front ends.
   const glyph = __STATE_GLYPHS__;
+  // Injected from chat.CONVERSANTS: a native analyzer emits unit events of the
+  // same shape, and a subprocess is not an exchange with a model.
+  const CONVERSANTS = new Set(__CONVERSANTS__);
   let progress = 0, ended = false;
+
+  /* ---------- the run as a conversation ----------
+     The same model as code_analyzer/chat.py, over the same events: one turn
+     per scan unit, the answer as it streams, and two speeds that are never
+     conflated -- an estimate from characters while the answer is arriving,
+     the provider's own count once the session settles. */
+  const CHARS_PER_TOKEN = 4, MAX_TURNS = 120, MAX_ANSWER = 20000, RATE_WINDOW = 10;
+  const CHAT_STREAMS = { prompt: 1, answer: 1, tool: 1, note: 1 };
+  const LABELS = { waiting: "等待模型", streaming: "接收中", reading: "读取工具", parsing: "解析响应",
+    completed: "完成", partial: "截断", failed: "失败", timed_out: "超时", interrupted: "已中断",
+    unscheduled: "未调度", cached: "缓存命中" };
+  const SETTLED = { completed: 1, partial: 1, failed: 1, timed_out: 1, interrupted: 1, unscheduled: 1 };
+  const BAD = { failed: 1, timed_out: 1, interrupted: 1, unscheduled: 1 };
+  const turns = new Map();
+  const conversant = (producer) => !!producer && (CONVERSANTS.has(producer)
+    || [...turns.values()].some(t => t.producer === producer));
+  // The same quantity counted two ways: the phase publishes its ledger on a
+  // heartbeat, so the last session's usage lands after the last heartbeat and
+  // the ledger alone under-reports the end of every run.  Neither can exceed
+  // the truth, so the strip shows whichever has seen more.
+  const totals = { prompt_tokens: 0, completion_tokens: 0, requests: 0 };
+  const fromTurns = { prompt_tokens: 0, completion_tokens: 0, requests: 0 };
+  const total = k => Math.max(totals[k], fromTurns[k]);
+  let model = "", eta = null, sessionRate = null, inFlight = 0, peak = null, dropped = 0;
+  let recent = [], chatDirty = false, runClock = 0;
+  const num = n => (n || 0).toLocaleString("en-US");
+  const clock = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    const pad = v => String(v).padStart(2, "0"); return h ? pad(h) + ":" + pad(m) + ":" + pad(x) : pad(m) + ":" + pad(x); };
+
+  const turnOf = (e) => {
+    const key = e.tool + "/" + e.unit;
+    let t = turns.get(key);
+    if (!t) {
+      t = { key: key, producer: e.tool, unit: e.unit, path: "", tier: "", index: null, total: null,
+            state: "waiting", started: e.timestamp, first: null, last: null, prompt: "", promptChars: 0,
+            promptOmitted: 0, answer: "", answerChars: 0, answerCut: false, tools: [], notes: [], cached: false,
+            duration: null, ct: null, pt: null, findings: null, malformed: null, reason: "", finish: "" };
+      turns.set(key, t);
+      // Forget the oldest settled turn; one still streaming is the one being watched.
+      while (turns.size > MAX_TURNS) {
+        const stale = [...turns.keys()].find(k => SETTLED[turns.get(k).state]);
+        if (!stale) break;
+        turns.delete(stale); dropped += 1;
+      }
+    }
+    return t;
+  };
+
+  const speedOf = t => {
+    if (t.ct && t.duration) return [Math.round(t.ct / t.duration * 10) / 10, "测量"];
+    if (t.first !== null && t.last !== null && t.answerChars && t.last - t.first >= 0.05) {
+      return [Math.round(t.answerChars / CHARS_PER_TOKEN / (t.last - t.first) * 10) / 10, "估算"];
+    }
+    return [null, ""];
+  };
+
+  // Measured against the run's own clock, not the browser's: the timestamps in
+  // the stream are the server's, and a stream that has gone quiet must report
+  // no current speed rather than the last one it saw -- a stalled provider is
+  // not a fast one.  Heartbeats keep this clock moving while a unit is silent.
+  const liveRate = () => {
+    const window = recent.filter(r => r[0] >= runClock - RATE_WINDOW);
+    if (window.length < 2) return null;
+    const span = window[window.length - 1][0] - window[0][0];
+    if (span < 0.05) return null;
+    return Math.round(window.reduce((a, r) => a + r[1], 0) / CHARS_PER_TOKEN / span * 10) / 10;
+  };
+
+  const foldTotals = (d) => {
+    if (!d) return;
+    if (d.measured) { for (const k in totals) { const v = d.measured[k]; if (typeof v === "number" && v > totals[k]) totals[k] = v; } }
+    if (typeof d.eta_seconds === "number") eta = d.eta_seconds;
+    if (typeof d.tok_s === "number") sessionRate = d.tok_s;
+    if (typeof d.in_flight === "number") inFlight = d.in_flight;
+  };
+
+  const foldChat = (e) => {
+    const d = e.data || {};
+    if (e.phase === "llm") {
+      if (d.model) model = String(d.model);
+      // A phase that has ended has nothing in flight; the last heartbeat is
+      // not the last word.
+      if (SETTLED[e.status] && inFlight) { inFlight = 0; return true; }
+      return false;
+    }
+    if (e.phase === "output") {
+      if (!CHAT_STREAMS[e.stream] || !e.tool || !e.unit || !conversant(e.tool)) return false;
+      const t = turnOf(e);
+      if (e.stream === "prompt") {
+        t.prompt = String(e.message || ""); t.promptChars = d.chars || t.prompt.length;
+        t.promptOmitted = d.omitted_lines || 0;
+      } else if (e.stream === "answer") {
+        const text = String(e.message || "");
+        if (!text) return false;
+        if (t.first === null) t.first = e.timestamp;
+        t.last = e.timestamp; t.answerChars += text.length;
+        const joined = t.answer + text;
+        if (joined.length > MAX_ANSWER) t.answerCut = true;
+        t.answer = joined.slice(-MAX_ANSWER);
+        if (t.state === "waiting" || t.state === "reading") t.state = "streaming";
+        const now = e.timestamp;
+        recent.push([now, text.length]);
+        recent = recent.filter(r => r[0] >= now - RATE_WINDOW);
+      } else if (e.stream === "tool") {
+        t.tools.push(String(e.message || "")); if (!SETTLED[t.state]) t.state = "reading";
+      } else { t.notes.push(String(e.message || "")); }
+      return true;
+    }
+    if (e.phase !== "unit" || !conversant(e.tool)) return false;
+    if (e.status === "heartbeat" || e.status === "info" || !e.unit) { foldTotals(d); return true; }
+    const t = turnOf(e);
+    foldTotals(d);
+    if (d.path) t.path = String(d.path);
+    if (d.tier) t.tier = String(d.tier);
+    if (typeof d.index === "number") t.index = d.index;
+    if (typeof d.total === "number") t.total = d.total;
+    if (e.status === "started") { t.started = e.timestamp; t.cached = !!d.cached; t.state = d.cached ? "cached" : "waiting"; return true; }
+    if (e.status === "step") { const w = String(d.step || ""); if (LABELS[w] && !SETTLED[t.state]) t.state = w; return true; }
+    if (SETTLED[e.status]) {
+      t.state = e.status; t.reason = String(d.reason || ""); t.finish = String(d.finish_reason || "");
+      t.duration = typeof d.duration_seconds === "number" ? d.duration_seconds : null;
+      t.findings = typeof d.finding_count === "number" ? d.finding_count : null;
+      t.malformed = d.malformed_count || 0;
+      if (d.cache_hit) t.cached = true;
+      const u = d.usage || {};
+      t.pt = typeof u.prompt_tokens === "number" ? u.prompt_tokens : null;
+      t.ct = typeof u.completion_tokens === "number" ? u.completion_tokens : null;
+      for (const k in fromTurns) { if (typeof u[k] === "number" && u[k] > 0) fromTurns[k] += u[k]; }
+      const sp = speedOf(t);
+      if (sp[1] === "测量" && (peak === null || sp[0] > peak)) peak = sp[0];
+      return true;
+    }
+    return true;
+  };
+
+  const headerOf = (t) => {
+    const mark = BAD[t.state] ? "✕" : (SETTLED[t.state] ? "✓" : "●");
+    const bits = [mark + " " + t.producer, t.path || t.unit];
+    if (t.index && t.total) bits.push(t.index + "/" + t.total);
+    if (t.tier) bits.push(t.tier);
+    bits.push((LABELS[t.state] || t.state) + (t.cached && SETTLED[t.state] ? " · 缓存" : ""));
+    return bits.filter(Boolean).join(" · ");
+  };
+
+  const footerOf = (t) => {
+    const bits = [], sp = speedOf(t);
+    if (sp[0] !== null) bits.push(sp[0] + " tok/s（" + sp[1] + "）");
+    if (t.first !== null && t.started) bits.push("首字 " + Math.max(0, t.first - t.started).toFixed(1) + "s");
+    if (t.ct) bits.push("输出 " + num(t.ct) + " tok");
+    else if (t.answerChars) bits.push("输出 ~" + num(Math.floor(t.answerChars / CHARS_PER_TOKEN)) + " tok");
+    if (t.pt) bits.push("输入 " + num(t.pt) + " tok");
+    if (t.duration !== null) bits.push("耗时 " + t.duration.toFixed(1) + "s");
+    if (t.findings !== null && SETTLED[t.state]) bits.push("发现 " + t.findings);
+    if (t.malformed) bits.push("格式错误 " + t.malformed);
+    if (t.reason && BAD[t.state]) bits.push(t.reason);
+    else if (t.finish && t.state === "partial") bits.push(t.finish);
+    return bits.join(" · ");
+  };
+
+  const drawChat = () => {
+    const showPrompts = $("show-prompts").checked;
+    const box = $("chat");
+    const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.replaceChildren();
+    const list = [...turns.values()];
+    if (!list.length) { box.append(line("span", "muted", "等待模型的第一次回复…")); }
+    if (dropped) box.append(line("div", "muted small", "… 更早的 " + dropped + " 个单元已从本页折叠（完整记录见报告目录）"));
+    list.forEach(t => {
+      const cls = BAD[t.state] ? "bad" : (SETTLED[t.state] ? "done" : "live");
+      const box2 = line("div", "turn " + cls);
+      box2.append(line("b", "", headerOf(t)));
+      if (showPrompts && t.prompt) {
+        // The preview carries a marker per block for what the sender left out,
+        // so this line points at the whole prompt rather than re-counting it.
+        box2.append(line("div", "ask", "▸ 发送的提示词 · " + num(t.promptChars) + " 字符 · 约 "
+          + num(Math.ceil(t.promptChars / CHARS_PER_TOKEN)) + " tok\n" + t.prompt
+          + "\n…（完整提示词见报告目录 llm/units/）"));
+      }
+      t.tools.slice(-4).forEach(name => box2.append(line("div", "meta", "⚒ 工具调用 " + name)));
+      t.notes.slice(-3).forEach(note => box2.append(line("div", "meta", "! " + note)));
+      if (t.answerCut) box2.append(line("div", "meta small", "…（回复开头已折叠；完整回复见报告目录 llm/sessions/）"));
+      if (t.answer) box2.append(line("pre", "", t.answer));
+      const foot = footerOf(t);
+      if (foot) box2.append(line("div", "meta small", foot));
+      box.append(box2);
+    });
+    if (pinned) box.scrollTop = box.scrollHeight;
+
+    const answered = list.filter(t => t.state === "completed" || t.state === "partial").length;
+    const failed = list.filter(t => BAD[t.state]).length;
+    const cached = list.filter(t => t.cached).length;
+    $("chat-stats").textContent = "已答 " + answered + "/" + (list.length + dropped)
+      + (failed ? " · 失败 " + failed : "") + (cached ? " · 缓存 " + cached : "");
+
+    const live = liveRate();
+    if (live !== null && (peak === null || live > peak)) peak = live;
+    const bits = [];
+    if (model) bits.push(model);
+    if (live !== null) bits.push(live + " tok/s（估算）");
+    else if (sessionRate !== null) bits.push(sessionRate + " tok/s（会话均值）");
+    if (peak !== null) bits.push("峰值 " + peak);
+    if (inFlight) bits.push("在途 " + inFlight);
+    if (total("prompt_tokens") || total("completion_tokens")) {
+      bits.push("输入 " + num(total("prompt_tokens")) + " · 输出 " + num(total("completion_tokens")) + " tok（测量）");
+    }
+    if (total("requests")) bits.push("请求 " + num(total("requests")));
+    if (eta !== null) bits.push("ETA " + clock(eta));
+    const speed = $("speed");
+    speed.textContent = bits.length ? "⚡ " + bits.join(" · ") : "等待模型的第一个 token…";
+    speed.className = bits.length ? "" : "muted";
+  };
+
+  const drawLanes = (nodes) => {
+    const root = $("lanes"); root.replaceChildren();
+    const lanes = [];
+    const stat = nodes.filter(n => n.kind === "static");
+    if (stat.length) {
+      const done = stat.filter(n => ["success", "partial", "failed"].includes(n.state)).length;
+      lanes.push(["静态分析", done / stat.length, done + "/" + stat.length + " 工具"]);
+    }
+    const llm = nodes.filter(n => n.kind === "llm" && n.units);
+    if (llm.length) {
+      const done = llm.reduce((a, n) => a + (n.units.completed || 0) + (n.units.failed || 0)
+        + (n.units.partial || 0) + (n.units.unscheduled || 0), 0);
+      const planned = llm.reduce((a, n) => a + (n.units.planned || 0), 0);
+      lanes.push(["LLM 扫描", planned ? Math.min(1, done / planned) : 0, done + "/" + planned + " 单元"]);
+    }
+    lanes.forEach(([label, fraction, detail]) => {
+      const row = line("div", "lane");
+      row.append(line("b", "", label));
+      const track = line("div", "track"), fill = line("div", "fill");
+      fill.style.width = (fraction * 100) + "%"; track.append(fill);
+      row.append(track, line("span", "", Math.round(fraction * 100) + "%  " + detail));
+      root.append(row);
+    });
+  };
+  $("show-prompts").onchange = drawChat;
+  setInterval(() => { if (chatDirty) { chatDirty = false; drawChat(); } }, 200);
   const drawGraph = async () => {
     const r = await fetch("/graph"); if (!r.ok) return;
     const g = await r.json(); const root = $("dag"); root.replaceChildren();
@@ -416,6 +683,7 @@ button[disabled]{opacity:.5;cursor:default}
       if (n.findings !== undefined && n.findings !== null) box.append(line("span", "", " · " + n.findings + " findings"));
       root.append(box);
     });
+    drawLanes(g.nodes);
     $("state").textContent = g.run.status ? g.run.status + (g.run.exit_code !== null && g.run.exit_code !== undefined ? " · exit " + g.run.exit_code : "") : "";
     if (g.nodes.some(n => n.id === "dashboard" && n.state === "success")) { $("report").hidden = false; }
   };
@@ -455,12 +723,19 @@ button[disabled]{opacity:.5;cursor:default}
   es.onmessage = ev => {
     let e; try { e = JSON.parse(ev.data); } catch (err) { return; }
     if (typeof e.progress === "number" && e.progress >= progress) { progress = e.progress; $("fill").style.width = (progress * 100) + "%"; $("pct").textContent = Math.round(progress * 100) + "%"; }
-    const when = e.timestamp ? new Date(e.timestamp * 1000).toISOString().slice(11, 19) : "";
-    log.append(line("div", "", when + "  " + e.phase + "/" + e.status + (e.tool ? "  " + e.tool : "") + (e.unit ? "/" + e.unit : "") + "  " + e.message));
-    log.scrollTop = log.scrollHeight;
+    if (typeof e.timestamp === "number" && e.timestamp > runClock) runClock = e.timestamp;
+    if (foldChat(e)) chatDirty = true;
+    // The model's own words belong to the conversation panel: a prompt preview
+    // is thousands of characters of source, and an answer arrives in dozens of
+    // chunks -- either one would bury every other line in a one-row-per-event log.
+    if (!(e.phase === "output" && CHAT_STREAMS[e.stream])) {
+      const when = e.timestamp ? new Date(e.timestamp * 1000).toISOString().slice(11, 19) : "";
+      log.append(line("div", "", when + "  " + e.phase + "/" + e.status + (e.tool ? "  " + e.tool : "") + (e.unit ? "/" + e.unit : "") + "  " + e.message));
+      log.scrollTop = log.scrollHeight;
+    }
     if (["tool", "llm", "unit", "units", "review", "audit", "export", "report", "build_context"].includes(e.phase)) drawGraph();
   };
-  es.addEventListener("end", () => { ended = true; es.close(); $("cancel").disabled = true; drawGraph(); pollState(); });
+  es.addEventListener("end", () => { ended = true; es.close(); $("cancel").disabled = true; drawChat(); drawGraph(); pollState(); });
   drawGraph(); pollState(); setInterval(() => { if (!ended) { drawGraph(); pollState(); } }, 3000);
 })();
 </script></body></html>

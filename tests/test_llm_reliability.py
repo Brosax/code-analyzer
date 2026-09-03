@@ -196,10 +196,20 @@ def test_steps_and_output_follow_the_session(tmp_path: Path, fake: FakeHarness) 
     ]
     assert step_events[2].data["detail"] == "1/5 TRANSPORT" and step_events[4].data["detail"] == "read"
     assert all(e.progress is None for e in step_events)
-    outputs = [e.message for e in events if e.phase == "output" and e.stream == "agent"]
-    assert any(message.startswith("assistant/chunk: {\"findings\": [") for message in outputs)
-    assert any(message == "tool/call: tool read" for message in outputs)
-    assert not any("turn/start" in message for message in outputs)
+    # One stream per kind of thing the model did, so a live view can lay the
+    # exchange out as a conversation without re-parsing a prefixed line.
+    answers = [e.message for e in events if e.phase == "output" and e.stream == "answer"]
+    assert any(message.startswith("{\"findings\": [") for message in answers)
+    assert [e.message for e in events if e.phase == "output" and e.stream == "tool"] == ["read"]
+    notes = [e.message for e in events if e.phase == "output" and e.stream == "note"]
+    assert any(message.startswith("retry 1/5: TRANSPORT") for message in notes)
+    assert not any(e.stream == "answer" and "turn/start" in e.message for e in events)
+    # The prompt travels as a bounded preview with the whole prompt's measures
+    # beside it; the prompt itself stays in llm/units/ and request.json.
+    prompts = [e for e in events if e.phase == "output" and e.stream == "prompt"]
+    assert prompts and prompts[0].data["chars"] > len(prompts[0].message)
+    assert prompts[0].data["estimated_tokens"] > 0 and prompts[0].data["blocks"] >= 2
+    assert "# Scanner" in prompts[0].message
 
 
 def test_heartbeats_carry_rate_and_eta_once_a_session_finished(tmp_path: Path, fake: FakeHarness) -> None:

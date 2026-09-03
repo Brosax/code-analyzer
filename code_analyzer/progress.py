@@ -151,6 +151,8 @@ def _terminal_width(stream: TextIO) -> int:
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# The same class without the newline (\x0a), for the multi-line form below.
+_CONTROL_CHARS_KEEPING_NEWLINE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
 
 def single_line(message: str) -> str:
@@ -161,3 +163,17 @@ def single_line(message: str) -> str:
     rewrite the operator's terminal.
     """
     return " ".join(_CONTROL_CHARS.sub(" ", str(message)).split())
+
+
+def multi_line(message: str) -> str:
+    """Remove the same control characters, but keep newlines and indentation.
+
+    ``single_line`` is right for one line of terminal output.  It is wrong for
+    a block: a model's answer is a JSON document and a prompt preview is a
+    numbered source listing, and their newlines and indentation are the only
+    structure either has -- collapsed, both become unreadable.  This keeps them
+    and still removes everything an untrusted reply could use to rewrite a
+    terminal.  Whoever prints such a message prints several lines knowingly;
+    inside a JSONL record the newline is escaped by the encoder either way.
+    """
+    return _CONTROL_CHARS_KEEPING_NEWLINE.sub(" ", str(message))

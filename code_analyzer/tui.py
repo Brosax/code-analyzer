@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len, chop_cells
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
@@ -43,6 +44,7 @@ from .analysis import (
     CancellationToken,
     run_analysis,
 )
+from .chat import Transcript
 from .config import (
     FIELD_BY_PATH,
     FieldSpec,
@@ -54,7 +56,7 @@ from .config import (
 )
 from .control import Decision, DecisionRequest, RunControl
 from .errors import UserError
-from .flow import WIDE_BREAKPOINT, RunFlow, capacity
+from .flow import WIDE_BREAKPOINT, Lane, RunFlow, capacity
 from .preflight import PreflightResult, run_preflight
 from .progress import animation_disabled_by_env, single_line
 from .runlog import LEVELS, format_line, level_of
@@ -65,9 +67,14 @@ from .tools import TOOL_NAMES
 RUN_ONLY_ACTIONS = frozenset({
     "cycle_pane", "cycle_filter", "toggle_pause_llm", "toggle_pause_static", "skip_selected",
     "jobs_up", "jobs_down", "cursor_up", "cursor_down", "node_detail", "open_decision", "retry_llm",
+    "toggle_prompts",
 })
-PANES = ("log", "llm", "problems")
-PANE_LABELS = {"log": "日志", "llm": "LLM 明细", "problems": "问题"}
+# "chat" first: when a model is answering, the answer is what the operator is
+# here for.  It is dropped from the cycle when the LLM lane is off, the way
+# the LLM pane already is -- an empty transcript is not a pane worth a keypress.
+PANES = ("chat", "log", "llm", "problems")
+PANE_LABELS = {"chat": "对话", "log": "日志", "llm": "LLM 明细", "problems": "问题"}
+LLM_ONLY_PANES = frozenset({"chat", "llm"})
 LOG_FILTERS = ("all", "warn", "error", "selected")
 FILTER_LABELS = {"all": "全部", "warn": "警告+", "error": "仅错误", "selected": "仅所选"}
 # How many queued events one 5 Hz tick folds at most; liveness events
@@ -99,6 +106,23 @@ LIST_SEPARATOR = ";"
 _STATE_STYLES = {"success": "green", "partial": "yellow", "failed": "red", "running": "bold cyan", "pending": "dim"}
 _SPINE_STYLES = ("bold cyan", "cyan", "dim cyan")
 _LABEL_WIDTH = 24
+# Transcript line role -> colour.  The answer itself is left unstyled: it is
+# the content, and everything around it is furniture.
+_CHAT_STYLES = {
+    "header": "bold cyan",
+    "prompt-title": "bold yellow",
+    "prompt": "yellow",
+    "answer": "",
+    "tool": "magenta",
+    "note": "bold red",
+    "footer": "dim",
+    "omitted": "dim italic",
+}
+# The lane bars under the overall progress bar.
+_LANE_LABEL_CELLS = 12
+_BAR_WIDTH = 22
+_BAR_FULL = "█"
+_BAR_EMPTY = "░"
 
 GRADING_NOTE = (
     "所有新报告固定采用 NXP i.MX RT700 AVA Test Plan 第 7 章的 "
@@ -306,6 +330,7 @@ class AnalyzerApp(App[TuiOutcome]):
         Binding("f2", "toggle_flow", "流程图"),
         Binding("f3", "cycle_pane", "面板"),
         Binding("f4", "cycle_filter", "过滤"),
+        Binding("f6", "toggle_prompts", "提示词"),
         Binding("p", "toggle_pause_llm", "暂停LLM", show=False),
         Binding("P", "toggle_pause_static", "暂停静态", show=False),
         Binding("s", "skip_selected", "跳过", show=False),
@@ -346,6 +371,8 @@ class AnalyzerApp(App[TuiOutcome]):
     #run-heading { height: 1; text-style: bold; }
     #run-details { height: 1; color: $text-muted; }
     #run-progress { height: 1; }
+    #run-bars { height: auto; text-wrap: nowrap; text-overflow: ellipsis; }
+    #run-speed { height: 1; color: $accent; text-wrap: nowrap; text-overflow: ellipsis; }
     #run-body { height: 1fr; layout: vertical; }
     #run-flow { height: auto; border: round $accent; background: $surface-darken-1;
                 padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
@@ -354,10 +381,14 @@ class AnalyzerApp(App[TuiOutcome]):
     #run-llm { display: none; height: auto; max-height: 10; border: round $accent; background: $surface-darken-1;
                padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #run-problems { display: none; height: 1fr; border: round $warning; background: $surface-darken-1; }
+    #run-chat { display: none; height: 1fr; border: round $success; background: $surface-darken-1;
+                padding: 0 1; }
     .pane-llm #run-llm { display: block; }
     .pane-llm #run-log { display: none; }
     .pane-problems #run-problems { display: block; }
     .pane-problems #run-log { display: none; }
+    .pane-chat #run-chat { display: block; }
+    .pane-chat #run-log { display: none; }
     .wide #run-body { layout: horizontal; }
     .wide #run-flow { width: 58; height: 1fr; margin-right: 1; }
     .wide #run-side { width: 1fr; }
@@ -410,6 +441,10 @@ class AnalyzerApp(App[TuiOutcome]):
         self._run_started_at: float | None = None
         self._last_preflight: PreflightResult | None = None
         self.flow: RunFlow | None = None
+        # The run as a conversation, and whether the operator asked to see the
+        # prompt beside each answer.
+        self.chat: Transcript | None = None
+        self._show_prompts = False
         self._flow_frame = 0
         self._flow_dirty = True
         self._flow_capacity = 7
@@ -467,10 +502,13 @@ class AnalyzerApp(App[TuiOutcome]):
             yield Static("正在运行…", id="run-heading")
             yield Static("阶段：准备 · 工具/单元：— · 已运行：00:00", id="run-details")
             yield ProgressBar(total=100, id="run-progress")
+            yield Static("", id="run-bars")
+            yield Static("", id="run-speed")
             with Vertical(id="run-body"):
                 yield Static("", id="run-flow")
                 with Vertical(id="run-side"):
                     yield Static("", id="run-llm")
+                    yield Static("", id="run-chat")
                     yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="run-log")
                     yield RichLog(max_lines=500, auto_scroll=False, wrap=True, markup=False, id="run-problems")
             yield Static("Ctrl+C 请求安全停止；将停止调度并回收当前进程组。", id="run-stop-hint")
@@ -571,9 +609,27 @@ class AnalyzerApp(App[TuiOutcome]):
     # --- the operator's hand ------------------------------------------------
 
     def action_cycle_pane(self) -> None:
-        order = [name for name in PANES if name != "llm" or (self.flow is not None and self.flow.llm_enabled)]
+        order = self._pane_order()
         index = order.index(self._pane) if self._pane in order else 0
         self._set_pane(order[(index + 1) % len(order)])
+
+    def _pane_order(self) -> list[str]:
+        llm = self.flow is not None and self.flow.llm_enabled
+        return [name for name in PANES if llm or name not in LLM_ONLY_PANES]
+
+    def action_toggle_prompts(self) -> None:
+        """Show, or stop showing, the prompt each unit was sent.
+
+        Off by default: the prompt is a whole source unit plus its context, and
+        an operator watching answers arrive does not want the question repeated
+        in front of every one of them.  The full text is in the report
+        directory either way -- the pane only ever had a preview.
+        """
+        self._show_prompts = not self._show_prompts
+        if self._pane != "chat" and "chat" in self._pane_order():
+            self._set_pane("chat")
+        self._flow_dirty = True
+        self._repaint_flow()
 
     def _set_pane(self, pane: str) -> None:
         self._pane = pane
@@ -998,10 +1054,12 @@ class AnalyzerApp(App[TuiOutcome]):
         app thread would have been refused outright.
         """
         self._queue_log_event(event)
-        if event.phase == "output":
-            return
         with self._events_lock:
-            if event.status in {"heartbeat", "step", "info"}:
+            # Output events are the transcript's content, and they are also
+            # the bulk of a real run's traffic: they queue as liveness, so an
+            # overloaded display drops answer chunks rather than the state
+            # events the flow and the counters are made of.
+            if event.phase == "output" or event.status in {"heartbeat", "step", "info"}:
                 self._liveness_events.append(event)
             else:
                 self._pending_events.append(event)
@@ -1022,6 +1080,8 @@ class AnalyzerApp(App[TuiOutcome]):
         # Repainting here would redraw once per event; during the LLM phase
         # that is a burst of hundreds. The timer coalesces them instead.
         if self.flow is not None and self.flow.apply(event):
+            self._flow_dirty = True
+        if self.chat is not None and self.chat.apply(event):
             self._flow_dirty = True
         if event.progress is not None:
             self.query_one("#run-progress", ProgressBar).update(progress=max(1, event.progress * 100))
@@ -1072,7 +1132,7 @@ class AnalyzerApp(App[TuiOutcome]):
         self._repaint_side()
 
     def _repaint_side(self) -> None:
-        """The control bar, the LLM panel and the problems pane."""
+        """The lane bars, the speed strip, the control bar and the panes."""
         if self.flow is None:
             return
         try:
@@ -1081,6 +1141,8 @@ class AnalyzerApp(App[TuiOutcome]):
             problems = self.query_one("#run-problems", RichLog)
         except NoMatches:
             return
+        self._repaint_lanes()
+        self._repaint_chat()
         bar.update(self._control_bar_text())
         if self.flow.llm_enabled:
             llm_panel.border_title = "LLM 扫描"
@@ -1096,6 +1158,87 @@ class AnalyzerApp(App[TuiOutcome]):
             for line in snapshot.splitlines() or ["（暂无失败原因）"]:
                 problems.write(line)
 
+    def _repaint_lanes(self) -> None:
+        """One bar per lane, and the speed strip above the panes.
+
+        The overall bar is the ProgressBar widget; these are the lanes it is a
+        weighted sum of, so "62%" can be read as the facts it came from.  All
+        of them share one Static: the set of lanes depends on the config, and
+        mounting a widget per lane would churn the tree at every repaint.
+        """
+        if self.flow is None:
+            return
+        try:
+            box = self.query_one("#run-bars", Static)
+            speed = self.query_one("#run-speed", Static)
+        except NoMatches:
+            return
+        lanes = [lane for lane in self.flow.lanes() if lane.id != "total"]
+        box.update(self._lane_text(lanes))
+        speed.update(self._speed_text())
+
+    @staticmethod
+    def _lane_text(lanes: list[Lane]) -> Text:
+        text = Text(no_wrap=True, overflow="ellipsis")
+        for index, lane in enumerate(lanes):
+            if index:
+                text.append("\n")
+            filled = max(0, min(_BAR_WIDTH, round(lane.fraction * _BAR_WIDTH)))
+            text.append(lane.label + " " * max(1, _LANE_LABEL_CELLS - cell_len(lane.label)))
+            text.append(_BAR_FULL * filled, style="cyan")
+            text.append(_BAR_EMPTY * (_BAR_WIDTH - filled), style="dim")
+            text.append(f" {int(lane.fraction * 100):>3}%  ")
+            text.append(lane.detail, style="dim")
+        return text
+
+    def _speed_text(self) -> Text:
+        """How fast the model is answering, and what the number is based on."""
+        if self.chat is None or self.flow is None or not self.flow.llm_enabled:
+            return Text("")
+        summary = self.chat.summary()
+        if not summary:
+            return Text("⚡ 等待模型的第一个 token…", style="dim")
+        return Text("⚡ " + summary)
+
+    def _repaint_chat(self) -> None:
+        """The transcript's tail: the exchange happening now, at the bottom."""
+        if self.chat is None:
+            return
+        try:
+            panel = self.query_one("#run-chat", Static)
+        except NoMatches:
+            return
+        rows = max(3, panel.size.height or 12)
+        width = max(20, (panel.size.width or 80))
+        # An answer is a JSON document on one line: ask for more logical lines
+        # than there are rows, wrap them to the pane, then keep the last rows.
+        # Wrapping here rather than in the model keeps the tail exact -- one
+        # logical line can be four rows, and a pane that let Textual wrap would
+        # clip the bottom, which is the part that is happening now.
+        lines = self.chat.lines(capacity=rows * 4, show_prompts=self._show_prompts)
+        stats = self.chat.stats()
+        title = f"对话 · 已答 {stats.answered}/{stats.turns}"
+        if stats.failed:
+            title += f" · 失败 {stats.failed}"
+        if stats.cached:
+            title += f" · 缓存 {stats.cached}"
+        title += " · F6 " + ("隐藏提示词" if self._show_prompts else "显示提示词")
+        panel.border_title = title
+        if not lines:
+            panel.update(Text("等待模型的第一次回复…（F6 显示发送的提示词）", style="dim"))
+            return
+        wrapped: list[tuple[str, str]] = []
+        for line in lines:
+            style = _CHAT_STYLES.get(line.role, "")
+            for piece in chop_cells(line.text, width) or [""]:
+                wrapped.append((piece, style))
+        text = Text(no_wrap=True, overflow="crop")
+        for index, (piece, style) in enumerate(wrapped[-rows:]):
+            if index:
+                text.append("\n")
+            text.append(piece, style=style)
+        panel.update(text)
+
     def _control_bar_text(self) -> str:
         if self.flow is None:
             return ""
@@ -1107,7 +1250,7 @@ class AnalyzerApp(App[TuiOutcome]):
         parts.append("静态 ⏸" if self.flow.paused["static"] else "静态 ▶")
         if self.flow.pending_decisions:
             parts.append(f"待决策 {len(self.flow.pending_decisions)}")
-        keys = "p/P 暂停 · s 跳过 · +/- 并发 · ↑↓⏎ 详情 · F3 面板 · F4 过滤 · Ctrl+C 停止"
+        keys = "p/P 暂停 · s 跳过 · +/- 并发 · ↑↓⏎ 详情 · F3 面板 · F4 过滤 · F6 提示词 · Ctrl+C 停止"
         return " · ".join(parts) + " · " + keys
 
     def _llm_text(self) -> Text:
@@ -1155,6 +1298,11 @@ class AnalyzerApp(App[TuiOutcome]):
 
     def _log_wanted(self, event: AnalysisEvent) -> bool:
         """The F4 filter, applied when a line is queued, not when it is drawn."""
+        # A prompt preview is thousands of characters of source; it belongs to
+        # the transcript pane, which can lay it out, and would bury every other
+        # line in a log that shows one event per row.
+        if event.phase == "output" and event.stream == "prompt":
+            return False
         if self._log_filter == "all":
             return True
         if self._log_filter == "selected":
@@ -1221,13 +1369,16 @@ class AnalyzerApp(App[TuiOutcome]):
         self._problems_snapshot = ""
         self._run_started_at = time.monotonic()
         self.flow = RunFlow(self.config, preflight=self._last_preflight)
+        self.chat = Transcript()
         if self.control is None:
             self.control = RunControl(self.cancel_token or CancellationToken(), llm_jobs=int(self.config["llm"].get("jobs") or 1))
         self._cursor = None
         self._log_filter = "all"
         self.query_one("#run-log", RichLog).border_title = "实时日志 · 全部"
         self.set_class(self.flow.llm_enabled, "llm-lane")
-        self._set_pane("log")
+        # A run with a model in it opens on the conversation; a static-only run
+        # has nothing to say there and opens on the log, as it always did.
+        self._set_pane("chat" if self.flow.llm_enabled else "log")
         # No widget holds the focus during a run, so the arrow keys and Enter
         # reach the app's own bindings instead of scrolling a form.
         self.screen.set_focus(None)
