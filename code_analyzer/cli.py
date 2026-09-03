@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .argv import (
+    add_analyze_arguments,
+    add_llm_arguments,
+    analyze_overrides,
+    assess_overrides,
+    llm_overrides,
+    normalize_compile_db_args,
+    positive_float,
+    positive_int,
+)
 from .compile_db_wizard import run_compile_db
 from .config import load_config
 from .control import auto_no, auto_yes, stdin_decider
@@ -15,14 +25,13 @@ from .doctor import probe_all
 from .errors import UserError
 from .events import EVENTS_FILE, JsonlEventSink, events_file
 from .llm.doctor import probe_llm
-from .llm.profiles import PROFILE_NAMES, third_party_warning
+from .llm.profiles import third_party_warning
 from .llm.resume import run_resume
 from .reconfigure import run_tools_resume
 from .recovery import recover_report
 from .runner import analyze
 from .serve import DEFAULT_PORT, serve
 from .status import EXIT_COMPLETE, EXIT_PARTIAL
-from .tools import LLM_PRODUCERS, TOOL_NAMES
 from .validate import run_assess
 
 
@@ -40,11 +49,11 @@ def parser() -> argparse.ArgumentParser:
     llm_doctor.add_argument("source", type=Path, nargs="?", help="source tree to estimate a full scan of")
     llm_doctor.add_argument("--config", type=Path)
     llm_doctor.add_argument("--json", action="store_true", dest="as_json")
-    _add_llm_arguments(llm_doctor)
+    add_llm_arguments(llm_doctor)
     llm_resume = commands.add_parser("llm-resume", help="scan the units a run left unscheduled or interrupted")
     llm_resume.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     llm_resume.add_argument("--config", type=Path)
-    _add_llm_arguments(llm_resume)
+    add_llm_arguments(llm_resume)
     compile_db = commands.add_parser("compile-db", help="discover or prepare a JSON compilation database")
     compile_db.add_argument("source", type=Path)
     compile_db.add_argument("--json", action="store_true", dest="as_json", help="report discovery without executing anything")
@@ -54,7 +63,7 @@ def parser() -> argparse.ArgumentParser:
     compile_db.add_argument("--preset")
     compile_db.add_argument("--cmake-arg", action="append", default=[])
     compile_db.add_argument("--expected-db", type=Path)
-    compile_db.add_argument("--timeout", type=_positive_float, default=900.0)
+    compile_db.add_argument("--timeout", type=positive_float, default=900.0)
     compile_db.add_argument("--yes", action="store_true")
     # ``*`` (instead of REMAINDER) keeps options after SOURCE parseable.  The
     # conventional ``--`` separator still protects every custom command arg.
@@ -65,12 +74,12 @@ def parser() -> argparse.ArgumentParser:
     recover.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     run = commands.add_parser("analyze", help="analyze a C/C++ source tree")
     run.add_argument("source", type=Path)
-    _add_analyze_arguments(run)
+    add_analyze_arguments(run)
     live = commands.add_parser("serve", help="serve a live view of a run over HTTP (127.0.0.1 only)")
     live.add_argument("report_directory", type=Path, nargs="?", metavar="REPORT_DIR", help="a run directory to watch, read-only")
     live.add_argument("--analyze", type=Path, metavar="SOURCE", help="run the analysis in this process, with cancel support")
     live.add_argument("--port", type=int, default=DEFAULT_PORT)
-    _add_analyze_arguments(live)
+    add_analyze_arguments(live)
     resume_tools = commands.add_parser("tools-resume", help="continue a finished run's build-context loop: diagnose, patch, re-run the failed Splint/Cppcheck units, re-derive the review")
     resume_tools.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     resume_tools.add_argument("--tool", choices=("splint", "cppcheck"), help="only this tool (default: every reconfigurable tool in the run)")
@@ -79,59 +88,9 @@ def parser() -> argparse.ArgumentParser:
     assess = commands.add_parser("assess", help="validate the correlated candidates of a finished run with the LLM validator")
     assess.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     assess.add_argument("--config", type=Path)
-    assess.add_argument("--max-candidates", type=_positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
-    _add_llm_arguments(assess)
+    assess.add_argument("--max-candidates", type=positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
+    add_llm_arguments(assess)
     return root
-
-
-def _add_analyze_arguments(run: argparse.ArgumentParser) -> None:
-    run.add_argument("--config", type=Path)
-    run.add_argument("--output-root", type=Path)
-    compile_group = run.add_mutually_exclusive_group()
-    compile_group.add_argument("--compile-db", type=Path)
-    compile_group.add_argument("--no-compile-db", action="store_true")
-    run.add_argument("--tool", choices=TOOL_NAMES, action="append")
-    run.add_argument("--include", action="append", type=Path, help="project include directory")
-    run.add_argument("--system-include", action="append", type=Path)
-    run.add_argument("--define", action="append")
-    run.add_argument("--undefine", action="append")
-    run.add_argument("--exclude", action="append", help="source-relative exclusion glob")
-    run.add_argument("--c-standard")
-    run.add_argument("--cpp-standard")
-    run.add_argument("--cppcheck-platform")
-    run.add_argument("--cppcheck-timeout", type=_positive_float)
-    run.add_argument("--flawfinder-timeout", type=_positive_float)
-    run.add_argument("--splint-tu-timeout", type=_positive_float)
-    run.add_argument("--splint-total-timeout", type=_positive_float)
-    run.add_argument("--splint-scope", choices=("auto", "build", "inventory"))
-    run.add_argument("--splint-jobs", type=_positive_int)
-    run.add_argument("--splint-heartbeat", type=_positive_float)
-    run.add_argument("--splint-mode", choices=("strict", "checks", "standard", "weak"), help="Splint's predefined check mode")
-    run.add_argument("--build-assist", choices=("off", "propose", "auto"), help="diagnose Splint/Cppcheck preprocessing failures and re-run failed units with an inferred build context")
-    run.add_argument("--build-assist-yes", action="store_true", help="apply a proposed build-context patch without asking (headless runs otherwise only record it)")
-    run.add_argument("--log-level", choices=("debug", "info", "warning"), help="how much logs/runner.log records")
-    run.add_argument("--llm", action=argparse.BooleanOptionalAction, default=None, help="run the LLM scanners as a second, independent detection path")
-    _add_llm_arguments(run)
-    run.add_argument("--llm-scanner", choices=LLM_PRODUCERS, action="append")
-    run.add_argument("--llm-token-budget", type=_positive_int, metavar="N", help="prompt token budget for the whole LLM phase")
-    run.add_argument("--llm-risk", action="append", metavar="PATTERN=TIER")
-    run.add_argument("--termination-grace", type=_positive_float)
-    run.add_argument("--events-file", type=Path, metavar="PATH", help="write the run-level event log here instead of <run_dir>/events.jsonl")
-    run.add_argument("--follow-symlinks", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--respect-gitignore", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--shareable-export", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--review", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--fail-on", choices=("none", "medium", "high", "critical"))
-
-
-def _add_llm_arguments(run: argparse.ArgumentParser) -> None:
-    """The provider flags both the scanners and the validator take."""
-    run.add_argument("--llm-profile", choices=PROFILE_NAMES, help="built-in provider profile supplying endpoint, model and api_key_env defaults")
-    run.add_argument("--llm-endpoint", metavar="URL")
-    run.add_argument("--llm-model", metavar="NAME")
-    run.add_argument("--llm-jobs", type=_positive_int)
-    run.add_argument("--llm-total-timeout", type=_positive_float, metavar="SECONDS")
-    run.add_argument("--llm-no-cache", action="store_true")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             root_parser.print_help(file=sys.stderr)
             print("\ncode-analyzer: hint: run 'code-analyzer tui [SOURCE]' in an interactive terminal", file=sys.stderr)
             return 2
-    raw_argv = _normalize_compile_db_args(raw_argv)
+    raw_argv = normalize_compile_db_args(raw_argv)
     # Split the custom command off before argparse sees it: ``--`` handling for
     # subparser positionals is version-dependent (fixed in Python 3.12.5).
     command_tail: list[str] | None = None
@@ -177,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result["ok"] else 20
         if args.command == "llm-doctor":
             source = (args.source or Path.cwd()).expanduser().resolve()
-            config = load_config(source, args.config, {"llm": _llm_overrides(args)} if _llm_overrides(args) else None)
+            config = load_config(source, args.config, {"llm": llm_overrides(args)} if llm_overrides(args) else None)
             result = probe_llm(config, source if args.source is not None else None)
             if args.as_json:
                 print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
@@ -194,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "llm-resume":
             report_directory = args.report_directory.expanduser().resolve()
-            config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))
+            config = load_config(_scanned_source(report_directory), args.config, assess_overrides(args))
             _warn_third_party(config)
             block = run_resume(report_directory, config,
                                progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
@@ -219,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_COMPLETE if block.get("outcome") in {"applied", "skipped"} else EXIT_PARTIAL
         if args.command == "assess":
             report_directory = args.report_directory.expanduser().resolve()
-            config = load_config(_scanned_source(report_directory), args.config, _assess_overrides(args))
+            config = load_config(_scanned_source(report_directory), args.config, assess_overrides(args))
             _warn_third_party(config)
             block = run_assess(report_directory, config,
                                progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
@@ -230,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise UserError("serve needs REPORT_DIR or --analyze SOURCE")
             if args.analyze is not None:
                 source = args.analyze.expanduser().resolve()
-                config = load_config(source, args.config, _overrides(args))
+                config = load_config(source, args.config, analyze_overrides(args))
                 if config["llm"]["enabled"]:
                     _warn_third_party(config)
                 return serve(None, analyze=(source, config), port=args.port,
@@ -238,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             return serve(args.report_directory.expanduser().resolve(), port=args.port,
                          announce=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
         source = args.source.expanduser().resolve()
-        overrides = _overrides(args)
+        overrides = analyze_overrides(args)
         config = load_config(source, args.config, overrides)
         if config["llm"]["enabled"]:
             _warn_third_party(config)
@@ -258,6 +217,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("code-analyzer: interrupted", file=sys.stderr)
         return 130
+
+
+# The argv vocabulary moved to argv.py so the conversation front end can parse
+# a slash command with the very parser this file builds.  Kept as a name here
+# because it is what the CLI's own tests reach for.
+_overrides = analyze_overrides
 
 
 def _warn_third_party(config: dict[str, Any]) -> None:
@@ -280,159 +245,6 @@ def _scanned_source(report_directory: Path) -> Path:
     if not source.is_dir():
         raise UserError(f"the scanned source tree is not a directory: {source}; assess needs the source")
     return source
-
-
-def _assess_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    llm = _llm_overrides(args)
-    if llm:
-        value["llm"] = llm
-    if getattr(args, "max_candidates", None) is not None:
-        value["audit"] = {"validation_max_candidates": args.max_candidates}
-    return value
-
-
-def _llm_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    llm: dict[str, Any] = {}
-    if args.llm_profile is not None:
-        llm["profile"] = args.llm_profile
-    if args.llm_endpoint is not None:
-        llm["endpoint"] = args.llm_endpoint
-    if args.llm_model is not None:
-        llm["model"] = args.llm_model
-    if args.llm_jobs is not None:
-        llm["jobs"] = args.llm_jobs
-    if args.llm_total_timeout is not None:
-        llm["total_timeout_seconds"] = args.llm_total_timeout
-    if args.llm_no_cache:
-        llm["cache"] = False
-    return llm
-
-
-def _overrides(args: argparse.Namespace) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    run: dict[str, Any] = {}
-    source: dict[str, Any] = {}
-    build: dict[str, Any] = {}
-    tools: dict[str, Any] = {}
-    review: dict[str, Any] = {}
-    llm = _llm_overrides(args)
-    if args.output_root is not None:
-        run["output_root"] = str(args.output_root.resolve())
-    if args.shareable_export is not None:
-        run["shareable_export"] = args.shareable_export
-    if args.termination_grace is not None:
-        run["termination_grace_seconds"] = args.termination_grace
-    if args.events_file is not None:
-        run["events_file"] = str(args.events_file.resolve())
-    if getattr(args, "log_level", None) is not None:
-        run["log_level"] = args.log_level
-    if args.exclude is not None:
-        source["exclude"] = args.exclude
-    if args.follow_symlinks is not None:
-        source["follow_symlinks"] = args.follow_symlinks
-    if args.respect_gitignore is not None:
-        source["respect_gitignore"] = args.respect_gitignore
-    if args.compile_db is not None:
-        build.update({"compile_database_mode": "explicit", "compile_database": str(args.compile_db.resolve())})
-    elif args.no_compile_db:
-        build.update({"compile_database_mode": "disabled", "compile_database": None})
-    for argument, key in ((args.include, "include"), (args.system_include, "system_include")):
-        if argument is not None:
-            build[key] = [str(path.resolve()) for path in argument]
-    for argument, key in ((args.define, "define"), (args.undefine, "undefine")):
-        if argument is not None:
-            build[key] = argument
-    for key in ("c_standard", "cpp_standard", "cppcheck_platform"):
-        if getattr(args, key) is not None:
-            build[key] = getattr(args, key)
-    timeout_values = {
-        "cppcheck": ("timeout_seconds", args.cppcheck_timeout),
-        "flawfinder": ("timeout_seconds", args.flawfinder_timeout),
-        "splint_tu": ("tu_timeout_seconds", args.splint_tu_timeout),
-        "splint_total": ("total_timeout_seconds", args.splint_total_timeout),
-    }
-    for name, (key, timeout) in timeout_values.items():
-        if timeout is not None:
-            tool = name.split("_", 1)[0]
-            tools.setdefault(tool, {})[key] = timeout
-    if args.splint_scope is not None:
-        tools.setdefault("splint", {})["scope"] = args.splint_scope
-    if args.splint_jobs is not None:
-        tools.setdefault("splint", {})["jobs"] = args.splint_jobs
-    if args.splint_heartbeat is not None:
-        tools.setdefault("splint", {})["heartbeat_seconds"] = args.splint_heartbeat
-    if getattr(args, "splint_mode", None) is not None:
-        tools.setdefault("splint", {})["mode"] = args.splint_mode
-    if getattr(args, "build_assist", None) is not None:
-        build["assist"] = args.build_assist
-    if args.llm is not None:
-        llm["enabled"] = args.llm
-    if args.llm_scanner:
-        llm["scanners"] = [name for name in LLM_PRODUCERS if name in set(args.llm_scanner)]
-    if args.llm_token_budget is not None:
-        llm["total_prompt_tokens"] = args.llm_token_budget
-    if args.llm_risk:
-        llm["risk_overrides"] = args.llm_risk
-    if args.review is not None:
-        review["enabled"] = args.review
-    if args.fail_on is not None:
-        review["fail_on"] = args.fail_on
-    if args.tool:
-        selected = set(args.tool)
-        for name in TOOL_NAMES:
-            tools.setdefault(name, {})["enabled"] = name in selected
-    if run:
-        value["run"] = run
-    if source:
-        value["source"] = source
-    if build:
-        value["build"] = build
-    if tools:
-        value["tools"] = tools
-    if review:
-        value["review"] = review
-    if llm:
-        value["llm"] = llm
-    return value
-
-
-def _normalize_compile_db_args(argv: list[str]) -> list[str]:
-    """Let ``--cmake-arg -D...`` work despite argparse option parsing.
-
-    Values are only regrouped before the custom-command ``--`` separator and
-    remain individual argv elements when CMake is eventually executed.
-    """
-    if not argv or argv[0] != "compile-db":
-        return argv
-    result: list[str] = []
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if item == "--":
-            result.extend(argv[index:])
-            break
-        if item == "--cmake-arg" and index + 1 < len(argv):
-            result.append("--cmake-arg=" + argv[index + 1])
-            index += 2
-            continue
-        result.append(item)
-        index += 1
-    return result
-
-
-def _positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
-
-
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
 
 
 def _print_doctor(result: dict[str, Any]) -> None:
