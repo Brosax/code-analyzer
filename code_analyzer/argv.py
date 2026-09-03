@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+from .errors import UserError
 from .llm.profiles import PROFILE_NAMES
 from .tools import LLM_PRODUCERS, TOOL_NAMES
 
@@ -222,3 +223,47 @@ def normalize_compile_db_args(argv: list[str]) -> list[str]:
         result.append(item)
         index += 1
     return result
+
+
+def subparser_for(command: str) -> argparse.ArgumentParser | None:
+    """The parser one subcommand uses, so a slash command can borrow it.
+
+    This is what makes ``/scan ~/p --llm-jobs 4`` accept exactly what
+    ``code-analyzer analyze`` accepts: the same parser object, not a second
+    list of thirty-five flags kept in step by hand.
+    """
+    from .cli import parser
+
+    subparsers = [
+        action for action in parser()._subparsers._group_actions  # noqa: SLF001
+        if isinstance(action, argparse._SubParsersAction)  # noqa: SLF001
+    ]
+    for action in subparsers:
+        found = action.choices.get(command)
+        if found is not None:
+            return found
+    return None
+
+
+class QuietParser(argparse.ArgumentParser):
+    """An argparse parser that raises instead of killing the process.
+
+    ``ArgumentParser.error`` calls ``SystemExit``, which is right for a command
+    line and fatal for a conversation: a typo in a slash command must come back
+    as a line the operator can read, not as the interface exiting.
+    """
+
+    def error(self, message: str) -> Any:  # noqa: ANN401
+        raise UserError(message)
+
+    def exit(self, status: int = 0, message: str | None = None) -> Any:  # noqa: ANN401
+        if message:
+            raise UserError(message.strip())
+        raise UserError("")
+
+
+def quiet(source: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """The same parser, but reporting a bad argument instead of exiting."""
+    source.error = QuietParser.error.__get__(source)  # type: ignore[method-assign]
+    source.exit = QuietParser.exit.__get__(source)  # type: ignore[method-assign]
+    return source

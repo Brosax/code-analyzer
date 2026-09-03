@@ -104,6 +104,14 @@ def main(argv: list[str] | None = None) -> int:
             root_parser.print_help(file=sys.stderr)
             print("\ncode-analyzer: hint: run 'code-analyzer tui [SOURCE]' in an interactive terminal", file=sys.stderr)
             return 2
+    # A third dispatch: neither a subcommand nor a flag, so it is something the
+    # operator said.  The deterministic parser resolves it or reports why it
+    # could not -- it never reaches a model here, because a non-interactive run
+    # that quietly called a provider would be a surprise, and an outage would
+    # change exit codes.  `/ask` off a terminal needs its own command.
+    known = set(_subcommands(root_parser))
+    if raw_argv and raw_argv[0] not in known and not raw_argv[0].startswith("-"):
+        return _spoken(raw_argv, root_parser)
     raw_argv = normalize_compile_db_args(raw_argv)
     # Split the custom command off before argparse sees it: ``--`` handling for
     # subparser positionals is version-dependent (fixed in Python 3.12.5).
@@ -252,6 +260,46 @@ def main(argv: list[str] | None = None) -> int:
 # a slash command with the very parser this file builds.  Kept as a name here
 # because it is what the CLI's own tests reach for.
 _overrides = analyze_overrides
+
+
+def _subcommands(root_parser: argparse.ArgumentParser) -> list[str]:
+    for action in root_parser._subparsers._group_actions:  # noqa: SLF001
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return list(action.choices)
+    return []
+
+
+def _spoken(raw_argv: list[str], root_parser: argparse.ArgumentParser) -> int:
+    """Run what the operator said, or say why it could not be run.
+
+    A resolved action with a subject runs exactly as the equivalent subcommand
+    would.  A bare path does not: a scan is not a side effect, so off a
+    terminal it prints the argv it would have run and exits 2.
+    """
+    from .intent import ACTION, AMBIGUOUS, ASK, Intent, parse
+
+    line = " ".join(raw_argv)
+    intent: Intent = parse(line)
+    if intent.kind == ASK:
+        print("code-analyzer: error: /ask needs an interactive session; type it in the conversation",
+              file=sys.stderr)
+        return 2
+    if intent.kind == AMBIGUOUS:
+        print(f"code-analyzer: error: {intent.problem}", file=sys.stderr)
+        for candidate in intent.candidates:
+            print(f"  code-analyzer {candidate} {' '.join(raw_argv)}", file=sys.stderr)
+        return 2
+    if intent.kind != ACTION:
+        print(f"code-analyzer: error: {intent.problem}", file=sys.stderr)
+        return 2
+    action = by_name(intent.action)
+    equivalent = [action.cli_command or action.name, *intent.argv]
+    if intent.confidence == "shorthand" and not _has_tty():
+        print("code-analyzer: error: that reads as:", file=sys.stderr)
+        print(f"  code-analyzer {' '.join(equivalent)}", file=sys.stderr)
+        print("code-analyzer: run it explicitly, or say it in an interactive session", file=sys.stderr)
+        return 2
+    return main(equivalent)
 
 
 def _invoke(command: str, request: ActionRequest, **context: Any) -> Any:
