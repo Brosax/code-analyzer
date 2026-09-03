@@ -108,6 +108,9 @@ class ActionContext:
     cancelled: Callable[[], bool] = lambda: False
     terminal: bool = False
     event_sink: Any = None
+    # A ``threading.Event`` an action that serves or waits can be told to stop
+    # with.  Inert unless a front end sets one, so nothing else changes.
+    stop: Any = None
 
     def say(self, phase: str, status: str, message: str, **fields: Any) -> None:
         self.emit(AnalysisEvent(phase, status, message, **fields))
@@ -377,16 +380,31 @@ def _run_recover_report(ctx: ActionContext) -> ActionOutcome:
 
 
 def _run_serve(ctx: ActionContext) -> ActionOutcome:
-    from .serve import serve
+    """Serve a run, and be stoppable.
+
+    Three things were wrong.  ``serve.serve`` accepts a ``stop`` event and was
+    never given one, so it looped forever.  ``port`` was passed straight from
+    an argparse namespace that a conversation does not have, so it arrived as
+    ``None`` and ``ThreadingHTTPServer(("127.0.0.1", None))`` raised.  And the
+    URL went to stderr, which a transcript never shows.
+    """
+    from .serve import DEFAULT_PORT, serve
 
     request = ctx.request
     args = request.args
-    announce = getattr(args, "_announce", None) or (lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+    port = getattr(args, "port", None) or DEFAULT_PORT
+    if ctx.terminal:
+        announce = getattr(args, "_announce", None) or (
+            lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+    else:
+        def announce(text: str) -> None:
+            ctx.say("serve", "info", text)
+
     if request.source is not None:
         exit_code = serve(None, analyze=(request.source, request.config),
-                          port=getattr(args, "port", None), announce=announce)
+                          port=port, announce=announce, stop=ctx.stop)
     else:
-        exit_code = serve(request.report_directory, port=getattr(args, "port", None), announce=announce)
+        exit_code = serve(request.report_directory, port=port, announce=announce, stop=ctx.stop)
     return ActionOutcome(exit_code=exit_code, summary="实时页已关闭")
 
 
@@ -503,13 +521,18 @@ RECOVER_REPORT = Action(
             "并每次新导出一个 ZIP；不调用任何分析器。",),
 )
 SERVE = Action(
-    name="serve", summary="用浏览器看一次运行的实时视图", subject=SUBJECT_NONE, run=_run_serve,
+    # A report directory, declared: it was SUBJECT_NONE while `_run_serve` read
+    # `request.source` anyway, which is how `/serve` in the conversation used to
+    # start a full scan.  With subjects no longer leaking it needs to say what
+    # it wants.  (`--analyze SOURCE` stays a CLI-only mode.)
+    name="serve", summary="用浏览器看一次运行的实时视图", subject=SUBJECT_REPORT, run=_run_serve,
     aliases=("实时页",),
-    long_running=True, cli_command="serve",
-    # Never returns on its own: serve.serve loops until a `stop` event that
-    # _run_serve does not yet pass (serve.py:352-355).  Out of the catalogue
-    # until that is fixed -- a model must not name something that cannot stop.
-    blocks=True, conversational=False,
+    # Not long_running in the display sense: that flag decides whether a flow
+    # diagram is drawn, and serve has no flow.  It still blocks, so it confirms.
+    cli_command="serve",
+    # Still `blocks`: it runs until stopped, so it confirms.  But it can now be
+    # stopped (`ctx.stop`), so a model may name it again.
+    blocks=True,
     impact=("在 127.0.0.1 上监听一个端口，直到你停止它。",),
 )
 CONFIG = Action(

@@ -222,6 +222,7 @@ class AnalyzerApp(App[TuiOutcome]):
         self._last_ask_seconds: float | None = None
         # Said once per reason, not once per sentence.
         self._gate_reason: str = ""
+        self._stop_event: threading.Event | None = None
 
     # --- the screen ---------------------------------------------------------
 
@@ -634,6 +635,7 @@ class AnalyzerApp(App[TuiOutcome]):
         # Every action gets a token, because Ctrl+C has to mean cancel for all
         # of them; only a long-running one gets a RunControl and a run block.
         self.cancel_token = CancellationToken()
+        self._stop_event = threading.Event()
         if action.long_running:
             self.control = RunControl(self.cancel_token,
                                       llm_jobs=int(request.config["llm"].get("jobs") or 1))
@@ -708,6 +710,7 @@ class AnalyzerApp(App[TuiOutcome]):
                 control=self.control,
                 cancelled=(self.cancel_token.is_cancelled if self.cancel_token else (lambda: False)),
                 terminal=False,
+                stop=self._stop_event,
             )
             outcome = invoke(action, context)
         except UserError as exc:
@@ -746,8 +749,16 @@ class AnalyzerApp(App[TuiOutcome]):
     def _emitter(self, block_id: str) -> Any:
         """Called on the worker thread; queues, never repaints."""
 
+        has_block = isinstance(self.dialogue.get(block_id), RunBlock)
+
         def emit(event: AnalysisEvent) -> None:
             self._queue_log_event(event)
+            if event.status == "info" and not has_block:
+                # An action with no run block has nowhere for progress to land,
+                # so it was being dropped -- which is how `serve` announced its
+                # URL to a transcript that never showed it.
+                self.call_from_thread(self._mount, self.dialogue.say(single_line(event.message)))
+                return
             with self._events_lock:
                 if event.phase == "output" or event.status in {"heartbeat", "step", "info"}:
                     self._liveness_events.append((block_id, event))
@@ -1188,6 +1199,10 @@ class AnalyzerApp(App[TuiOutcome]):
                 self.control.cancel("tui")
             else:
                 self.cancel_token.cancel()
+            if self._stop_event is not None:
+                # An action that serves or waits watches this rather than the
+                # token, because it never reaches a cancellation checkpoint.
+                self._stop_event.set()
             if run is not None and run.flow is not None:
                 run.flow.mark_stopping()
             self._mount(self.dialogue.say("已请求安全停止；正在等待当前进程终止并回收。"))

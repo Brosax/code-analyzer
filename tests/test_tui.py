@@ -1182,3 +1182,48 @@ def test_a_ticked_configuration_change_survives_a_value_containing_a_space(
                 app.dialogue.config["build"]["c_standard"] == "gnu11 extra"
 
     asyncio.run(exercise())
+
+
+def test_serving_a_run_announces_its_url_in_the_conversation_and_can_be_closed(
+    tmp_path: Path,
+) -> None:
+    """It used to start a scan, crash on a None port, and never stop."""
+
+    async def exercise() -> None:
+        import urllib.request
+
+        run = tmp_path / "20260903T000000Z-abcdef"
+        run.mkdir()
+        (run / "manifest.json").write_text('{"status": "complete"}', encoding="utf-8")
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit(f"/serve {run}")
+            for _ in range(60):
+                await pilot.pause()
+                if app.dialogue.pending_question() is not None:
+                    break
+            # It blocks, so it confirms.
+            question = app.dialogue.pending_question()
+            assert question is not None and question.question.id == "serve.confirm"
+
+            app.submit("y")
+            for _ in range(150):
+                await pilot.pause(0.1)
+                if any("live view" in line for line in app.dialogue.lines()):
+                    break
+            announced = [line for line in app.dialogue.lines() if "live view" in line]
+            assert announced, "the URL never reached the transcript"
+            port = announced[0].strip().rstrip("/").rsplit(":", 1)[-1]
+            assert urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read()
+            assert app._busy
+
+            app.action_cancel_or_exit()
+            for _ in range(100):
+                await pilot.pause(0.1)
+                if not app._busy:
+                    break
+            assert not app._busy and app.is_running
+            assert "实时页已关闭" in _transcript(app)
+
+    asyncio.run(exercise())

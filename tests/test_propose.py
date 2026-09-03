@@ -48,14 +48,9 @@ def _run(tmp_path: Path) -> Path:
 
 
 def test_the_model_may_only_propose_actions_the_registry_defines() -> None:
-    """Generated, not written out: a named action exists by construction.
-
-    Minus the ones marked non-conversational -- today `serve`, which never
-    returns on its own, so a model must not be able to name it.
-    """
+    """Generated, not written out: a named action exists by construction."""
     names = {row["action"] for row in catalogue()}
     assert names == {action.name for action in REGISTRY if action.conversational}
-    assert names < {action.name for action in REGISTRY}
     for row in catalogue():
         assert row["does"] and row["needs"] in {"none", "source", "report"}
 

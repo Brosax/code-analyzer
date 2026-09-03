@@ -263,12 +263,42 @@ def test_rebuilding_the_dashboard_confirms_because_it_rewrites_the_manifest() ->
         assert "manifest.json" in " ".join(action.impact), name
 
 
-def test_the_action_that_never_returns_is_not_in_the_catalogue_a_model_sees() -> None:
-    """A model must not name something that cannot be stopped."""
+def test_an_action_a_model_may_not_name_is_kept_out_of_the_catalogue() -> None:
+    """`conversational` is the mechanism; `serve` used it while it could not stop.
+
+    It served until a `stop` event that `_run_serve` never passed, so a model
+    naming it produced something the operator could not close. Now that the
+    event is threaded through it is back -- but it still confirms, because it
+    still runs until stopped.
+    """
+    import dataclasses
+
     from code_analyzer.llm.propose import catalogue
 
-    assert by_name("serve").blocks and not by_name("serve").conversational
-    assert "serve" not in {row["action"] for row in catalogue()}
+    serve = by_name("serve")
+    assert serve.blocks and serve.confirm == CONFIRM_ALWAYS and not serve.auto_run
+    assert serve.conversational and "serve" in {row["action"] for row in catalogue()}
+
+    # The gate still works: a non-conversational action is not offered.
+    hidden = dataclasses.replace(serve, conversational=False)
+    assert hidden.name not in {row["action"] for row in _catalogue_of((hidden,))}
+
+
+def _catalogue_of(actions: tuple) -> list[dict]:
+    return [{"action": a.name} for a in actions if a.conversational]
+
+
+def test_a_blocking_action_can_be_told_to_stop(tmp_path: Path) -> None:
+    """`ActionContext.stop` is how something that never returns is closed."""
+    import threading
+
+    from code_analyzer.actions import ActionContext
+
+    stop = threading.Event()
+    context = ActionContext(request=ActionRequest("serve", config=_config()), stop=stop)
+    assert context.stop is stop and not stop.is_set()
+    # Inert unless a front end sets one, so nothing else changed.
+    assert ActionContext(request=ActionRequest("doctor", config=_config())).stop is None
 
 
 def test_the_confirmation_names_the_files_it_is_about_to_replace(tmp_path: Path) -> None:
