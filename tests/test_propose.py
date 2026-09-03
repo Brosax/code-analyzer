@@ -160,7 +160,9 @@ def test_an_untrusted_sentence_cannot_carry_control_characters() -> None:
 # --- the gate ----------------------------------------------------------------
 
 
-def test_ask_degrades_to_a_named_reason_when_the_provider_is_unconfigured() -> None:
+def test_ask_degrades_to_a_named_reason_when_the_provider_is_unconfigured(
+    provider_lane_enabled: None,
+) -> None:
     """Provider down is a gate, not an exception: the trunk keeps working."""
     ok, reason = gate(_config(endpoint="", model=""))
     assert not ok and "endpoint" in reason
@@ -170,7 +172,9 @@ def test_ask_degrades_to_a_named_reason_when_the_provider_is_unconfigured() -> N
     assert proposal.steps == [] and not proposal.used
 
 
-def test_an_unreachable_endpoint_is_skipped_rather_than_raised(tmp_path: Path) -> None:
+def test_an_unreachable_endpoint_is_skipped_rather_than_raised(
+    tmp_path: Path, provider_lane_enabled: None,
+) -> None:
     proposal = propose(
         "帮我看看", _config(endpoint="http://127.0.0.1:1/v1", model="nothing-here"),
         output_root=tmp_path,
@@ -196,3 +200,29 @@ def test_the_skill_says_it_may_not_read_the_tree() -> None:
 
     assert tool_allowlist([skill]) == ("skill",)
     assert "fs" in tool_allowlist([load_skill("build-context-configurator")])
+
+
+# --- the test seam ----------------------------------------------------------
+
+
+def test_the_environment_can_switch_the_model_off_without_opening_a_socket() -> None:
+    """The suite must be green on a machine whose GPU host is powered off.
+
+    The autouse `no_provider` fixture sets this, so the assertion here is that
+    the switch is real: `gate` refuses before it resolves an endpoint, which is
+    why an unroutable host cannot cost the suite 30 seconds a call.
+    """
+    from code_analyzer.llm.propose import disabled_by_env
+
+    assert disabled_by_env()
+    # A blackholed address would take 30s if a socket were attempted.
+    ok, reason = gate(_config(endpoint="http://192.0.2.1:11434/v1", model="anything"))
+    assert not ok and "CODE_ANALYZER_NO_MODEL" in reason
+
+
+def test_the_switch_is_off_by_default_so_an_operator_is_never_silently_offline(
+    provider_lane_enabled: None,
+) -> None:
+    from code_analyzer.llm.propose import disabled_by_env
+
+    assert not disabled_by_env()

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -88,8 +89,20 @@ class Proposal:
         return self.status == "completed"
 
 
+def disabled_by_env() -> bool:
+    """``CODE_ANALYZER_NO_MODEL=1`` -- no socket, no provider, no exceptions.
+
+    Three uses, one switch: a test suite that must be green with the GPU host
+    powered off, an air-gapped machine, and an operator who wants the
+    deterministic tool today.  Checked before anything opens a connection.
+    """
+    return os.environ.get("CODE_ANALYZER_NO_MODEL", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def gate(config: Mapping[str, Any]) -> tuple[bool, str | None]:
     """Whether the lane can run at all: a runtime, an endpoint, a model answering."""
+    if disabled_by_env():
+        return False, "CODE_ANALYZER_NO_MODEL=1 已关闭模型通道"
     settings = config["llm"]
     if not str(settings.get("endpoint") or "").strip() or not str(settings.get("model") or "").strip():
         return False, "[llm] 没有配置 endpoint 和 model"
