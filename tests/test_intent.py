@@ -345,3 +345,36 @@ def test_help_says_that_anything_else_is_simply_said() -> None:
     assert "不认识的输入会自动交给模型理解，不需要前缀" in text
     # The old advice to use a keyword shorthand is gone with the table.
     assert "简写" not in text
+
+
+# --- the offline hint --------------------------------------------------------
+
+
+def test_the_offline_hint_names_a_command_the_operator_can_press_enter_on() -> None:
+    from code_analyzer.intent import offline_hint
+
+    assert offline_hint("扫描 ~/fw") == "/scan ~/fw"
+    assert offline_hint("体检") == "/doctor"
+    assert offline_hint("preflight /tmp") == "/preflight /tmp"
+
+
+def test_the_offline_hint_is_never_an_intent_and_never_runs_by_itself() -> None:
+    """This is not the keyword table coming back.
+
+    That table matched a verb as a substring anywhere in the line and could
+    start an hours-long scan off a coincidence. This matches token 0 exactly,
+    returns text, and waits for a keystroke.
+    """
+    from code_analyzer.intent import offline_hint
+
+    # A substring is not a match.
+    assert offline_hint("帮我扫描一下这个目录") is None
+    assert offline_hint("配置一下扫描") is None
+    assert offline_hint("nonsense here") is None
+    # It returns a string, never something the front end could execute.
+    hint = offline_hint("扫描 ~/fw")
+    assert isinstance(hint, str)
+    # And whatever it emits parses back to a real action.
+    assert parse(hint).kind == ACTION
+    # parse() itself cannot reach it: the same line is still a sentence.
+    assert parse("扫描 ~/fw").kind == ASK

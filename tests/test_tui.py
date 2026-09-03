@@ -261,7 +261,7 @@ def test_a_sentence_goes_to_the_model_with_no_prefix_and_the_box_says_so(tmp_pat
             assert "› 帮我看看哪些单元最值得先扫" in text and "↳ → 模型" in text
             # Provider off in the suite: it degrades and names what still works.
             assert "模型不可达" in text
-            assert "/help" in text and "确定性命令不受影响" in text
+            assert "离线仍然可用" in text and "/help 列出全部命令" in text
 
     asyncio.run(exercise())
 
@@ -955,5 +955,112 @@ def test_escape_on_an_empty_box_drops_the_queue(tmp_path: Path) -> None:
             await pilot.pause()
             assert app._queued == []
             assert "已清空队列（2 条）" in _transcript(app)
+
+    asyncio.run(exercise())
+
+
+def test_a_repeated_outage_is_said_once_and_not_on_every_line(tmp_path: Path) -> None:
+    """Free text is the main path; a dead host must not paint a wall of red."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("帮我看看内存安全")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            first = _transcript(app)
+            assert "模型不可达" in first
+            assert "离线仍然可用" in first and "/llm-doctor 重新探测" in first
+
+            app.submit("再看看别的")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            tail = _transcript(app)[len(first):]
+            assert "模型仍不可达（同上）" in tail
+            assert "离线仍然可用" not in tail
+
+    asyncio.run(exercise())
+
+
+def test_the_hint_is_about_this_sentence_so_it_survives_the_repeat(tmp_path: Path) -> None:
+    """The explanation is about the host and is said once; the hint is not."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("先随便说点什么")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            marker = len(_transcript(app))
+
+            app.submit(f"扫描 {tmp_path}")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            tail = _transcript(app)[marker:]
+            assert "模型仍不可达（同上）" in tail
+            assert f"你可能想要：/scan {tmp_path}" in tail
+
+    asyncio.run(exercise())
+
+
+def test_the_offline_refusal_offers_the_command_the_sentence_named(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit(f"扫描 {tmp_path}")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._occupied():
+                    break
+            text = _transcript(app)
+            assert f"你可能想要：/scan {tmp_path}" in text
+            # Offered, not run.
+            assert app.dialogue.live_run() is None and not app._busy
+
+    asyncio.run(exercise())
+
+
+def test_everything_deterministic_still_works_with_no_provider(tmp_path: Path) -> None:
+    """Only free text needs a model; the rest of the tool does not."""
+
+    async def exercise() -> None:
+        source = tmp_path / "project"
+        (source / "src").mkdir(parents=True)
+        (source / "src" / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("/help")
+            app.submit("/config")
+            app.submit("/set review.fail_on high")
+            await pilot.pause()
+            text = _transcript(app)
+            assert "/scan" in text and "review.fail_on" in text
+            assert app.dialogue.config["review"]["fail_on"] == "high"
+            # And a bare path still proposes a scan without a model.
+            app.submit(str(source))
+            for _ in range(40):
+                await pilot.pause()
+                if app.dialogue.pending_question() is not None:
+                    break
+            assert app.dialogue.live_run() is not None
+            # Decline it, or the confirm question's worker outlives the test.
+            app.submit("n")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._busy:
+                    break
+            assert not app._busy
 
     asyncio.run(exercise())

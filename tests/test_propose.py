@@ -323,3 +323,61 @@ def test_the_intent_model_is_given_its_skill_and_told_not_to_go_looking_for_it()
     assert "<skill_content>" in text
     # Still no findings, no source, no analyzer output.
     assert "summary.json" not in text
+
+
+# --- the gate, now on the path of every sentence -----------------------------
+
+
+def test_three_sentences_against_a_dead_host_cost_one_probe_and_not_three(
+    provider_lane_enabled: None,
+) -> None:
+    """Before the cache this was 90 seconds of silence for one refusal."""
+    from code_analyzer.llm import propose as module
+
+    module.reset_gate()
+    calls: list[float] = []
+
+    def counted(settings: object, *, timeout: float) -> tuple[bool, str]:
+        calls.append(timeout)
+        return False, "unreachable"
+
+    original, module.endpoint_reachable = module.endpoint_reachable, counted
+    try:
+        config = _config(endpoint="http://192.0.2.1:11434/v1", model="nothing")
+        for _ in range(3):
+            ok, reason = module.gate(config)
+            assert not ok and reason == "unreachable"
+    finally:
+        module.endpoint_reachable = original
+    assert len(calls) == 1, "the verdict was not cached"
+    # And the routing probe is the tight one, not the scan lane's 15s.
+    assert calls == [module.ROUTE_PROBE_SECONDS] and module.ROUTE_PROBE_SECONDS < module.PROBE_SECONDS
+
+
+def test_a_cached_verdict_expires_so_a_recovered_host_is_noticed(
+    provider_lane_enabled: None,
+) -> None:
+    from code_analyzer.llm import propose as module
+
+    module.reset_gate()
+    answers = iter([(False, "unreachable"), (True, None)])
+    original = module.endpoint_reachable
+    module.endpoint_reachable = lambda settings, *, timeout: next(answers)
+    try:
+        config = _config(endpoint="http://192.0.2.1:11434/v1", model="nothing")
+        assert module.gate(config)[0] is False
+        # Age the entry past the down TTL.
+        key = ("http://192.0.2.1:11434/v1", "nothing")
+        ok, reason, checked = module._GATE_CACHE[key]
+        module._GATE_CACHE[key] = (ok, reason, checked - module.GATE_TTL_DOWN - 1)
+        assert module.gate(config)[0] is True
+    finally:
+        module.endpoint_reachable = original
+        module.reset_gate()
+
+
+def test_the_ttls_are_estimates_and_the_down_one_is_the_shorter() -> None:
+    """A recovered host must be noticed sooner than a dead one is forgotten."""
+    from code_analyzer.llm.propose import GATE_TTL_DOWN, GATE_TTL_OK
+
+    assert GATE_TTL_DOWN < GATE_TTL_OK

@@ -74,6 +74,7 @@ from .intent import (
     META,
     coerce,
     help_lines,
+    offline_hint,
     parse,
 )
 from .journal import Journal, disabled_by_env
@@ -214,6 +215,8 @@ class AnalyzerApp(App[TuiOutcome]):
         self._ask_generation = 0
         self._ask_inflight = False
         self._last_ask_seconds: float | None = None
+        # Said once per reason, not once per sentence.
+        self._gate_reason: str = ""
 
     # --- the screen ---------------------------------------------------------
 
@@ -452,16 +455,15 @@ class AnalyzerApp(App[TuiOutcome]):
             self._repaint_block(thinking.block_id)
         if proposal is not None and proposal.duration_seconds:
             self._last_ask_seconds = proposal.duration_seconds
+        if proposal is not None and proposal.status == "completed":
+            self._gate_reason = ""
         if proposal is None or proposal.status == "failed":
             self._mount(self.dialogue.failed(
                 f"模型没能回答：{error or proposal.reason}", ["确定性命令不受影响，/help 列出全部"]))
             self._drain_queue()
             return
         if proposal.status == "skipped":
-            # Provider down is a gate, not a failure: everything else still works.
-            self._mount(self.dialogue.say(
-                f"模型不可达：{proposal.reason}",
-                ["确定性命令不受影响：/scan /doctor /config /preflight …，/help 列出全部"]))
+            self._offline(proposal.reason or "模型不可达", thinking)
             self._drain_queue()
             return
         notes = []
@@ -489,6 +491,28 @@ class AnalyzerApp(App[TuiOutcome]):
             "ask.steps", "select", "要执行哪些？输入编号（如 1,2），或直接回车全部拒绝： ",
             options=tuple(step["label"] for step in steps),
         )))
+
+    def _offline(self, reason: str, thinking: Any = None) -> None:
+        """Provider down is a gate, not a failure -- and it is said once.
+
+        Free text is the main path now, so an unreachable host would otherwise
+        paint the same wall of red after every line.  The first time it names
+        the reason and what still works; after that it is one line.
+        """
+        utterance = getattr(thinking, "utterance", "") or ""
+        # The hint is about *this* sentence, so it survives the repeat; the
+        # explanation is about the host, and is said once.
+        hint = offline_hint(utterance)
+        hint_lines = [f"  你可能想要：{hint}"] if hint else []
+        if reason == self._gate_reason:
+            self._mount(self.dialogue.say("模型仍不可达（同上）", hint_lines))
+            return
+        self._gate_reason = reason
+        self._mount(self.dialogue.say(f"模型不可达：{reason}", [
+            "  离线仍然可用：/help 列出全部命令；/scan <目录>、/preflight <目录> 直接可用；",
+            "  直接输入一个目录也可以。/llm-doctor 重新探测。",
+            *hint_lines,
+        ]))
 
     def _run_proposed(self, text: str) -> None:
         """Turn the ticked steps into the very commands the operator could type."""
@@ -767,7 +791,9 @@ class AnalyzerApp(App[TuiOutcome]):
             widget = self.query_one(f"#b-{block_id}", Static)
         except NoMatches:
             return
-        widget.update(self._block_text(block))
+        text = self._block_text(block)
+        widget.display = bool(text.plain.strip())
+        widget.update(text)
 
     def _tick(self) -> None:
         if not self.is_mounted:

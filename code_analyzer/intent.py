@@ -306,6 +306,26 @@ def _bare_path(line: str, state: State) -> Intent | None:
                   argv=(str(candidate),), values={"source": candidate})
 
 
+def offline_hint(line: str) -> str | None:
+    """A command the operator could press enter on, or nothing.
+
+    Reachable only from the offline refusal -- never from ``parse()``, which is
+    why it returns a *string* and not an ``Intent``.  It matches token 0
+    **exactly** against a registry name or alias: no substring, no fuzz, no
+    keyword table.  That distinction is the whole point.  The table this
+    replaces matched a verb anywhere in a line and could start an hours-long
+    scan off a coincidence; this proposes text and waits for a keystroke.
+    """
+    tokens = line.strip().split()
+    if not tokens:
+        return None
+    first = tokens[0].strip().lower()
+    for action in REGISTRY:
+        if any(first == name.lower() for name in action.names()):
+            return " ".join([f"/{action.name}", *tokens[1:]])
+    return None
+
+
 def help_lines() -> list[str]:
     """What /help shows: every action, then the conversation's own commands."""
     lines = ["命令（/ 开头）："]

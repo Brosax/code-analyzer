@@ -43,6 +43,17 @@ from .skills import load_skill, skills_directory
 
 PRODUCER = "operator-intent"
 PROBE_SECONDS = 15.0
+# The routing gate runs on every sentence, so it gets a tighter budget than the
+# scan lane's preflight: a LAN Ollama lists its models in milliseconds
+# (measured 3-53 ms), and a host that needs more than three seconds to list
+# will not answer a generation.  Measured cost of getting this wrong: a
+# blackholed address cost 30 seconds a line, because 15 s was paid twice --
+# once for /v1/models and once for the /api/tags fallback.
+ROUTE_PROBE_SECONDS = 3.0
+# How long a gate verdict is trusted.  Both are estimates, not measurements:
+# they trade a stale answer against a probe per sentence.
+GATE_TTL_OK = 60.0
+GATE_TTL_DOWN = 20.0
 # A proposal a person has to audit is only useful while it is short.
 MAX_STEPS = 3
 MAX_TURNS = 4
@@ -108,16 +119,42 @@ def disabled_by_env() -> bool:
     return os.environ.get("CODE_ANALYZER_NO_MODEL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def gate(config: Mapping[str, Any]) -> tuple[bool, str | None]:
-    """Whether the lane can run at all: a runtime, an endpoint, a model answering."""
+# (endpoint, model) -> (ok, reason, checked_at).  Module level on purpose: it
+# is a property of the host, not of one conversation.
+_GATE_CACHE: dict[tuple[str, str], tuple[bool, str | None, float]] = {}
+
+
+def reset_gate() -> None:
+    """Forget every cached verdict.  For tests, and for `/llm-doctor`."""
+    _GATE_CACHE.clear()
+
+
+def gate(config: Mapping[str, Any], *, timeout: float = ROUTE_PROBE_SECONDS) -> tuple[bool, str | None]:
+    """Whether the lane can run at all: a runtime, an endpoint, a model answering.
+
+    Cached, because this is now on the path of every sentence.  Three sentences
+    at a dead host should cost one probe, not three -- and before the cache
+    that was 90 seconds of silence for three identical refusals.
+    """
     if disabled_by_env():
         return False, "CODE_ANALYZER_NO_MODEL=1 已关闭模型通道"
     settings = config["llm"]
-    if not str(settings.get("endpoint") or "").strip() or not str(settings.get("model") or "").strip():
+    endpoint = str(settings.get("endpoint") or "").strip()
+    model = str(settings.get("model") or "").strip()
+    if not endpoint or not model:
         return False, "[llm] 没有配置 endpoint 和 model"
     if not harness_available():
         return False, "deepseek-harness 运行时不可导入"
-    return endpoint_reachable(settings, timeout=PROBE_SECONDS)
+
+    key = (endpoint, model)
+    cached = _GATE_CACHE.get(key)
+    if cached is not None:
+        ok, reason, checked_at = cached
+        if time.monotonic() - checked_at < (GATE_TTL_OK if ok else GATE_TTL_DOWN):
+            return ok, reason
+    ok, reason = endpoint_reachable(settings, timeout=timeout)
+    _GATE_CACHE[key] = (ok, reason, time.monotonic())
+    return ok, reason
 
 
 def ask_root(override: Path | None = None) -> Path:
@@ -452,6 +489,11 @@ def propose(
                         model=model, third_party=warning)
 
     prune_ask_evidence(run_dir)
+    if str(record.get("status") or "") == "completed":
+        # The host answered.  That is better evidence than any probe, so the
+        # next sentence should not re-check what we just proved.
+        _GATE_CACHE[(str(settings.get("endpoint") or ""), str(settings.get("model") or ""))] = (
+            True, None, time.monotonic())
     body = record.get("proposal") if isinstance(record.get("proposal"), dict) else {}
     session = None
     for artifact in record.get("artifacts") or []:
