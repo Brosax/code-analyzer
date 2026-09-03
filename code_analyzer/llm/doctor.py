@@ -52,8 +52,82 @@ ESTIMATED_COMPLETION_TOKENS = 220
 LIST_TIMEOUT = 15.0
 
 
-def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: float = 300.0) -> dict[str, Any]:
-    """Probe the configured provider and estimate a full scan of ``source``."""
+def describe(result: dict[str, Any]) -> list[str]:
+    """One rendering of a probe, for both front ends.
+
+    ``result`` is either a :func:`connection` (no generation) or a full
+    :func:`probe_llm`; the benchmark and estimate lines simply do not appear
+    when nothing measured them.  The CLI and the conversation share this so the
+    two cannot drift -- the same reason `actions.py` is the only registry.
+    """
+    lines = [
+        f"模型：{result['model'] or '（未配置）'}",
+        f"端点：{result['endpoint']}（profile: {result['profile']}）",
+    ]
+    if result.get("enabled") is False:
+        lines.append("状态：[llm] enabled = false —— 扫描不会调用模型；/set llm.enabled true 打开")
+    if result["third_party_warning"]:
+        lines.append(f"注意：{result['third_party_warning']}")
+    runtime = result["runtime"]
+    lines.append(f"运行时：{'可用' if runtime['available'] else '缺失'}"
+                 f" · SDK {runtime['sdk_version'] or '未知'}")
+    credential = result["credential"]
+    lines.append("凭据：" + (f"可用（{credential.get('source')}）" if credential["ok"]
+                             else f"不可用 —— {credential['reason']}"))
+    models = result["models"]
+    if not models["reachable"]:
+        lines.append(f"连接：不可达 —— {models['reason']}")
+    else:
+        lines.append(f"连接：可达，端点列出 {len(models['available'])} 个模型；"
+                     f"配置的这个{'在其中' if models['model_present'] else '不在其中'}")
+        if not models["model_present"]:
+            lines.append(f"  {models['reason']}")
+    window = result["context_window"]
+    served = window["served"] if window["served"] is not None else "未报告"
+    lines.append(f"上下文窗口：配置 {window['configured']}，端点提供 {served}")
+    if window["reason"]:
+        lines.append(f"  {window['reason']}")
+
+    benchmark = result.get("benchmark")
+    if benchmark is None:
+        # Said plainly rather than left blank: this reading cost no generation,
+        # so it has no tokens per second, and inventing one is the one thing
+        # this codebase will not do.
+        lines.append("速度：本次读取没有发起生成请求，所以没有测量值（/llm-doctor 会实测一次）")
+    elif not benchmark["ok"]:
+        lines.append(f"速度：基准失败 —— {benchmark['reason']}")
+    else:
+        rate = f"{benchmark['tokens_per_second']} tok/s" if benchmark["tokens_per_second"] else "速率未报告"
+        lines.append(f"速度：{rate}，一次请求 {benchmark['latency_seconds']}s（测量）")
+        if benchmark.get("served_other_model"):
+            lines.append(f"  警告：端点是以 {benchmark['served_model']!r} 的身份回答的，"
+                         f"不是 {result['model']!r}")
+    estimate = result.get("estimate")
+    if estimate is not None:
+        if estimate["known"]:
+            lines.append(f"整棵树扫描估算：{duration(estimate['wall_clock_seconds'])}")
+            lines.append(f"  {estimate['basis']}")
+        else:
+            lines.append(f"整棵树扫描估算：未知 —— {estimate['reason']}")
+    return lines
+
+
+def duration(seconds: float) -> str:
+    minutes, remainder = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
+
+
+def connection(config: dict[str, Any], *, timeout: float = LIST_TIMEOUT) -> dict[str, Any]:
+    """Who we are configured to talk to, and whether they are answering.
+
+    The cheap half of :func:`probe_llm`: the configuration, the credential, one
+    model listing and the served context window.  **No completion**, so no
+    tokens and no money -- which is why a model may run `/model` on its own
+    while `/llm-doctor`, which does generate, stays something a person types.
+    """
     settings = config["llm"]
     base = endpoint_url(settings).rstrip("/")
     model = str(settings.get("model", "") or "")
@@ -61,6 +135,7 @@ def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: fl
         "endpoint": base,
         "model": model,
         "profile": settings.get("profile"),
+        "enabled": bool(settings.get("enabled")),
         "runtime": {"available": harness_available(), "sdk_version": _sdk_version()},
         "third_party_warning": third_party_warning(settings),
         "scanners": list(settings.get("scanners") or []),
@@ -76,16 +151,29 @@ def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: fl
 
     result["models"] = _models(base, key, model, timeout=min(timeout, LIST_TIMEOUT))
     result["context_window"] = _context(settings, config)
-    result["benchmark"] = _benchmark(base, key, model, timeout=timeout)
-    result["estimate"] = _estimate(config, source, result["benchmark"])
     result["ok"] = bool(
         result["runtime"]["available"]
         and result["credential"]["ok"]
         and result["models"]["reachable"]
         and result["models"]["model_present"]
+        and result["context_window"]["ok"]
+    )
+    return result
+
+
+def probe_llm(config: dict[str, Any], source: Path | None = None, *, timeout: float = 300.0) -> dict[str, Any]:
+    """Probe the configured provider and estimate a full scan of ``source``."""
+    settings = config["llm"]
+    base = endpoint_url(settings).rstrip("/")
+    model = str(settings.get("model", "") or "")
+    result = connection(config, timeout=timeout)
+    key = api_key(settings) if result["credential"]["ok"] else None
+    result["benchmark"] = _benchmark(base, key, model, timeout=timeout)
+    result["estimate"] = _estimate(config, source, result["benchmark"])
+    result["ok"] = bool(
+        result["ok"]
         and result["benchmark"]["ok"]
         and not result["benchmark"].get("served_other_model")
-        and result["context_window"]["ok"]
     )
     return result
 
@@ -158,7 +246,7 @@ def _models(base: str, key: str | None, model: str, *, timeout: float) -> dict[s
         "model_present": present,
         "available": names,
         "reason": None if present else (
-            f"the endpoint does not serve {model!r}; it serves: {', '.join(names) or '(nothing)'}"
+            f"端点不提供 {model!r}；它提供的是：{', '.join(names) or '（什么都没有）'}"
         ),
     }
 
@@ -179,13 +267,13 @@ def _context(settings: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     if served is None:
         # Not every server can be asked.  Unknown is not a failure: the scan
         # proceeds on the configured window, as it always has.
-        return {"ok": True, "configured": configured, "served": None, "reason": "the endpoint does not report its served window"}
+        return {"ok": True, "configured": configured, "served": None, "reason": "端点不报告它实际提供的窗口"}
     if served < configured:
         return {
             "ok": False, "configured": configured, "served": served,
             "reason": (
-                f"the endpoint serves {served} tokens but [llm] context_window is {configured}: "
-                "prompts past the served window are truncated silently"
+                f"端点只提供 {served} 个 token，而 [llm] context_window 配的是 {configured}："
+                "超出的提示词会被静默截断"
             ),
         }
     return {"ok": True, "configured": configured, "served": served, "reason": None}

@@ -128,7 +128,7 @@ def test_an_endpoint_that_does_not_serve_the_configured_model_is_not_ok(
 
     assert result["ok"] is False
     assert result["models"]["model_present"] is False
-    assert "does not serve 'qwen3.8:27b'" in result["models"]["reason"]
+    assert "端点不提供 'qwen3.8:27b'" in result["models"]["reason"]
     assert "llama3:8b" in result["models"]["reason"]
 
 
@@ -167,7 +167,7 @@ def test_a_served_window_smaller_than_the_configured_one_is_not_ok(
 
     assert result["ok"] is False
     assert result["context_window"]["served"] == 4096
-    assert "truncated silently" in result["context_window"]["reason"]
+    assert "静默截断" in result["context_window"]["reason"]
 
 
 def test_a_slow_endpoint_is_reported_as_slow_not_as_unreachable(

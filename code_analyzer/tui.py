@@ -209,6 +209,10 @@ class AnalyzerApp(App[TuiOutcome]):
         self._waiting: dict[str, tuple[threading.Event, dict[str, Answer]]] = {}
         self._busy = False
         self._busy_since = 0.0
+        # Speeds this session actually measured.  Never a default, never an
+        # estimate dressed as one: absent means nothing has measured it yet.
+        self._last_benchmark: dict[str, Any] | None = None
+        self._last_benchmark_at = 0.0
         # What a model proposed and the operator has not yet ticked, and the
         # commands a ticked proposal turned into.
         self._pending_steps: list[Any] = []
@@ -428,7 +432,8 @@ class AnalyzerApp(App[TuiOutcome]):
         self._busy_since = time.time()
         self._ask_inflight = True
         self.cancel_token = CancellationToken()
-        block = self.dialogue.thinking(utterance, last_seconds=self._last_ask_seconds)
+        block = self.dialogue.thinking(utterance, last_seconds=self._last_ask_seconds,
+                                       model=str(self.dialogue.config["llm"].get("model") or ""))
         self._mount(block)
         self._propose_worker(utterance, self._ask_generation)
 
@@ -751,8 +756,22 @@ class AnalyzerApp(App[TuiOutcome]):
             self._repaint_run(run)
         if outcome is not None:
             self.last_outcome = TuiOutcome(outcome.exit_code, outcome.report_directory)
+            lines = list(outcome.lines)
+            data = outcome.data if isinstance(outcome.data, dict) else {}
+            if name == "llm-doctor" and isinstance(data.get("benchmark"), dict):
+                self._last_benchmark = data["benchmark"]
+                self._last_benchmark_at = time.time()
+            if name in {"model", "llm-doctor"} and isinstance(data.get("models"), dict):
+                # Reachability, not `ok`: a served context window smaller than
+                # the configured one fails the probe while the endpoint is
+                # answering perfectly well.
+                served = data["models"]
+                self._note_gate(bool(served.get("reachable") and served.get("model_present")),
+                                served.get("reason"))
+            if name == "model":
+                lines.extend(self._measured_speeds())
             if not isinstance(run, RunBlock):
-                self._mount(self.dialogue.say(outcome.summary, list(outcome.lines)))
+                self._mount(self.dialogue.say(outcome.summary, lines))
             if self.journal is not None:
                 self.journal.finished(name, outcome.exit_code, outcome.report_directory)
         elif note:
@@ -1066,6 +1085,77 @@ class AnalyzerApp(App[TuiOutcome]):
             text.append(" " + " · ".join(extras), style="dim")
         return text
 
+    def _note_gate(self, ok: bool, reason: str | None) -> None:
+        from .llm.propose import note_gate
+
+        note_gate(self.dialogue.config, ok, reason)
+        self._gate_reason = "" if ok else (reason or self._gate_reason)
+
+    def _scan_rate(self) -> float | None:
+        """Tokens per second from the last run that measured any."""
+        for block in reversed(self.dialogue.blocks):
+            if isinstance(block, RunBlock) and block.final_stats is not None:
+                return block.final_stats.session_tok_s
+        run = self.dialogue.live_run()
+        return run.chat.stats().session_tok_s if run is not None else None
+
+    def _measured_rate(self) -> float | None:
+        """The best tokens-per-second this session measured, or nothing."""
+        if self._last_benchmark and self._last_benchmark.get("tokens_per_second"):
+            return float(self._last_benchmark["tokens_per_second"])
+        return self._scan_rate()
+
+    def _model_mark(self) -> str:
+        """The provider, ambiently.  Reads the gate's cache; never probes.
+
+        Three states, not two: reachable, unreachable, and *not asked yet* --
+        which is drawn as the bare name, because a status line that guesses is
+        worse than one that stays quiet.
+        """
+        from .llm.propose import cached_gate
+
+        llm = self.dialogue.config["llm"]
+        name = str(llm.get("model") or "").strip()
+        if not name:
+            return "未配置模型"
+        parts = [name]
+        if not llm.get("enabled"):
+            parts.append("未启用")
+        else:
+            ok, _reason, _age = cached_gate(self.dialogue.config)
+            if ok is True:
+                parts.append("✓")
+            elif ok is False:
+                parts.append("✕")
+        rate = self._measured_rate()
+        if rate is not None:
+            parts.append(f"{rate} tok/s")
+        return " ".join(parts)
+
+    def _measured_speeds(self) -> list[str]:
+        """Every speed this session measured, each said to be a measurement.
+
+        The action itself cannot know these -- they are facts about this
+        conversation, not about the configuration -- so the front end appends
+        them to what `/model` read from the endpoint.
+        """
+        lines: list[str] = []
+        benchmark = self._last_benchmark or {}
+        if benchmark.get("tokens_per_second"):
+            ago = max(0, int(time.time() - self._last_benchmark_at))
+            lines.append(f"  · 一次生成：{benchmark['tokens_per_second']} tok/s，"
+                         f"整个请求 {benchmark.get('latency_seconds')}s"
+                         f"（/llm-doctor 实测，{ago}s 前）")
+        if self._last_ask_seconds:
+            lines.append(f"  · 理解一句话的往返：{self._last_ask_seconds:.1f}s（实测）")
+        rate = self._scan_rate()
+        if rate is not None:
+            lines.append(f"  · 扫描时的模型对话：{rate} tok/s（会话均值，实测）")
+        if not lines:
+            return ["本会话还没有测到任何速度。`/llm-doctor` 实测一次（一次真实生成，"
+                    "计费、18–52 秒），或者随便说一句话让它跑一趟。"]
+        return ["本会话测得的速度：", *lines]
+
     def _update_status(self) -> None:
         try:
             status = self.query_one("#status", Static)
@@ -1093,6 +1183,7 @@ class AnalyzerApp(App[TuiOutcome]):
         elif self.dialogue.pending_question() is not None:
             parts.append("等你回答上面的问题")
         else:
+            parts.append(self._model_mark())
             parts.append(str(self.source))
         if self._queued:
             parts.append(f"排队 {len(self._queued)}")

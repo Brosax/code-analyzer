@@ -145,6 +145,7 @@ class ThinkingBlock(Block):
     started_at: float = field(default_factory=time.time)
     phase: str = PHASE_PROBING
     last_seconds: float | None = None
+    model: str = ""
     settled: bool = False
     abandoned: bool = False
 
@@ -154,8 +155,14 @@ class ThinkingBlock(Block):
         now = time.time() if now is None else now
         elapsed = max(0, int(now - self.started_at))
         lines = [f"  {spin(frame)} 正在理解这句话… {elapsed}s · {self.phase} · Ctrl+C 放弃"]
-        if self.last_seconds is not None:
-            lines.append(f"    上次 {self.last_seconds:.1f}s（本会话测量）")
+        # Which model is being waited on belongs next to the wait, not three
+        # screens away in `/config`.
+        below = [part for part in (
+            self.model,
+            f"上次 {self.last_seconds:.1f}s（本会话测量）" if self.last_seconds is not None else "",
+        ) if part]
+        if below:
+            lines.append("    " + " · ".join(below))
         return lines
 
 
@@ -313,9 +320,10 @@ class Dialogue:
     def said(self, text: str, reading: str = "", by: str = "parser", queued: int = 0) -> UserBlock:
         return self.add(UserBlock(text=text, reading=reading, by=by, queued=queued))  # type: ignore[return-value]
 
-    def thinking(self, utterance: str, last_seconds: float | None = None) -> ThinkingBlock:
+    def thinking(self, utterance: str, last_seconds: float | None = None,
+                 model: str = "") -> ThinkingBlock:
         return self.add(ThinkingBlock(  # type: ignore[return-value]
-            utterance=utterance, last_seconds=last_seconds, text=utterance))
+            utterance=utterance, last_seconds=last_seconds, model=model, text=utterance))
 
     def live_thinking(self) -> ThinkingBlock | None:
         for block in reversed(self.blocks):

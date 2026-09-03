@@ -231,7 +231,7 @@ def _run_doctor(ctx: ActionContext) -> ActionOutcome:
 
 
 def _run_llm_doctor(ctx: ActionContext) -> ActionOutcome:
-    from .llm.doctor import probe_llm
+    from .llm.doctor import describe, probe_llm
 
     request = ctx.request
     ctx.say("llm", "started", "probing the provider")
@@ -240,6 +240,24 @@ def _run_llm_doctor(ctx: ActionContext) -> ActionOutcome:
     return ActionOutcome(
         exit_code=0 if ok else 20,
         summary=f"{result.get('model')} @ {result.get('endpoint')}" + ("" if ok else " · 不可用"),
+        # It measures tokens per second and the conversation used to throw all
+        # of it away: only the CLI ever rendered the probe.
+        lines=describe(result),
+        data=result,
+    )
+
+
+def _run_model(ctx: ActionContext) -> ActionOutcome:
+    from .llm.doctor import connection, describe
+
+    ctx.say("llm", "started", "reading the configured provider")
+    result = connection(ctx.request.config)
+    ok = bool(result.get("ok"))
+    return ActionOutcome(
+        exit_code=0 if ok else 20,
+        summary=f"{result.get('model') or '（未配置模型）'} @ {result.get('endpoint')}"
+                + ("" if ok else " · 不可用"),
+        lines=describe(result),
         data=result,
     )
 
@@ -442,6 +460,14 @@ LLM_DOCTOR = Action(
     spends=True,
     impact=("向配置的端点发一次真实的生成请求（计费、实测 18–52 秒），并走一遍整棵源码树；不修改任何文件。",),
 )
+MODEL = Action(
+    name="model", summary="显示连接的模型：名字、端点、可达性与速度", subject=SUBJECT_NONE,
+    run=_run_model, aliases=("模型",), cli_command="model",
+    # A model listing, not a completion.  `spends` means a generation -- money,
+    # tokens, minutes -- and this is the same request `preflight` already makes,
+    # so a model may reach for it the way it may reach for `doctor`.
+    impact=("只读：读配置，并向端点要一次模型列表（不是生成请求）；不写任何文件。",),
+)
 PREFLIGHT = Action(
     name="preflight", summary="运行前的只读检查", subject=SUBJECT_SOURCE, run=_run_preflight,
     aliases=("预检",), cli_command="preflight",
@@ -544,7 +570,7 @@ CONFIG = Action(
 )
 
 REGISTRY: tuple[Action, ...] = (
-    DOCTOR, LLM_DOCTOR, PREFLIGHT, COMPILE_DB, SCAN, LLM_RESUME,
+    DOCTOR, LLM_DOCTOR, MODEL, PREFLIGHT, COMPILE_DB, SCAN, LLM_RESUME,
     TOOLS_RESUME, ASSESS, REBUILD_DASHBOARD, RECOVER_REPORT, SERVE, CONFIG,
 )
 

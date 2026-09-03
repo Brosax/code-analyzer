@@ -130,6 +130,37 @@ def reset_gate() -> None:
     _GATE_CACHE.clear()
 
 
+def cached_gate(config: Mapping[str, Any]) -> tuple[bool | None, str | None, float | None]:
+    """What the gate last decided, opening no socket.  ``(None, ...)`` = never asked.
+
+    For an ambient indicator: a status line must not be able to cost a probe,
+    and "not asked yet" is a third state that must not be drawn as "down".
+    """
+    if disabled_by_env():
+        return False, "CODE_ANALYZER_NO_MODEL=1 已关闭模型通道", None
+    settings = settings_for(config)
+    key = (str(settings.get("endpoint") or ""), str(settings.get("model") or ""))
+    cached = _GATE_CACHE.get(key)
+    if cached is None:
+        return None, None, None
+    ok, reason, checked_at = cached
+    return ok, reason, max(0.0, time.monotonic() - checked_at)
+
+
+def note_gate(config: Mapping[str, Any], ok: bool, reason: str | None = None) -> None:
+    """Record a verdict something else just established, opening no socket.
+
+    `/model` and `/llm-doctor` make the same listing request the gate makes, and
+    a real answer is at least as good as the gate's own probe.  Without this the
+    ambient indicator still reads "never asked" straight after a `/model` that
+    just proved the endpoint answers -- which is not a cautious display, it is a
+    wrong one.
+    """
+    settings = settings_for(config)
+    key = (str(settings.get("endpoint") or ""), str(settings.get("model") or ""))
+    _GATE_CACHE[key] = (ok, reason, time.monotonic())
+
+
 def gate(config: Mapping[str, Any], *, timeout: float = ROUTE_PROBE_SECONDS) -> tuple[bool, str | None]:
     """Whether the lane can run at all: a runtime, an endpoint, a model answering.
 

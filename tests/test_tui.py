@@ -913,6 +913,126 @@ def test_a_sentence_typed_while_the_model_thinks_is_queued_and_runs_in_order(
     asyncio.run(exercise())
 
 
+def test_the_status_line_names_the_model_without_ever_probing_for_it(
+    tmp_path: Path, provider_lane_enabled: None,
+) -> None:
+    """Three states, not two: reachable, unreachable, and never asked.
+
+    Needs the lane switch back on: with ``CODE_ANALYZER_NO_MODEL=1`` the answer
+    is a truthful ✕ before anything is asked, which is not the case under test.
+    """
+    from code_analyzer.llm import propose as propose_module
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        app.dialogue.config["llm"]["model"] = "qwen3.8:27b"
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            propose_module.reset_gate()
+
+            # Never asked: the name, and no verdict invented for it.
+            mark = app._model_mark()
+            assert mark == "qwen3.8:27b", mark
+
+            settings = propose_module.settings_for(app.dialogue.config)
+            key = (str(settings.get("endpoint") or ""), str(settings.get("model") or ""))
+            propose_module._GATE_CACHE[key] = (True, None, time.monotonic())
+            assert app._model_mark() == "qwen3.8:27b ✓"
+            propose_module._GATE_CACHE[key] = (False, "拒绝连接", time.monotonic())
+            assert app._model_mark() == "qwen3.8:27b ✕"
+
+            # And a measurement, once there is one.
+            app._last_benchmark = {"tokens_per_second": 24.6, "latency_seconds": 8.2}
+            app._last_benchmark_at = time.time()
+            assert "24.6 tok/s" in app._model_mark()
+
+            app.dialogue.config["llm"]["enabled"] = False
+            assert "未启用" in app._model_mark()
+
+    asyncio.run(exercise())
+
+
+def test_the_speeds_it_reports_are_the_ones_it_measured_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """A number nobody measured is the one thing this codebase will not print."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert "本会话还没有测到任何速度" in "\n".join(app._measured_speeds())
+
+            app._last_benchmark = {"tokens_per_second": 24.6, "latency_seconds": 8.2}
+            app._last_benchmark_at = time.time()
+            app._last_ask_seconds = 21.7
+            lines = "\n".join(app._measured_speeds())
+            assert "24.6 tok/s" in lines and "8.2s" in lines and "/llm-doctor 实测" in lines
+            assert "21.7s（实测）" in lines
+            assert "ETA" not in lines and "估算" not in lines
+
+    asyncio.run(exercise())
+
+
+def test_the_probe_that_measured_a_speed_shows_it_in_the_conversation(
+    tmp_path: Path,
+) -> None:
+    """It measured tok/s all along and only the CLI ever rendered it."""
+    from code_analyzer.actions import ActionOutcome
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._finished("", "llm-doctor", ActionOutcome(
+                exit_code=0, summary="qwen3.8:27b @ http://h:1",
+                lines=["速度：24.6 tok/s，一次请求 8.2s（测量）"],
+                data={"benchmark": {"ok": True, "tokens_per_second": 24.6, "latency_seconds": 8.2}},
+            ), "")
+            await pilot.pause()
+
+            assert "24.6 tok/s" in _transcript(app)
+            # And the session remembers it, so `/model` can report it later.
+            assert app._last_benchmark is not None
+            assert "24.6 tok/s" in "\n".join(app._measured_speeds())
+
+    asyncio.run(exercise())
+
+
+def test_a_reading_that_reached_the_endpoint_updates_the_ambient_verdict(
+    tmp_path: Path, provider_lane_enabled: None,
+) -> None:
+    """It said "never asked" right after a `/model` that had just answered."""
+    from code_analyzer.actions import ActionOutcome
+    from code_analyzer.llm import propose as propose_module
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        app.dialogue.config["llm"]["model"] = "qwen3.8:27b"
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            propose_module.reset_gate()
+            assert app._model_mark() == "qwen3.8:27b"
+
+            app._finished("", "model", ActionOutcome(
+                exit_code=20,        # a served window smaller than the configured one
+                summary="qwen3.8:27b @ http://h:1",
+                data={"models": {"reachable": True, "model_present": True, "reason": None}},
+            ), "")
+            await pilot.pause()
+            # Reachability, not the overall verdict: the endpoint is answering.
+            assert app._model_mark().startswith("qwen3.8:27b ✓")
+
+            app._finished("", "model", ActionOutcome(
+                exit_code=20, summary="x",
+                data={"models": {"reachable": False, "model_present": False, "reason": "拒绝连接"}},
+            ), "")
+            await pilot.pause()
+            assert app._model_mark().startswith("qwen3.8:27b ✕")
+
+    asyncio.run(exercise())
+
+
 def test_the_status_line_has_a_row_of_its_own_instead_of_the_footers(tmp_path: Path) -> None:
     """It docked bottom beside `Footer`, which keeps that row: it drew under it.
 

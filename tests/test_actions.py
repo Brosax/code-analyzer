@@ -208,6 +208,9 @@ GROUND_TRUTH = {
     #                    writes  spends  blocks
     "doctor":            (False, False, False),
     "llm-doctor":        (False, True,  False),
+    # One model listing, the same request preflight already makes.  `spends`
+    # means a generation -- tokens, money, minutes -- and this makes none.
+    "model":             (False, False, False),
     "preflight":         (False, False, False),
     "config":            (False, False, False),
     "compile-db":        (True,  False, False),
@@ -248,7 +251,7 @@ def test_every_action_that_never_confirms_declares_no_writes_and_no_indefinite_b
 def test_every_action_a_model_may_auto_run_spends_no_provider_time() -> None:
     """The auto-run set is exactly what "read-only" can honestly mean."""
     auto = {action.name for action in REGISTRY if action.auto_run}
-    assert auto == {"doctor", "preflight", "config"}
+    assert auto == {"doctor", "preflight", "config", "model"}
     for action in REGISTRY:
         if action.auto_run:
             assert not action.writes and not action.spends and not action.blocks, action.name

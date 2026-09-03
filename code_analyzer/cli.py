@@ -47,6 +47,10 @@ def parser() -> argparse.ArgumentParser:
     llm_resume.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     llm_resume.add_argument("--config", type=Path)
     add_llm_arguments(llm_resume)
+    model_cmd = commands.add_parser("model", help="show the configured model, endpoint and reachability")
+    model_cmd.add_argument("--config", type=Path)
+    model_cmd.add_argument("--json", action="store_true", dest="as_json")
+    add_llm_arguments(model_cmd)
     pre = commands.add_parser("preflight", help="read-only checks before a scan")
     pre.add_argument("source", type=Path)
     pre.add_argument("--config", type=Path)
@@ -154,6 +158,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
             else:
                 _print_llm_doctor(result)
+            return outcome.exit_code
+        if args.command == "model":
+            config = load_config(Path.cwd(), args.config,
+                                 {"llm": llm_overrides(args)} if llm_overrides(args) else None)
+            outcome = _invoke("model", ActionRequest("model", config=config, args=args))
+            if args.as_json:
+                print(json.dumps(outcome.data or {}, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                for line in outcome.lines:
+                    print(line)
             return outcome.exit_code
         if args.command == "compile-db":
             return _invoke("compile-db", ActionRequest(
@@ -371,48 +385,10 @@ def _print_doctor(result: dict[str, Any]) -> None:
 
 
 def _print_llm_doctor(result: dict[str, Any]) -> None:
-    print(f"endpoint: {result['endpoint']}  (profile: {result['profile']})")
-    print(f"model: {result['model']}")
-    if result["third_party_warning"]:
-        print(f"WARNING: {result['third_party_warning']}")
-    runtime = result["runtime"]
-    print(f"runtime: {'available' if runtime['available'] else 'MISSING'}  sdk {runtime['sdk_version'] or 'unknown'}")
-    credential = result["credential"]
-    print(f"credential: {'ok' if credential['ok'] else 'unusable'}"
-          + (f" — {credential.get('source')}" if credential["ok"] else f" — {credential['reason']}"))
-    models = result["models"]
-    if not models["reachable"]:
-        print(f"models: unreachable — {models['reason']}")
-    else:
-        print(f"models: {len(models['available'])} served; configured model {'present' if models['model_present'] else 'ABSENT'}")
-        if not models["model_present"]:
-            print(f"  {models['reason']}")
-    window = result["context_window"]
-    print(f"context window: configured {window['configured']}, served {window['served'] if window['served'] is not None else 'unreported'}")
-    if window["reason"]:
-        print(f"  {window['reason']}")
-    benchmark = result["benchmark"]
-    if not benchmark["ok"]:
-        print(f"benchmark: failed — {benchmark['reason']}")
-    else:
-        rate = f"{benchmark['tokens_per_second']} tok/s" if benchmark["tokens_per_second"] else "rate unreported"
-        print(f"benchmark: {benchmark['latency_seconds']}s for one request, {rate}")
-        if benchmark.get("served_other_model"):
-            print(f"  WARNING: the endpoint answered as {benchmark['served_model']!r}, not {result['model']!r}")
-    estimate = result["estimate"]
-    if estimate["known"]:
-        print(f"estimated full scan: {_duration(estimate['wall_clock_seconds'])}")
-        print(f"  {estimate['basis']}")
-    else:
-        print(f"estimated full scan: unknown — {estimate['reason']}")
+    from .llm.doctor import describe
 
-
-def _duration(seconds: float) -> str:
-    minutes, remainder = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
+    for line in describe(result):
+        print(line)
 
 
 if __name__ == "__main__":
