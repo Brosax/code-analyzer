@@ -1,0 +1,84 @@
+# TF-M full review: static over the whole tree, LLM riskiest-first under an
+# 8-hour deadline, then validation and the overall summary.
+config_schema_version = 2
+
+[run]
+output_root = "/home/ubuntu/workspace/code-analyzer/code-analyzer-reports"
+profile = "exhaustive"
+shareable_export = true
+log_level = "info"
+
+[source]
+follow_symlinks = false
+respect_gitignore = false
+
+[build]
+compile_database_mode = "auto"
+# The whole point of this run: 1465 of 1588 Splint units died on missing
+# includes last time.  Diagnose, let the model complete the build context,
+# prove it on a probe, apply it, and re-run the failed units.
+assist = "propose"
+assist_rounds = 2
+assist_probe_units = 12
+stub_headers = true
+approval_timeout_seconds = 0
+
+[review]
+enabled = true
+fail_on = "none"
+gate_includes_llm = false
+
+[tools.cppcheck]
+timeout_seconds = 10800
+
+[tools.flawfinder]
+timeout_seconds = 3600
+
+[tools.splint]
+scope = "auto"
+jobs = 8
+tu_timeout_seconds = 60
+total_timeout_seconds = 21600
+heartbeat_seconds = 10
+
+[llm]
+enabled = true
+profile = "gpu-host"
+scanners = [
+  "llm-memory-safety",
+  "llm-security",
+  "llm-firmware-concurrency",
+  "llm-undefined-behavior",
+  "llm-resource-error",
+  "llm-logic",
+]
+jobs = 4
+reasoning = "off"
+intent_reasoning = "low"
+max_completion_tokens = 2000
+request_timeout_seconds = 600.0
+# Eight hours, decided with the operator.  The plan is 42 678 units x 6
+# scanners; nothing on one GPU covers that, so the deadline is the real bound
+# and everything past it is accounted as `unscheduled` and resumable.
+total_timeout_seconds = 28800.0
+# Per scanner, and deliberately above what the deadline can spend: the wall
+# clock is the bound that was chosen, and a token budget that bit first would
+# stop the run for a reason nobody picked.
+total_prompt_tokens = 4000000
+total_completion_tokens = 400000
+cache = true
+# 40 647 of the 42 678 units are board-support code under platform/.  Pushed to
+# the bottom of the dispatch order -- which is riskiest-first -- so the eight
+# hours buy the firmware core (secure_fw, bl1, bl2, lib, interface) before they
+# buy a vendor's LED driver.  Declared here rather than filtered away: the plan
+# still contains every unit, and the manifest still says what it did not reach.
+risk_overrides = ["platform/**=low"]
+risk_profile = "auto"
+min_tier = "low"
+heartbeat_seconds = 15.0
+consecutive_failure_limit = 8
+export_sessions = false
+
+[audit]
+enabled = true
+validation_max_candidates = 200
