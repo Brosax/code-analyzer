@@ -201,13 +201,86 @@ class _Args:
         self.yes = False
 
 
-def test_the_scan_action_is_the_one_that_confirms_and_the_probes_are_not() -> None:
-    """A scan may run for hours; a probe reads and returns."""
-    assert by_name("scan").confirm == CONFIRM_ALWAYS
-    assert by_name("scan").long_running
-    for name in ("doctor", "llm-doctor", "preflight", "rebuild-dashboard", "recover-report"):
-        assert by_name(name).confirm == "never", name
-        assert not by_name(name).long_running, name
+# The ground-truth audit, as a table.  No test can prove `writes == ()` over a
+# whole call tree, so this mirrors the audit that traced each one by hand: if
+# an effect is ever re-declared, this fails and someone has to look again.
+GROUND_TRUTH = {
+    #                    writes  spends  blocks
+    "doctor":            (False, False, False),
+    "llm-doctor":        (False, True,  False),
+    "preflight":         (False, False, False),
+    "config":            (False, False, False),
+    "compile-db":        (True,  False, False),
+    "scan":              (True,  True,  False),
+    "llm-resume":        (True,  True,  False),
+    "tools-resume":      (True,  True,  True),
+    "assess":            (True,  True,  False),
+    "rebuild-dashboard": (True,  False, False),
+    "recover-report":    (True,  False, False),
+    "serve":             (False, False, True),
+}
+
+
+def test_every_declared_effect_matches_the_audit_of_its_call_tree() -> None:
+    assert set(GROUND_TRUTH) == {action.name for action in REGISTRY}
+    for action in REGISTRY:
+        writes, spends, blocks = GROUND_TRUTH[action.name]
+        assert bool(action.writes) is writes, f"{action.name}: writes"
+        assert action.spends is spends, f"{action.name}: spends"
+        assert action.blocks is blocks, f"{action.name}: blocks"
+
+
+def test_every_action_that_never_confirms_declares_no_writes_and_no_indefinite_block() -> None:
+    """`confirm` is derived, so it cannot disagree with what the code does.
+
+    Three actions were `confirm=never` while rewriting manifest.json or opening
+    a socket, because the field was stored and nothing checked it against the
+    call tree.
+    """
+    for action in REGISTRY:
+        if action.confirm == "never":
+            assert not action.writes, action.name
+            assert not action.blocks, action.name
+        else:
+            assert action.writes or action.blocks, action.name
+
+
+def test_every_action_a_model_may_auto_run_spends_no_provider_time() -> None:
+    """The auto-run set is exactly what "read-only" can honestly mean."""
+    auto = {action.name for action in REGISTRY if action.auto_run}
+    assert auto == {"doctor", "preflight", "config"}
+    for action in REGISTRY:
+        if action.auto_run:
+            assert not action.writes and not action.spends and not action.blocks, action.name
+
+
+def test_rebuilding_the_dashboard_confirms_because_it_rewrites_the_manifest() -> None:
+    """manifest.json is the only source of node truth; nothing rewrites it silently."""
+    for name in ("rebuild-dashboard", "recover-report"):
+        action = by_name(name)
+        assert action.confirm == CONFIRM_ALWAYS, name
+        assert any("manifest.json" in path for path in action.writes), name
+        assert "manifest.json" in " ".join(action.impact), name
+
+
+def test_the_action_that_never_returns_is_not_in_the_catalogue_a_model_sees() -> None:
+    """A model must not name something that cannot be stopped."""
+    from code_analyzer.llm.propose import catalogue
+
+    assert by_name("serve").blocks and not by_name("serve").conversational
+    assert "serve" not in {row["action"] for row in catalogue()}
+
+
+def test_the_confirmation_names_the_files_it_is_about_to_replace(tmp_path: Path) -> None:
+    """"开始吗？" asks consent to a sentence; the paths ask consent to the act."""
+    from code_analyzer.actions import render_writes
+
+    request = ActionRequest("recover-report", report_directory=tmp_path / "run-1", config=_config())
+    rendered = render_writes(by_name("recover-report"), request)
+    assert any(str(tmp_path / "run-1") in path for path in rendered)
+    assert any("manifest.json" in path for path in rendered)
+    # An action that writes nothing renders nothing.
+    assert render_writes(by_name("doctor"), ActionRequest("doctor", config=_config())) == ()
 
 
 def test_an_action_that_needs_a_subject_says_so_rather_than_guessing() -> None:

@@ -684,3 +684,96 @@ def test_a_command_with_flags_keeps_everything_set_in_the_session(tmp_path: Path
             assert request.config["llm"]["enabled"] is True
 
     asyncio.run(exercise())
+
+
+# --- the confirm audit -------------------------------------------------------
+
+
+def test_an_action_that_needs_no_subject_is_not_handed_the_sessions_source_tree(tmp_path: Path) -> None:
+    """`/serve` in the conversation used to start a full analysis.
+
+    `_request` filled `source` and `report_directory` for every action, and
+    `_run_serve` branches on `request.source is not None`.
+    """
+
+    async def exercise() -> None:
+        from code_analyzer.actions import SUBJECT_NONE, by_name
+        from code_analyzer.intent import parse
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert app.dialogue.source == tmp_path
+
+            for name in ("doctor", "config"):
+                action = by_name(name)
+                assert action.subject == SUBJECT_NONE
+                request = app._request(action, parse(f"/{name}", app.dialogue.state()))
+                assert request.source is None, name
+                assert request.report_directory is None, name
+
+            # And an action that does need one still gets it.
+            scan = app._request(by_name("scan"), parse(f"/scan {tmp_path}", app.dialogue.state()))
+            assert scan.source == tmp_path and scan.report_directory is None
+
+    asyncio.run(exercise())
+
+
+def test_the_confirmation_of_a_writing_action_names_the_files(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        run = tmp_path / "20260903T000000Z-abcdef"
+        run.mkdir()
+        (run / "manifest.json").write_text('{"source": "%s"}' % tmp_path, encoding="utf-8")
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit(f"/rebuild-dashboard {run}")
+            for _ in range(40):
+                await pilot.pause()
+                if app.dialogue.pending_question() is not None:
+                    break
+            question = app.dialogue.pending_question()
+            assert question is not None
+            preview = "\n".join(question.question.preview)
+            assert "manifest.json" in preview
+            assert str(run) in preview
+            app.submit("n")
+            for _ in range(40):
+                await pilot.pause()
+                if not app._busy:
+                    break
+
+    asyncio.run(exercise())
+
+
+def test_saving_the_configuration_asks_before_it_replaces_the_file(tmp_path: Path) -> None:
+    """The one write the conversation does outside an action."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.submit("/set review.fail_on high")
+            await pilot.pause()
+            target = tmp_path / ".code-analyzer.toml"
+
+            app.action_save()
+            await pilot.pause()
+            question = app.dialogue.pending_question()
+            assert question is not None and question.question.id == "save.confirm"
+            assert str(target) in "\n".join(question.question.preview)
+            # Declining writes nothing.
+            app.submit("n")
+            await pilot.pause()
+            assert not target.exists()
+            assert "没有写入" in _transcript(app)
+
+            app.action_save()
+            await pilot.pause()
+            app.submit("y")
+            await pilot.pause()
+            assert target.exists()
+            assert "review" in target.read_text(encoding="utf-8")
+            assert not app.dirty
+
+    asyncio.run(exercise())

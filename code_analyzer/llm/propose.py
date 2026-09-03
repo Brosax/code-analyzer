@@ -50,6 +50,11 @@ MIN_COMPLETION_TOKENS = 1024
 # How much of the sentence and of the context the model is given.
 MAX_UTTERANCE = 2000
 MAX_CONTEXT_ROWS = 40
+# What one routing request may take.  `settings_for` spreads config["llm"] and
+# overrides five keys but not this one, so the ask lane inherited
+# `request_timeout_seconds = 600.0` (config.py:94) -- ten minutes for a
+# question whose measured worst case is 79 seconds.  1.5x that is the budget.
+ROUTE_REQUEST_TIMEOUT = 120.0
 
 
 @dataclass
@@ -117,10 +122,20 @@ def catalogue() -> list[dict[str, Any]]:
     Generated rather than written out, so the catalogue cannot drift from what
     is actually executable -- an action the model names is an action that
     exists, by construction.
+
+    ``conversational=False`` keeps one out: today that is ``serve``, which
+    never returns on its own because ``_run_serve`` does not pass the ``stop``
+    event ``serve.serve`` accepts.  A model must not be able to name something
+    the operator cannot then stop.
+
+    Deliberately absent: any "this one runs immediately" column.  Telling the
+    model which steps are free biases it toward proposing those; the front end
+    can ask ``by_name(step.action).auto_run`` itself.
     """
     return [
         {"action": action.name, "does": action.summary, "needs": action.subject}
         for action in REGISTRY
+        if action.conversational
     ]
 
 
@@ -130,6 +145,7 @@ def settings_for(config: Mapping[str, Any]) -> dict[str, Any]:
         **llm, "jobs": 1, "max_steps": MAX_STEPS_PER_SESSION,
         "max_turns": max(MAX_TURNS, int(llm.get("max_turns") or 0)),
         "max_completion_tokens": max(MIN_COMPLETION_TOKENS, int(llm.get("max_completion_tokens") or 0)),
+        "request_timeout_seconds": ROUTE_REQUEST_TIMEOUT,
         # One answer per question; a replay would answer a different sentence.
         "cache": False,
     }

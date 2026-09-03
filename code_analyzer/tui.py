@@ -40,12 +40,14 @@ from textual.widgets import Collapsible, Footer, Header, Input, RichLog, Static
 
 from .actions import (
     CONFIRM_ALWAYS,
+    SUBJECT_NONE,
     SUBJECT_REPORT,
     SUBJECT_SOURCE,
     ActionContext,
     ActionRequest,
     by_name,
     invoke,
+    render_writes,
 )
 from .analysis import AnalysisEvent, CancellationToken
 from .argv import analyze_overrides, assess_overrides
@@ -203,6 +205,7 @@ class AnalyzerApp(App[TuiOutcome]):
         # commands a ticked proposal turned into.
         self._pending_steps: list[Any] = []
         self._queued: list[str] = []
+        self._pending_save: Path | None = None
 
     # --- the screen ---------------------------------------------------------
 
@@ -495,10 +498,20 @@ class AnalyzerApp(App[TuiOutcome]):
         self._run_action(action.name, request, block_id)
 
     def _request(self, action: Any, intent: Any) -> ActionRequest:
-        """Turn a parsed line into what the registry takes."""
+        """Turn a parsed line into what the registry takes.
+
+        A subject is supplied only to an action that declares it needs one.
+        Filling both for everything is how ``/serve`` in the conversation came
+        to start a full analysis: ``_run_serve`` branches on
+        ``request.source is not None``, and every request carried the
+        session's source whether the action asked for one or not.
+        """
         namespace = intent.values.get("namespace")
-        source = intent.values.get("source") or self.dialogue.source
-        report = intent.values.get("report_directory") or self.dialogue.report_directory
+        source = report = None
+        if action.subject == SUBJECT_SOURCE:
+            source = intent.values.get("source") or self.dialogue.source
+        elif action.subject == SUBJECT_REPORT:
+            report = intent.values.get("report_directory") or self.dialogue.report_directory
         config = self.dialogue.config
         if namespace is not None:
             if action.subject == SUBJECT_SOURCE and getattr(namespace, "source", None):
@@ -512,6 +525,8 @@ class AnalyzerApp(App[TuiOutcome]):
                 # everything the operator set with /set has to survive a
                 # command that also carries flags.
                 config = apply_overrides(copy.deepcopy(config), overrides, sources=self.sources)
+        if action.subject == SUBJECT_NONE and (source is not None or report is not None):
+            raise UserError(f"{action.name} 不接受目标目录")
         if action.subject == SUBJECT_SOURCE and source is None:
             raise UserError(f"{action.name} 需要一个源码目录")
         if action.subject == SUBJECT_REPORT and report is None:
@@ -528,7 +543,9 @@ class AnalyzerApp(App[TuiOutcome]):
             if action.confirm == CONFIRM_ALWAYS:
                 answer = asker(Question(
                     f"{action.name}.confirm", CONFIRM, "开始吗？ [y/N] ",
-                    preview=(f"{action.summary}", *(f"  {line}" for line in action.impact)),
+                    preview=(f"{action.summary}",
+                             *(f"  {line}" for line in action.impact),
+                             *(f"  将写入 {path}" for path in render_writes(action, request))),
                 ))
                 if not answer.yes:
                     self.call_from_thread(self._finished, block_id, name, None, "已取消")
@@ -630,6 +647,12 @@ class AnalyzerApp(App[TuiOutcome]):
             done, box = waiting
             box["answer"] = answer
             done.set()
+        elif getattr(question, "question", None) is not None and question.question.id == "save.confirm":
+            target, self._pending_save = self._pending_save, None
+            if answer.yes and target is not None:
+                self._save_now(target)
+            else:
+                self._mount(self.dialogue.say("没有写入。"))
         elif self._pending_steps and getattr(question, "question", None) is not None \
                 and question.question.id == "ask.steps":
             self._run_proposed(text)
@@ -939,7 +962,22 @@ class AnalyzerApp(App[TuiOutcome]):
             self._repaint_run(widgets[-1].block)
 
     def action_save(self, destination: Path | None = None) -> None:
+        """Ask before replacing a file on disk.
+
+        The only write the conversation performs outside an action, so it needs
+        the beat an action gets from `Action.confirm` -- it replaces a config
+        file whole, comments and ordering included.
+        """
         target = destination or (self.explicit_config or self.source / ".code-analyzer.toml")
+        self._pending_save = target
+        self._mount(self.dialogue.ask(Question(
+            "save.confirm", CONFIRM, "写入吗？ [y/N] ",
+            preview=("把当前会话配置写成完整的 schema v2 快照",
+                     f"  将写入 {target}" + ("（覆盖已有文件）" if target.exists() else ""),
+                     "  原文件的注释与键顺序不会保留。"),
+        )))
+
+    def _save_now(self, target: Path) -> None:
         try:
             saved = save_config_snapshot(self.source, self.dialogue.config, target, overwrite=True)
         except (UserError, OSError) as exc:

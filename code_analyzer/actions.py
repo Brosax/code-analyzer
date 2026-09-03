@@ -35,10 +35,10 @@ SUBJECT_NONE = "none"
 SUBJECT_SOURCE = "source"
 SUBJECT_REPORT = "report"
 
-# When the front end must stop and confirm before running.
+# When the front end must stop and confirm before running.  Both are derived
+# from declared effects (see Action.confirm); neither is ever stored.
 CONFIRM_NEVER = "never"
 CONFIRM_ALWAYS = "always"
-CONFIRM_WHEN_WRITES = "when_writes"
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,17 @@ class ActionOutcome:
 
 @dataclass(frozen=True)
 class Action:
-    """One thing an operator can ask for."""
+    """One thing an operator can ask for, and what it does to the world.
+
+    The three effect fields are facts about the call tree, audited against it.
+    ``confirm`` and ``auto_run`` are *derived* from them rather than stored,
+    which is the whole point: a stored policy can disagree with what the code
+    does, and three of them did -- ``rebuild-dashboard``, ``recover-report``
+    and ``serve`` were all marked "never confirm" while rewriting
+    ``manifest.json`` or opening a socket.  A declaration cannot disagree with
+    a policy derived from it, and an under-declared ``writes`` can no longer be
+    papered over by a hand-set ``confirm``.
+    """
 
     name: str
     summary: str
@@ -144,14 +154,56 @@ class Action:
     aliases: tuple[str, ...] = ()
     keywords: tuple[str, ...] = ()
     params: tuple[Param, ...] = ()
-    confirm: str = CONFIRM_NEVER
     long_running: bool = False
     interactive: bool = False
     cli_command: str | None = None
     impact: tuple[str, ...] = ()
+    # --- declared effects ---------------------------------------------------
+    # Path templates using {source} {report} {output_root} {cwd}.  Empty means
+    # this action writes nothing a person would miss -- a temporary directory
+    # does not count, and the audit says so per action.
+    writes: tuple[str, ...] = ()
+    # Sends a *completion* request: tokens, money on a metered provider, and
+    # minutes.  A model listing (preflight's endpoint probe) is not spending.
+    spends: bool = False
+    # Waits unboundedly on a person, or never returns on its own.
+    blocks: bool = False
+    # May a model name this action?  False keeps it out of the catalogue.
+    conversational: bool = True
+
+    @property
+    def confirm(self) -> str:
+        """A human named it: naming is the consent, so only effects need a prompt."""
+        return CONFIRM_ALWAYS if (self.writes or self.blocks) else CONFIRM_NEVER
+
+    @property
+    def auto_run(self) -> bool:
+        """A model inferred it: no writes, no money, no indefinite block."""
+        return not self.writes and not self.spends and not self.blocks
 
     def names(self) -> tuple[str, ...]:
         return (self.name, *self.aliases)
+
+
+def render_writes(action: Action, request: ActionRequest) -> tuple[str, ...]:
+    """The paths this action will write, resolved for this request.
+
+    A confirmation that says "开始吗？" asks the operator to consent to a
+    sentence; one that names the files asks them to consent to the act.
+    """
+    values = {
+        "source": str(request.source) if request.source else "<源码目录>",
+        "report": str(request.report_directory) if request.report_directory else "<报告目录>",
+        "output_root": str((request.config or {}).get("run", {}).get("output_root") or "<输出目录>"),
+        "cwd": str(Path.cwd()),
+    }
+    resolved = []
+    for template in action.writes:
+        try:
+            resolved.append(template.format(**values))
+        except (KeyError, IndexError, ValueError):
+            resolved.append(template)
+    return tuple(resolved)
 
 
 # --- the actions ------------------------------------------------------------
@@ -361,13 +413,17 @@ def _run_config(ctx: ActionContext) -> ActionOutcome:
 DOCTOR = Action(
     name="doctor", summary="探测分析器与运行环境", subject=SUBJECT_NONE, run=_run_doctor,
     aliases=("体检",), keywords=("体检", "环境", "doctor"), cli_command="doctor",
-    impact=("只读：探测三个分析器的版本与能力，不写任何文件。",),
+    # Writes only a canary.c inside a TemporaryDirectory (doctor.py:70-72).
+    impact=("只读：探测三个分析器的版本与能力；只在临时目录里编译一个探针，不写任何会留下的文件。",),
 )
 LLM_DOCTOR = Action(
     name="llm-doctor", summary="探测 LLM 提供方并估算一次完整扫描", subject=SUBJECT_SOURCE,
     run=_run_llm_doctor, aliases=("模型体检",), keywords=("模型", "provider", "端点"),
     cli_command="llm-doctor",
-    impact=("向配置的端点发一次基准请求；不修改任何文件。",),
+    # Writes nothing, but it is a real generation: tokens, money on a metered
+    # provider, and 18-52s of time.  Typed is consent; inferred is not.
+    spends=True,
+    impact=("向配置的端点发一次真实的生成请求（计费、实测 18–52 秒），并走一遍整棵源码树；不修改任何文件。",),
 )
 PREFLIGHT = Action(
     name="preflight", summary="运行前的只读检查", subject=SUBJECT_SOURCE, run=_run_preflight,
@@ -377,55 +433,92 @@ PREFLIGHT = Action(
 COMPILE_DB = Action(
     name="compile-db", summary="发现或生成 JSON compilation database", subject=SUBJECT_SOURCE,
     run=_run_compile_db, aliases=("cdb", "编译数据库"), keywords=("编译数据库", "compile_commands"),
-    confirm=CONFIRM_ALWAYS, long_running=True, interactive=True, cli_command="compile-db",
-    impact=("在构建目录里运行 CMake 配置（不编译目标）；产物写入报告目录下的 compile-db/。",),
+    long_running=True, interactive=True, cli_command="compile-db",
+    # Two corrections: the log does NOT go under the report directory (it goes
+    # under the process CWD, compile_db_wizard.py:349-357) and the build tree
+    # defaults to INSIDE the scanned source tree (:183).
+    writes=("{cwd}/code-analyzer-reports/compile-db/…", "{source}/build/code-analyzer/…"),
+    impact=("运行 CMake 配置（不编译目标）；日志写在当前工作目录下的 code-analyzer-reports/compile-db/，"
+            "构建目录默认在源码树内的 build/code-analyzer/。--method command 会运行你给的任意命令。",),
 )
 SCAN = Action(
     name="scan", summary="对一个 C/C++ 源码树执行完整扫描", subject=SUBJECT_SOURCE, run=_run_scan,
     aliases=("analyze", "扫描"), keywords=("扫描", "分析", "跑一遍", "scan"),
     params=(Param("source", kind="path", label="源码根目录", required=True),),
-    confirm=CONFIRM_ALWAYS, long_running=True, interactive=True, cli_command="analyze",
-    impact=("在输出目录下新建一个报告目录；不修改源码树。",),
+    long_running=True, interactive=True, cli_command="analyze",
+    writes=("{output_root}/<报告目录>/…", "{output_root}/.llm-cache"),
+    spends=True,
+    impact=("在输出目录下新建一个报告目录，并写入跨运行缓存；不修改源码树。",),
 )
 LLM_RESUME = Action(
     name="llm-resume", summary="续扫一次运行里未调度或被中断的单元", subject=SUBJECT_REPORT,
     run=_run_llm_resume, aliases=("续扫",), keywords=("续扫", "resume", "接着跑"),
-    confirm=CONFIRM_ALWAYS, long_running=True, cli_command="llm-resume",
-    impact=("向提供方发起新的会话，写入同一个报告目录；已有证据保留。",),
+    long_running=True, cli_command="llm-resume",
+    writes=("{report}/llm/…", "{report}/review/summary.{json,md,sarif}",
+            "{report}/audit/assessment.json", "{report}/manifest.json", "{report}/index.html"),
+    spends=True,
+    impact=("向提供方发起新的会话，并重新派生该运行的 review / SARIF / 评估 / manifest / 报告页；"
+            "原生证据保留。",),
 )
 TOOLS_RESUME = Action(
     name="tools-resume", summary="对已完成的运行继续构建上下文修补循环", subject=SUBJECT_REPORT,
     run=_run_tools_resume, aliases=("补构建上下文",), keywords=("构建上下文", "补丁", "splint 失败"),
-    confirm=CONFIRM_ALWAYS, long_running=True, interactive=True, cli_command="tools-resume",
-    impact=("只重跑失败的单元到新的单元目录；不修改配置文件，不运行构建。",),
+    long_running=True, interactive=True, cli_command="tools-resume",
+    writes=("{report}/manifest.json", "{report}/inputs/build-context/…",
+            "{report}/suggested-config.toml", "{report}/tools/…"),
+    # Consults the model independently of the LLM lane, and
+    # build.approval_timeout_seconds = 0.0 becomes timeout=None: it waits for a
+    # person forever (reconfigure.py:192-193).
+    spends=True, blocks=True,
+    impact=("只重跑失败的单元到新的单元目录；不修改配置文件，不运行构建。"
+            "补丁被采纳时会调用 recover-report 重新派生全部产物。默认会无限期等待你的决定。",),
 )
 ASSESS = Action(
     name="assess", summary="用验证器复核已关联的候选项", subject=SUBJECT_REPORT, run=_run_assess,
     aliases=("验证",), keywords=("验证", "复核", "assess"),
-    confirm=CONFIRM_ALWAYS, long_running=True, cli_command="assess",
-    impact=("每个候选项一次模型会话；review/summary.json 不变。",),
+    long_running=True, cli_command="assess",
+    writes=("{report}/llm/…", "{report}/audit/assessment.json",
+            "{report}/manifest.json", "{report}/index.html"),
+    spends=True,
+    impact=("每个候选项一次模型会话，写入评估、manifest 与报告页；review/summary.json 不变。",),
 )
 REBUILD_DASHBOARD = Action(
     name="rebuild-dashboard", summary="从已有报告重建 index.html", subject=SUBJECT_REPORT,
     run=_run_rebuild_dashboard, aliases=("重建报告页",), keywords=("重建", "dashboard"),
-    cli_command="rebuild-dashboard", impact=("只重写 index.html。",),
+    cli_command="rebuild-dashboard",
+    # It also rewrites manifest.json -- the only source of node truth
+    # (dashboard.py:70).  The old string omitted that and the old policy was
+    # "never confirm".
+    writes=("{report}/index.html", "{report}/manifest.json"),
+    impact=("重写 index.html，并重写 manifest.json。",),
 )
 RECOVER_REPORT = Action(
     name="recover-report", summary="从原生证据重建全部派生产物", subject=SUBJECT_REPORT,
     run=_run_recover_report, aliases=("恢复报告",), keywords=("恢复", "recover"),
     cli_command="recover-report",
-    impact=("重新派生 review / SARIF / 报告页；不调用任何分析器。",),
+    # Also manifest.json, audit/assessment.json, and one new timestamped ZIP
+    # per call -- unconditionally (recovery.py:82), so it grows without bound.
+    writes=("{report}/review/summary.{json,md,sarif}", "{report}/audit/assessment.json",
+            "{report}/manifest.json", "{report}/index.html", "{report}/exports/<新的 ZIP>"),
+    impact=("重新派生 review / SARIF / audit/assessment.json / manifest.json / index.html，"
+            "并每次新导出一个 ZIP；不调用任何分析器。",),
 )
 SERVE = Action(
     name="serve", summary="用浏览器看一次运行的实时视图", subject=SUBJECT_NONE, run=_run_serve,
     aliases=("实时页",), keywords=("实时", "浏览器", "serve"),
     long_running=True, cli_command="serve",
+    # Never returns on its own: serve.serve loops until a `stop` event that
+    # _run_serve does not yet pass (serve.py:352-355).  Out of the catalogue
+    # until that is fixed -- a model must not name something that cannot stop.
+    blocks=True, conversational=False,
     impact=("在 127.0.0.1 上监听一个端口，直到你停止它。",),
 )
 CONFIG = Action(
     name="config", summary="查看或修改本次会话的配置", subject=SUBJECT_NONE, run=_run_config,
-    aliases=("配置",), keywords=("配置", "设置"), confirm=CONFIRM_WHEN_WRITES,
-    cli_command="config", impact=("只改本次会话；写入 TOML 需要另外确认。",),
+    aliases=("配置",), keywords=("配置", "设置"),
+    cli_command="config",
+    # _run_config cannot write; the config write is /save, which confirms.
+    impact=("只读：列出当前配置与它们的来源。写入 TOML 是 /save，另行确认。",),
 )
 
 REGISTRY: tuple[Action, ...] = (

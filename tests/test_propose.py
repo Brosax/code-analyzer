@@ -46,11 +46,22 @@ def _run(tmp_path: Path) -> Path:
 
 
 def test_the_model_may_only_propose_actions_the_registry_defines() -> None:
-    """Generated, not written out: a named action exists by construction."""
+    """Generated, not written out: a named action exists by construction.
+
+    Minus the ones marked non-conversational -- today `serve`, which never
+    returns on its own, so a model must not be able to name it.
+    """
     names = {row["action"] for row in catalogue()}
-    assert names == {action.name for action in REGISTRY}
+    assert names == {action.name for action in REGISTRY if action.conversational}
+    assert names < {action.name for action in REGISTRY}
     for row in catalogue():
         assert row["does"] and row["needs"] in {"none", "source", "report"}
+
+
+def test_the_catalogue_never_tells_the_model_which_steps_are_free() -> None:
+    """Naming the free ones biases it toward proposing exactly those."""
+    for row in catalogue():
+        assert set(row) == {"action", "does", "needs"}
 
 
 def test_a_proposed_action_outside_the_registry_is_dropped_with_a_reason(tmp_path: Path) -> None:
