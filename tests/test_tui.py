@@ -1033,6 +1033,56 @@ def test_a_reading_that_reached_the_endpoint_updates_the_ambient_verdict(
     asyncio.run(exercise())
 
 
+def test_the_round_trip_says_what_it_cost_where_the_answer_lands(
+    tmp_path: Path,
+) -> None:
+    """It was measured every time and only the *next* wait ever mentioned it."""
+    from code_analyzer.llm.propose import Proposal, Step
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._proposed(Proposal(
+                "completed", model="qwen3.8:27b", duration_seconds=30.0,
+                completion_tokens=744, steps=[Step(action="doctor", why="体检")],
+            ), "", app._ask_generation)
+            await pilot.pause()
+
+            transcript = _transcript(app)
+            assert "qwen3.8:27b · 30.0s · 24.8 tok/s（测量）" in transcript
+            assert "输出 744 token" in transcript
+            # And it is remembered, for the ambient line and for `/model`.
+            assert app._last_ask_rate == 24.8
+            assert "24.8 tok/s" in app._model_mark()
+            assert "30.0s，24.8 tok/s（实测）" in "\n".join(app._measured_speeds())
+
+    asyncio.run(exercise())
+
+
+def test_a_streamed_answer_rates_itself_even_when_the_model_does_no_reasoning(
+    tmp_path: Path,
+) -> None:
+    """`on_chunk` has its own path: an answer streams with no thinking at all."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            block = app.dialogue.thinking("扫一下固件", model="qwen3.8:27b")
+            app._mount(block)
+
+            block.first_chunk_at = time.time() - 4.0
+            app._thinking_text("", 800, app._ask_generation)
+            block.last_chunk_at = block.first_chunk_at + 4.0
+            await pilot.pause()
+
+            assert block.thinking == "", "no reasoning text was sent"
+            assert "tok/s（估算）" in _transcript(app)
+
+    asyncio.run(exercise())
+
+
 def test_the_status_line_has_a_row_of_its_own_instead_of_the_footers(tmp_path: Path) -> None:
     """It docked bottom beside `Footer`, which keeps that row: it drew under it.
 
@@ -1412,5 +1462,31 @@ def test_serving_a_run_announces_its_url_in_the_conversation_and_can_be_closed(
                     break
             assert not app._busy and app.is_running
             assert "实时页已关闭" in _transcript(app)
+
+    asyncio.run(exercise())
+
+
+def test_the_model_thinking_out_loud_reaches_the_wait_block(tmp_path: Path) -> None:
+    """The reasoning is the decision; the JSON is only its conclusion."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path, llm=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            block = app.dialogue.thinking("扫一下固件", model="qwen3.8:27b")
+            app._mount(block)
+            await pilot.pause()
+
+            app._thinking_text("先确认路径存在，", 8, app._ask_generation)
+            app._thinking_text("再决定跑 scan 还是 preflight。", 15, app._ask_generation)
+            await pilot.pause()
+
+            assert "先确认路径存在，" in _transcript(app)
+            assert "▾ 思维链" in _transcript(app)
+
+            # An answer to a question already abandoned changes nothing.
+            app._ask_generation += 1
+            app._thinking_text("这句属于上一轮", 6, app._ask_generation - 1)
+            assert "这句属于上一轮" not in _transcript(app)
 
     asyncio.run(exercise())

@@ -88,6 +88,14 @@ DEFAULTS: dict[str, Any] = {
         # always thinks (GLM-5.x) rejects "off" and wants low/high/max, and its
         # thinking counts against max_completion_tokens.
         "reasoning": "off",
+        # The decision lane thinks; the scanners do not.  A scanner answers with
+        # one JSON object under a 2000-token ceiling, and reasoning is billed
+        # against that ceiling -- measured, a GLM burned 4000 tokens of it and
+        # returned nothing.  Routing one sentence is the opposite case: the
+        # answer is three lines of JSON, the budget is not the constraint, and
+        # the reasoning is the very thing the operator wants to read before
+        # ticking a step that will spend an afternoon.
+        "intent_reasoning": "low",
         "max_completion_tokens": 2000,
         "max_steps": 4,
         "max_turns": 8,
@@ -216,6 +224,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("llm.temperature", "float", "采样温度", "0 表示尽可能确定的输出。", minimum=0.0, advanced=True),
     FieldSpec("llm.seed", "int", "随机种子", "端点支持时用于复现采样。", minimum=0, advanced=True),
     FieldSpec("llm.reasoning", "choice", "推理强度", "模型作答前的思考量：off 关闭（Ollama/Qwen 需要）；始终思考的模型（GLM-5.x）用 low/high/max，思考 token 计入生成上限。", choices=REASONING_LEVELS, advanced=True),
+    FieldSpec("llm.intent_reasoning", "choice", "决策通道推理强度", "自由文本 → 提案这一路的思考量，与扫描器的 llm.reasoning 分开：默认 low，思维链会显示在对话里；扫描器保持 off，以免思考 token 挤占它的 JSON 生成预算。", choices=REASONING_LEVELS, advanced=True),
     FieldSpec("llm.max_completion_tokens", "int", "单次生成上限", "单个单元的最大生成 token 数。", minimum=1, advanced=True),
     FieldSpec("llm.max_steps", "int", "Agent 步数上限", "单个单元内 agent 的最大步数。", minimum=1, advanced=True),
     FieldSpec("llm.max_turns", "int", "模型往返上限", "单个单元内的最大模型往返次数。", minimum=1, advanced=True),
@@ -570,6 +579,9 @@ def _validate_llm(llm: dict[str, Any], audit: dict[str, Any]) -> None:
     _expect(llm["reasoning"], str, "llm.reasoning")
     if llm["reasoning"] not in REASONING_LEVELS:
         raise UserError("llm.reasoning must be " + ", ".join(REASONING_LEVELS))
+    _expect(llm["intent_reasoning"], str, "llm.intent_reasoning")
+    if llm["intent_reasoning"] not in REASONING_LEVELS:
+        raise UserError("llm.intent_reasoning must be " + ", ".join(REASONING_LEVELS))
     if llm["min_tier"] not in RISK_TIERS:
         raise UserError("llm.min_tier must be " + ", ".join(RISK_TIERS))
     for key in (

@@ -440,8 +440,9 @@ button[disabled]{opacity:.5;cursor:default}
      conflated -- an estimate from characters while the answer is arriving,
      the provider's own count once the session settles. */
   const CHARS_PER_TOKEN = 4, MAX_TURNS = 120, MAX_ANSWER = 20000, RATE_WINDOW = 10;
-  const CHAT_STREAMS = { prompt: 1, answer: 1, tool: 1, note: 1 };
-  const LABELS = { waiting: "等待模型", streaming: "接收中", reading: "读取工具", parsing: "解析响应",
+  const MAX_THINKING = 4000;
+  const CHAT_STREAMS = { prompt: 1, answer: 1, thinking: 1, tool: 1, note: 1 };
+  const LABELS = { waiting: "等待模型", thinking: "思考中", streaming: "接收中", reading: "读取工具", parsing: "解析响应",
     completed: "完成", partial: "截断", failed: "失败", timed_out: "超时", interrupted: "已中断",
     unscheduled: "未调度", cached: "缓存命中" };
   const SETTLED = { completed: 1, partial: 1, failed: 1, timed_out: 1, interrupted: 1, unscheduled: 1 };
@@ -468,7 +469,8 @@ button[disabled]{opacity:.5;cursor:default}
     if (!t) {
       t = { key: key, producer: e.tool, unit: e.unit, path: "", tier: "", index: null, total: null,
             state: "waiting", started: e.timestamp, first: null, last: null, prompt: "", promptChars: 0,
-            promptOmitted: 0, answer: "", answerChars: 0, answerCut: false, tools: [], notes: [], cached: false,
+            promptOmitted: 0, answer: "", answerChars: 0, answerCut: false,
+            thinking: "", thinkingChars: 0, thinkingCut: false, tools: [], notes: [], cached: false,
             duration: null, ct: null, pt: null, findings: null, malformed: null, reason: "", finish: "" };
       turns.set(key, t);
       // Forget the oldest settled turn; one still streaming is the one being watched.
@@ -483,8 +485,9 @@ button[disabled]{opacity:.5;cursor:default}
 
   const speedOf = t => {
     if (t.ct && t.duration) return [Math.round(t.ct / t.duration * 10) / 10, "测量"];
-    if (t.first !== null && t.last !== null && t.answerChars && t.last - t.first >= 0.05) {
-      return [Math.round(t.answerChars / CHARS_PER_TOKEN / (t.last - t.first) * 10) / 10, "估算"];
+    const generated = t.answerChars + t.thinkingChars;
+    if (t.first !== null && t.last !== null && generated && t.last - t.first >= 0.05) {
+      return [Math.round(generated / CHARS_PER_TOKEN / (t.last - t.first) * 10) / 10, "估算"];
     }
     return [null, ""];
   };
@@ -532,7 +535,19 @@ button[disabled]{opacity:.5;cursor:default}
         const joined = t.answer + text;
         if (joined.length > MAX_ANSWER) t.answerCut = true;
         t.answer = joined.slice(-MAX_ANSWER);
-        if (t.state === "waiting" || t.state === "reading") t.state = "streaming";
+        if (t.state === "waiting" || t.state === "reading" || t.state === "thinking") t.state = "streaming";
+        const now = e.timestamp;
+        recent.push([now, text.length]);
+        recent = recent.filter(r => r[0] >= now - RATE_WINDOW);
+      } else if (e.stream === "thinking") {
+        const text = String(e.message || "");
+        if (!text) return false;
+        if (t.first === null) t.first = e.timestamp;
+        t.last = e.timestamp; t.thinkingChars += text.length;
+        const joined = t.thinking + text;
+        if (joined.length > MAX_THINKING) t.thinkingCut = true;
+        t.thinking = joined.slice(-MAX_THINKING);
+        if (t.state === "waiting" || t.state === "reading") t.state = "thinking";
         const now = e.timestamp;
         recent.push([now, text.length]);
         recent = recent.filter(r => r[0] >= now - RATE_WINDOW);
@@ -582,7 +597,7 @@ button[disabled]{opacity:.5;cursor:default}
     if (sp[0] !== null) bits.push(sp[0] + " tok/s（" + sp[1] + "）");
     if (t.first !== null && t.started) bits.push("首字 " + Math.max(0, t.first - t.started).toFixed(1) + "s");
     if (t.ct) bits.push("输出 " + num(t.ct) + " tok");
-    else if (t.answerChars) bits.push("输出 ~" + num(Math.floor(t.answerChars / CHARS_PER_TOKEN)) + " tok");
+    else if (t.answerChars + t.thinkingChars) bits.push("输出 ~" + num(Math.floor((t.answerChars + t.thinkingChars) / CHARS_PER_TOKEN)) + " tok");
     if (t.pt) bits.push("输入 " + num(t.pt) + " tok");
     if (t.duration !== null) bits.push("耗时 " + t.duration.toFixed(1) + "s");
     if (t.findings !== null && SETTLED[t.state]) bits.push("发现 " + t.findings);
@@ -613,6 +628,11 @@ button[disabled]{opacity:.5;cursor:default}
       }
       t.tools.slice(-4).forEach(name => box2.append(line("div", "meta", "⚒ 工具调用 " + name)));
       t.notes.slice(-3).forEach(note => box2.append(line("div", "meta", "! " + note)));
+      if (t.thinking) {
+        box2.append(line("div", "meta small", "▾ 思维链 · " + num(t.thinkingChars) + " 字符"
+          + (t.thinkingCut ? "（已折叠更早的部分）" : "")));
+        box2.append(line("pre", "meta small", t.thinking));
+      }
       if (t.answerCut) box2.append(line("div", "meta small", "…（回复开头已折叠；完整回复见报告目录 llm/sessions/）"));
       if (t.answer) box2.append(line("pre", "", t.answer));
       const foot = footerOf(t);

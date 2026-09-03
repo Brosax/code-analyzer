@@ -32,7 +32,7 @@ from typing import Any
 
 from .analysis import AnalysisEvent
 from .ask import Answer, Question
-from .chat import Transcript
+from .chat import CHARS_PER_TOKEN, Transcript
 from .flow import RunFlow
 from .progress import BRAILLE_FRAMES, multi_line, single_line
 from .status import STATE_GLYPHS
@@ -112,6 +112,14 @@ class UserBlock(Block):
 # import the harness.
 PHASE_PROBING = "探测端点"
 PHASE_WAITING = "等待模型的第一个 token"
+PHASE_THINKING = "模型在思考"
+
+# How much of a live chain of thought the wait shows.  A tail, not the whole
+# thing: the block sits above the input box while the operator waits, and a
+# model that thinks for 30 seconds would otherwise push the conversation off
+# the screen.  The full text is in the session evidence either way.
+THINKING_TAIL_LINES = 6
+MAX_THINKING_CHARS = 4000
 
 
 def spin(frame: int) -> str:
@@ -148,6 +156,59 @@ class ThinkingBlock(Block):
     model: str = ""
     settled: bool = False
     abandoned: bool = False
+    # What the model is thinking, as it arrives.  Bounded and tail-kept: see
+    # THINKING_TAIL_LINES.  Empty when the provider sends no reasoning, which
+    # is the ordinary case and must read as ordinary, not as a missing feature.
+    thinking: str = ""
+    thinking_chars: int = 0
+    # Every output character the provider has streamed, reasoning and answer
+    # alike: both are billed as output tokens, so both belong in a rate.
+    output_chars: int = 0
+    first_chunk_at: float | None = None
+    last_chunk_at: float | None = None
+
+    def saw(self, chars: int, now: float | None = None) -> None:
+        """Count output that arrived.  Text goes through ``think``; this counts."""
+        if chars <= 0:
+            return
+        now = time.time() if now is None else now
+        if self.first_chunk_at is None:
+            self.first_chunk_at = now
+        self.last_chunk_at = now
+        self.output_chars += chars
+
+    def speed(self) -> tuple[float | None, str]:
+        """An estimate, and it says so: characters over four, the budget's divisor.
+
+        The measured rate needs the provider's own token count, which arrives
+        with the answer -- so while the answer is still arriving there is only
+        an estimate to be had, and ``chat.Turn.speed`` labels the same pair the
+        same way.  A pane that showed one as the other would be inventing
+        throughput nobody reported.
+        """
+        if self.first_chunk_at is None or self.last_chunk_at is None or not self.output_chars:
+            return None, ""
+        span = self.last_chunk_at - self.first_chunk_at
+        if span < 0.05:
+            return None, ""
+        return round(self.output_chars / CHARS_PER_TOKEN / span, 1), "估算"
+
+    def think(self, text: str) -> None:
+        """Fold one reasoning delta in.  Oldest characters go first."""
+        if not text:
+            return
+        self.thinking_chars += len(text)
+        joined = self.thinking + text
+        self.thinking = joined[-MAX_THINKING_CHARS:]
+        if self.phase == PHASE_WAITING:
+            self.phase = PHASE_THINKING
+
+    def thinking_tail(self) -> list[str]:
+        """The last few lines of the chain of thought, newest last."""
+        if not self.thinking:
+            return []
+        lines = [line for line in self.thinking.splitlines() if line.strip()]
+        return lines[-THINKING_TAIL_LINES:]
 
     def render(self, now: float | None = None, frame: int = -1) -> list[str]:
         if self.settled:
@@ -157,12 +218,18 @@ class ThinkingBlock(Block):
         lines = [f"  {spin(frame)} 正在理解这句话… {elapsed}s · {self.phase} · Ctrl+C 放弃"]
         # Which model is being waited on belongs next to the wait, not three
         # screens away in `/config`.
+        rate, basis = self.speed()
         below = [part for part in (
             self.model,
+            f"≈{rate} tok/s（{basis}）" if rate is not None else "",
             f"上次 {self.last_seconds:.1f}s（本会话测量）" if self.last_seconds is not None else "",
         ) if part]
         if below:
             lines.append("    " + " · ".join(below))
+        tail = self.thinking_tail()
+        if tail:
+            lines.append(f"    ▾ 思维链 · {self.thinking_chars} 字符")
+            lines.extend(f"    │ {line}" for line in tail)
         return lines
 
 

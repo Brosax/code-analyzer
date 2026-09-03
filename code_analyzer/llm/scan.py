@@ -39,11 +39,14 @@ from ..harness.cordis import cordis_document, tool_allowlist, write_cordis_confi
 from ..harness.runtime import (
     HarnessRuntime,
     RunOutcome,
+    answer_text,
     endpoint_context_length,
     endpoint_url,
     harness_available,
+    reasoning_text,
     redact_credential,
     sdk_version,
+    unwrap_notification,
 )
 from ..harness.session import resync_meta_status, run_unit, unit_directory
 from ..persist import json_bytes, write_json
@@ -1044,7 +1047,7 @@ class _Phase:
                 self._step(producer, unit_id, name, detail)
 
         def forward(event: dict[str, Any]) -> None:
-            kind, data = _unwrap_notification(event)
+            kind, data = unwrap_notification(event)
             # The stream names the kind of thing the model did, so a live view
             # can lay the exchange out as a conversation instead of re-parsing
             # a prefixed line: `answer` is the reply itself, `tool` is a call
@@ -1053,15 +1056,24 @@ class _Phase:
             if kind == "turn/start":
                 step("waiting")
             elif kind == "assistant/chunk":
-                chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
                 # "text-delta" is what the pinned runtime actually sends, one
                 # per token group (verified against a live Ollama session on
                 # 2026-09-03: 194 of them for one 776-character answer).
                 # "text" is accepted beside it because a chunk carrying a whole
                 # block in one piece is the same fact.
-                if chunk.get("type") in {"text-delta", "text"} and chunk.get("text"):
+                if answer_text(data):
                     step("streaming")
-                    stream, text = "answer", str(chunk["text"])[:2000]
+                    stream, text = "answer", answer_text(data)[:2000]
+                # What the model thought before it answered.  The runtime sends
+                # it as its own delta type (`{type: 'reasoning-delta', index,
+                # text}`), and it used to be dropped on the floor here -- so a
+                # scan with [llm] reasoning set to anything but "off" spent the
+                # completion budget on thinking nobody could see.  It stays a
+                # separate stream: concatenated onto the answer it would make
+                # every unit unparseable.
+                elif reasoning_text(data):
+                    step("thinking")
+                    stream, text = "thinking", reasoning_text(data)[:2000]
             elif kind.startswith("tool/call"):
                 name = str(data.get("name") or data.get("tool") or "")
                 step("reading", name)
@@ -1191,7 +1203,7 @@ class _Phase:
         return record
 
     def _step(self, producer: str, unit_id: str, step: str, detail: str = "") -> None:
-        """Where one unit is: prompting, waiting, retry k/N, streaming, reading, parsing, validating, caching."""
+        """Where one unit is: prompting, waiting, thinking, retry k/N, streaming, reading, parsing, validating, caching."""
         label = f"{step} {detail}".strip()
         self.unit_event(producer, unit_id, "step", label, None, data={"step": step, "detail": detail or None})
 
@@ -1218,20 +1230,6 @@ class _Phase:
                 batch["last_index"] / max(1, self.total),
                 data={**batch, "reason": reason, "total": self.total}, phase="units",
             )
-
-
-def _unwrap_notification(notification: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """The event type and data one SDK notification carries.
-
-    A ``session.event`` notification wraps the event under ``payload.event``;
-    anything already reduced to an event is read directly.
-    """
-    payload = notification.get("payload")
-    event = payload.get("event") if isinstance(payload, dict) else None
-    if not isinstance(event, dict):
-        event = notification
-    data = event.get("data") if isinstance(event.get("data"), dict) else {}
-    return str(event.get("type", "") or ""), data
 
 
 def _provider_stop(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:

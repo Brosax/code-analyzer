@@ -439,3 +439,91 @@ def test_a_front_end_that_throws_on_a_phase_does_not_take_the_request_with_it(
     proposal = propose("帮我看看", _config(enabled=True), output_root=tmp_path,
                        open_runtime=_NeverConnects, on_phase=explode)
     assert "a repaint blew up" not in (proposal.reason or "")
+
+
+# --- the chain of thought ---------------------------------------------------
+
+
+class _Thinks:
+    """A runtime that reasons out loud before it answers."""
+
+    ANSWER = '{"steps": [{"action": "doctor", "why": "先看看主机缺什么"}], "unclear": null}'
+    THOUGHT = ("这句话没有指定路径，", "所以先跑 doctor 而不是 scan。")
+
+    def __enter__(self) -> "_Thinks":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def run(self, _prompt: object, *, session_id: object = None,
+            on_event: object = None) -> object:
+        from code_analyzer.harness.runtime import RunOutcome
+
+        for piece in self.THOUGHT:
+            if on_event is not None:
+                on_event({"type": "assistant/chunk",
+                          "data": {"chunk": {"type": "reasoning-delta", "index": 0, "text": piece}}})
+        if on_event is not None:
+            on_event({"type": "assistant/chunk",
+                      "data": {"chunk": {"type": "text-delta", "index": 0, "text": self.ANSWER}}})
+        return RunOutcome(
+            session_id="s1", final_response=self.ANSWER, finish_reason="completed",
+            events=[], notifications=[], duration_seconds=1.0,
+        )
+
+
+def test_the_reasoning_reaches_the_front_end_as_it_streams(tmp_path: Path) -> None:
+    """A minute-long wait the operator can read is not the same wait."""
+    seen: list[str] = []
+    proposal = propose("我该先做什么", _config(enabled=True), output_root=tmp_path,
+                       open_runtime=_Thinks, on_thinking=seen.append)
+
+    assert proposal.status == "completed"
+    assert [step.action for step in proposal.steps] == ["doctor"]
+    assert seen == list(_Thinks.THOUGHT)
+    assert proposal.thinking_chars == sum(len(piece) for piece in _Thinks.THOUGHT)
+
+
+def test_the_reasoning_is_never_folded_into_the_answer(tmp_path: Path) -> None:
+    """Prepended to the reply, it would take the JSON object with it."""
+    proposal = propose("我该先做什么", _config(enabled=True), output_root=tmp_path,
+                       open_runtime=_Thinks)
+
+    assert proposal.status == "completed"
+    assert proposal.steps[0].why == "先看看主机缺什么"
+
+
+def test_a_front_end_that_throws_on_a_thought_does_not_take_the_request_with_it(
+    tmp_path: Path,
+) -> None:
+    def explode(_text: str) -> None:
+        raise RuntimeError("a repaint blew up")
+
+    proposal = propose("我该先做什么", _config(enabled=True), output_root=tmp_path,
+                       open_runtime=_Thinks, on_thinking=explode)
+    assert proposal.status == "completed"
+    assert proposal.thinking_chars > 0
+
+
+def test_the_decision_lane_thinks_and_the_scanners_do_not() -> None:
+    """Two leaves, because the two are billed against different ceilings."""
+    from code_analyzer.llm.propose import settings_for
+
+    config = _config(enabled=True)
+    assert config["llm"]["reasoning"] == "off"
+    assert config["llm"]["intent_reasoning"] == "low"
+    assert settings_for(config)["reasoning"] == "low"
+
+    config["llm"]["intent_reasoning"] = "off"
+    assert settings_for(config)["reasoning"] == "off"
+
+
+def test_a_round_trip_reports_the_rate_the_provider_charged_for() -> None:
+    """Measured or nothing: there is no honest guess when usage is unreported."""
+    from code_analyzer.llm.propose import Proposal
+
+    assert Proposal("completed", duration_seconds=30.0, completion_tokens=744).speed() == (24.8, "测量")
+    # Reasoning tokens are in the count because the provider bills them.
+    assert Proposal("completed", duration_seconds=30.0).speed() == (None, "")
+    assert Proposal("completed", completion_tokens=744).speed() == (None, "")

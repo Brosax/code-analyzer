@@ -34,7 +34,7 @@ from .schema import (
     response_unparsed,
     schema_hash,
 )
-from .session import run_unit, unit_directory
+from .session import run_summary, run_unit, unit_directory
 
 __all__ = [
     "FINDING_CATEGORIES",
@@ -53,6 +53,7 @@ __all__ = [
     "harness_available",
     "parse_findings",
     "response_unparsed",
+    "run_summary",
     "run_unit",
     "schema_hash",
     "sdk_version",

@@ -377,6 +377,27 @@ def _run_assess(ctx: ActionContext) -> ActionOutcome:
     )
 
 
+def _run_summarize(ctx: ActionContext) -> ActionOutcome:
+    from .llm.summarize import summarize
+
+    request = ctx.request
+    if request.report_directory is None:
+        raise UserError("summarize needs a report directory")
+    ctx.say("summary", "started", "asking the model to account for the run")
+    block = summarize(request.report_directory, request.config, progress=ctx.progress("summary"))
+    lines = [f"结论：{block['posture']}", str(block["headline"] or "")] if block["status"] == "complete" else [
+        str(block["error"] or "")]
+    if block["status"] == "complete":
+        lines.append(f"完整汇总：{request.report_directory / block['markdown']}")
+    return ActionOutcome(
+        exit_code=int(block["exit_code"]),
+        summary=str(block["headline"] or "模型没能给出汇总"),
+        lines=lines,
+        report_directory=request.report_directory,
+        data=block,
+    )
+
+
 def _run_rebuild_dashboard(ctx: ActionContext) -> ActionOutcome:
     from .dashboard import rebuild_dashboard
 
@@ -525,6 +546,15 @@ ASSESS = Action(
     spends=True,
     impact=("每个候选项一次模型会话，写入评估、manifest 与报告页；review/summary.json 不变。",),
 )
+SUMMARIZE = Action(
+    name="summarize", summary="让模型对整次运行做一次总体汇总", subject=SUBJECT_REPORT,
+    run=_run_summarize, aliases=("汇总", "总结"),
+    long_running=True, cli_command="summarize",
+    writes=("{report}/audit/summary.json", "{report}/audit/summary.md", "{report}/manifest.json"),
+    spends=True,
+    impact=("一次模型会话，读的是运行自己的账本（findings 计数、覆盖率、候选项与判定），"
+            "不读源码；写入 audit/ 下的汇总与 manifest；证据层与退出码都不变。",),
+)
 REBUILD_DASHBOARD = Action(
     name="rebuild-dashboard", summary="从已有报告重建 index.html", subject=SUBJECT_REPORT,
     run=_run_rebuild_dashboard, aliases=("重建报告页",),
@@ -571,7 +601,7 @@ CONFIG = Action(
 
 REGISTRY: tuple[Action, ...] = (
     DOCTOR, LLM_DOCTOR, MODEL, PREFLIGHT, COMPILE_DB, SCAN, LLM_RESUME,
-    TOOLS_RESUME, ASSESS, REBUILD_DASHBOARD, RECOVER_REPORT, SERVE, CONFIG,
+    TOOLS_RESUME, ASSESS, SUMMARIZE, REBUILD_DASHBOARD, RECOVER_REPORT, SERVE, CONFIG,
 )
 
 BY_NAME: dict[str, Action] = {name: action for action in REGISTRY for name in action.names()}

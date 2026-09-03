@@ -198,6 +198,54 @@ qwen3.8:27b @ http://192.168.5.10:11434/v1
   名字，不显示对错：「还没问过」是第三种状态，画成「不可达」是在撒谎。
 - 思考中的那一行也带上模型名：`qwen3.8:27b · 上次 21.7s（本会话测量）`。
 
+### 3.2.4 思维链
+
+模型作答前的思考（运行时把它作为 `reasoning-delta` 单独发出，与答案的 `text-delta` 分开）
+**有就显示，没有就不显示**。它一直都在被发出，此前被直接丢弃——所以把 `[llm] reasoning`
+调到 off 以外的任何一档，都是在花生成预算买一段没人看得见的思考。
+
+```text
+› 帮我看看这棵树先做什么
+  ⠹ 正在理解这句话… 14s · 模型在思考 · Ctrl+C 放弃
+    qwen3.8:27b · 上次 21.7s（本会话测量）
+    ▾ 思维链 · 412 字符
+    │ 这句话没有给路径，所以主语是当前的源码树。
+    │ 它问"先做什么"，不是"扫描"，所以 preflight 比 scan 更贴切。
+```
+
+- **两条通道，两个开关。** `[llm] reasoning` 是扫描器的（默认 `off`）：一个扫描器要在
+  2000 token 的上限内交出一个 JSON 对象，而思考 token 计入同一个上限——实测一个 GLM
+  在这上面烧掉 4000 token 然后什么都没返回。`[llm] intent_reasoning` 是决策通道的
+  （默认 `low`）：那边的答案只有三行 JSON，预算不是约束，而思维链正是你在勾选一个
+  会跑一下午的步骤之前想读的东西。
+- **思维链永不与答案拼接。** 拼上去，每个单元的 JSON 都会解析失败。它是自己的 stream
+  （`thinking`），在对话、扫描的模型对话面板和 `serve` 实时页上都是单独一段。
+- **它按输出计费，所以按输出计数。** tok/s 与「输出 ~N tok」把思考字符一并算入——
+  provider 自己的 `completion_tokens` 就是这么算的，只数答案会把一个会思考的模型
+  报成慢好几倍。
+- 显示是**有界**的：等待中只留最后 6 行，扫描面板里每个单元最多 24 行、8000 字符。
+  完整的会话证据始终在报告目录的 `llm/sessions/` 下。
+
+### 3.2.5 总体汇总
+
+`/summarize`（别名 `/汇总`、`/总结`，以及 `code-analyzer summarize REPORT_DIR`）是流程的
+最后一步：**一次**模型会话，读的是这次运行**自己的账本**——findings 的计数与最严重的
+那一批、每个 producer 的覆盖率、关联候选项与验证器的判定、以及运行自己报告的完整性——
+然后写出一个人在决定「所以要做什么」之前要读的那一页。
+
+- **它读账本，不读源码。** 与验证器一样看得到 findings 的正文，但看不到任何一行源码、
+  任何一个单元的内容。111,482 条 findings 的运行也能装进一个上下文窗口：计数是完整的，
+  样本是有界的（最严重的 60 条，每个 (文件, 规则) 只取一条），而且它被明确告知计数才是
+  完整的那一半。
+- **它是意见层，和 `assess` 并排。** 写 `audit/summary.json` 与 `audit/summary.md`，
+  authority 与 `audit/assessment.json` 同一个字符串：不改证据层的任何一行，不进质量门，
+  不能移动退出码。provider 答不出来时退出码是 20，报告本身分毫不变。
+- **覆盖度先于结论。** 技能里钉死了这一条：一次只预处理了 8% 翻译单元的运行，没有证明
+  代码是干净的；这种情况下 `posture` 是 `blocked`，而且必须写进 `headline`，不能只藏在
+  保留意见里。
+- 五档结论：`clean` / `minor` / `serious` / `blocked` / `inconclusive`。模型编一个别的
+  档位出来，会被记为 `inconclusive` 并在 `dropped` 里写明。
+
 ### 3.3 配置
 
 `/config` 列出已设的项与它们的来源（default / 某个 TOML / session），
@@ -269,7 +317,7 @@ action、确认与否、结果指向哪个报告目录。与 `events.jsonl` 同�
 
 对话能做的每一件事，CLI 也能做，走的是同一个 action 注册表：
 `doctor`、`llm-doctor`、`model`、`preflight`、`compile-db`、`analyze`、`llm-resume`、
-`tools-resume`、`assess`、`rebuild-dashboard`、`recover-report`、`serve`、`config`。
+`tools-resume`、`assess`、`summarize`、`rebuild-dashboard`、`recover-report`、`serve`、`config`。
 其中 `preflight` 与 `config` 是上一轮重构才有的子命令，`model` 是这一轮的。
 
 `code-analyzer <你说的一句话>` 也走同一个解析器，但**自由文本一律拒绝**（在 TTY 上也拒绝：
@@ -293,6 +341,7 @@ provider，provider 故障绝不能改变退出码——只是面从一个字面
 | `config` | — | — | — | 直接跑 | **直接跑** |
 | `model` | — | — | — | 直接跑 | **直接跑** |
 | `llm-doctor` | — | ✔ | — | 直接跑 | 要确认 |
+| `summarize` | 报告目录的 audit/ | ✔ | — | 要确认 | 要确认 |
 | `compile-db` | CWD 与源码树内 | — | — | 要确认 | 要确认 |
 | `scan` | 输出目录 + 缓存 | ✔ | — | 要确认 | 要确认 |
 | `llm-resume` | 报告目录六个派生文件 | ✔ | — | 要确认 | 要确认 |

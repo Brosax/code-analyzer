@@ -33,6 +33,13 @@ CHARS_PER_TOKEN = 4
 MAX_TURNS = 240
 MAX_ANSWER_LINES = 400
 MAX_ANSWER_CHARS = 40_000
+# The chain of thought is the longest thing a reasoning model emits and the
+# least load-bearing: it is not evidence, nothing parses it, and the run
+# directory keeps the whole session anyway.  So it is bounded harder than the
+# answer -- enough to read what the model was weighing, not enough to bury the
+# answer it was weighing it for.
+MAX_THINKING_LINES = 24
+MAX_THINKING_CHARS = 8_000
 MAX_PROMPT_LINES = 400
 MAX_LINE_CHARS = 2000
 # The window the header's "current speed" is measured over: long enough that
@@ -49,13 +56,19 @@ CONVERSANTS = frozenset(LLM_PRODUCERS) | {"build-context-configurator"}
 # static analyzer's stdout and belongs in the log pane, not here.
 STREAM_PROMPT = "prompt"
 STREAM_ANSWER = "answer"
+# What the model thought before it answered.  A separate stream rather than
+# part of `answer`, because the two must never be concatenated: the answer is
+# parsed as one JSON object, and reasoning prepended to it would make every
+# unit unparseable.  The runtime sends it as `reasoning-delta`.
+STREAM_THINKING = "thinking"
 STREAM_TOOL = "tool"
 STREAM_NOTE = "note"
-CHAT_STREAMS = frozenset({STREAM_PROMPT, STREAM_ANSWER, STREAM_TOOL, STREAM_NOTE})
+CHAT_STREAMS = frozenset({STREAM_PROMPT, STREAM_ANSWER, STREAM_THINKING, STREAM_TOOL, STREAM_NOTE})
 
 # Turn state -> what the header of the turn says.
 STATE_LABELS = {
     "waiting": "等待模型",
+    "thinking": "思考中",
     "streaming": "接收中",
     "reading": "读取工具",
     "parsing": "解析响应",
@@ -137,6 +150,11 @@ class Turn:
     answer: str = ""
     answer_chars: int = 0
     answer_truncated: bool = False
+    # The chain of thought, kept apart from the answer for the reason given at
+    # STREAM_THINKING.  ``thinking_chars`` is what arrived, not what is kept.
+    thinking: str = ""
+    thinking_chars: int = 0
+    thinking_truncated: bool = False
     first_chunk_at: float | None = None
     last_chunk_at: float | None = None
     tools: list[str] = field(default_factory=list)
@@ -162,6 +180,16 @@ class Turn:
     def prompt_tokens_estimated(self) -> int:
         return max(1, -(-self.prompt_chars // CHARS_PER_TOKEN)) if self.prompt_chars else 0
 
+    @property
+    def output_chars(self) -> int:
+        """Everything the model generated.  Reasoning is billed as output too.
+
+        Counting only the answer would report a reasoning model as several
+        times slower than it is, and would under-report the tokens it spent --
+        the provider's own ``completion_tokens`` includes them.
+        """
+        return self.answer_chars + self.thinking_chars
+
     def ttft_seconds(self) -> float | None:
         """Time to the first token of the answer: what the operator feels as lag."""
         if self.first_chunk_at is None or self.started_at is None:
@@ -177,10 +205,10 @@ class Turn:
         """
         if self.completion_tokens and self.duration_seconds:
             return round(self.completion_tokens / self.duration_seconds, 1), "测量"
-        if self.first_chunk_at is not None and self.last_chunk_at is not None and self.answer_chars:
+        if self.first_chunk_at is not None and self.last_chunk_at is not None and self.output_chars:
             span = self.last_chunk_at - self.first_chunk_at
             if span >= 0.05:
-                return round(self.answer_chars / CHARS_PER_TOKEN / span, 1), "估算"
+                return round(self.output_chars / CHARS_PER_TOKEN / span, 1), "估算"
         return None, ""
 
     def subject(self) -> str:
@@ -288,6 +316,8 @@ class Transcript:
             return self._absorb_prompt(turn, event)
         if stream == STREAM_ANSWER:
             return self._absorb_answer(turn, event)
+        if stream == STREAM_THINKING:
+            return self._absorb_thinking(turn, event)
         if stream == STREAM_TOOL:
             name = single_line(event.message)[:120]
             if name:
@@ -326,7 +356,7 @@ class Transcript:
             turn.first_chunk_at = now
         turn.last_chunk_at = now
         turn.answer_chars += len(text)
-        if turn.state in {"waiting", "reading"}:
+        if turn.state in {"waiting", "reading", "thinking"}:
             turn.state = "streaming"
         joined = turn.answer + text
         if len(joined) > MAX_ANSWER_CHARS:
@@ -335,6 +365,43 @@ class Transcript:
         turn.answer = joined
         self._sample(now, len(text))
         return True
+
+    def _absorb_thinking(self, turn: Turn, event: AnalysisEvent) -> bool:
+        """Fold one reasoning delta in, oldest dropped first.
+
+        The tail is kept rather than the head: what the model concluded just
+        before it answered is what explains the answer, and the head of a chain
+        of thought is almost always it restating the prompt.
+        """
+        text = str(event.message)
+        if not text:
+            return False
+        now = event.timestamp
+        if turn.first_chunk_at is None:
+            turn.first_chunk_at = now
+        turn.last_chunk_at = now
+        turn.thinking_chars += len(text)
+        # Only until the answer starts: a turn that is already streaming its
+        # reply must not be dragged back to "thinking" by a late delta.
+        if turn.state in {"waiting", "reading"}:
+            turn.state = "thinking"
+        joined = turn.thinking + text
+        if len(joined) > MAX_THINKING_CHARS:
+            joined = joined[-MAX_THINKING_CHARS:]
+            turn.thinking_truncated = True
+        turn.thinking = joined
+        self._sample(now, len(text))
+        return True
+
+    @staticmethod
+    def thinking_lines(turn: Turn) -> tuple[list[str], int]:
+        """The chain of thought as display lines, newest kept, and how many were dropped."""
+        if not turn.thinking:
+            return [], 0
+        lines = _lines(turn.thinking)
+        if len(lines) <= MAX_THINKING_LINES:
+            return lines, 0
+        return lines[-MAX_THINKING_LINES:], len(lines) - MAX_THINKING_LINES
 
     @staticmethod
     def answer_lines(turn: Turn) -> tuple[list[str], int]:
@@ -371,7 +438,7 @@ class Transcript:
             return True
         if event.status == "step":
             step = str(data.get("step") or "")
-            if step in {"waiting", "streaming", "reading", "parsing"} and not turn.settled:
+            if step in {"waiting", "thinking", "streaming", "reading", "parsing"} and not turn.settled:
                 turn.state = step
                 return True
             return changed
@@ -536,6 +603,13 @@ class Transcript:
             block.append(Line("tool", f"  ⚒ 工具调用 {name}", turn.turn_id))
         for note in turn.notes[-3:]:
             block.append(Line("note", f"  ! {note}", turn.turn_id))
+        thinking, thinking_omitted = self.thinking_lines(turn)
+        if thinking:
+            block.append(Line("thinking-title",
+                              f"  ▾ 思维链 · {turn.thinking_chars} 字符"
+                              + ("（已折叠更早的部分）" if thinking_omitted or turn.thinking_truncated else ""),
+                              turn.turn_id))
+            block.extend(Line("thinking", f"  │ {line}", turn.turn_id) for line in thinking)
         lines, omitted = self.answer_lines(turn)
         if omitted or turn.answer_truncated:
             block.append(Line("omitted", f"  …（已折叠 {omitted} 行回复；完整回复见报告目录 llm/sessions/）", turn.turn_id))
@@ -571,8 +645,8 @@ class Transcript:
             parts.append(f"首字 {ttft:.1f}s")
         if turn.completion_tokens:
             parts.append(f"输出 {turn.completion_tokens} tok")
-        elif turn.answer_chars:
-            parts.append(f"输出 ~{turn.answer_chars // CHARS_PER_TOKEN} tok")
+        elif turn.output_chars:
+            parts.append(f"输出 ~{turn.output_chars // CHARS_PER_TOKEN} tok")
         if turn.prompt_tokens:
             parts.append(f"输入 {turn.prompt_tokens} tok")
         if turn.duration_seconds is not None:

@@ -107,6 +107,51 @@ class RunOutcome:
     duration_seconds: float
 
 
+def unwrap_notification(notification: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The event type and data one SDK notification carries.
+
+    A ``session.event`` notification wraps the event under ``payload.event``;
+    anything already reduced to an event is read directly.  Shared, because two
+    lanes now read this stream and the shape has been got wrong once already:
+    the runtime sends ``text-delta`` and the scanner checked for ``text``.
+    """
+    payload = notification.get("payload")
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if not isinstance(event, dict):
+        event = notification
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return str(event.get("type", "") or ""), data
+
+
+# What one chunk of a model's answer looks like on the wire.  `text-delta` is
+# what the pinned runtime sends; `text` is a whole block in one piece.
+ANSWER_CHUNKS = frozenset({"text-delta", "text"})
+
+
+# And what one chunk of its thinking looks like.  Its own block type on the
+# wire (`{type: 'reasoning-delta', index, text}`), which is what lets a front
+# end show the two apart -- concatenated onto the answer, reasoning would make
+# every scanner reply unparseable.
+REASONING_CHUNKS = frozenset({"reasoning-delta", "reasoning"})
+
+
+def answer_text(data: dict[str, Any]) -> str:
+    """The answer characters in one ``assistant/chunk`` event, if any."""
+    return _chunk_text(data, ANSWER_CHUNKS)
+
+
+def reasoning_text(data: dict[str, Any]) -> str:
+    """The chain-of-thought characters in one ``assistant/chunk`` event, if any."""
+    return _chunk_text(data, REASONING_CHUNKS)
+
+
+def _chunk_text(data: dict[str, Any], kinds: frozenset[str]) -> str:
+    chunk = data.get("chunk") if isinstance(data.get("chunk"), dict) else {}
+    if chunk.get("type") in kinds and chunk.get("text"):
+        return str(chunk["text"])
+    return ""
+
+
 def measured_usage(events: list[dict[str, Any]]) -> dict[str, int]:
     """Sum the provider's own token counts over one session's requests.
 

@@ -95,6 +95,11 @@ def parser() -> argparse.ArgumentParser:
     assess.add_argument("--config", type=Path)
     assess.add_argument("--max-candidates", type=positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
     add_llm_arguments(assess)
+    summarize = commands.add_parser("summarize", help="ask the model for one overall account of a finished run")
+    summarize.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
+    summarize.add_argument("--config", type=Path)
+    summarize.add_argument("--json", action="store_true", dest="as_json")
+    add_llm_arguments(summarize)
     return root
 
 
@@ -233,6 +238,20 @@ def main(argv: list[str] | None = None) -> int:
                 "assess", report_directory=report_directory, config=config, args=args),
                 emit=_stderr_emitter("code-analyzer: "))
             print(report_directory)
+            return outcome.exit_code
+        if args.command == "summarize":
+            report_directory = args.report_directory.expanduser().resolve()
+            config = load_config(_scanned_source(report_directory), args.config,
+                                 {"llm": llm_overrides(args)} if llm_overrides(args) else None)
+            _warn_third_party(config)
+            outcome = _invoke("summarize", ActionRequest(
+                "summarize", report_directory=report_directory, config=config, args=args),
+                emit=_stderr_emitter("code-analyzer: "))
+            if args.as_json:
+                print(json.dumps(outcome.data or {}, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                for line in outcome.lines:
+                    print(line)
             return outcome.exit_code
         if args.command == "serve":
             if args.analyze is None and args.report_directory is None:

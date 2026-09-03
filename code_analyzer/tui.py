@@ -105,11 +105,18 @@ _LABEL_WIDTH = 24
 # the content, and everything around it is furniture.
 _CHAT_STYLES = {
     "header": "bold cyan", "prompt-title": "bold yellow", "prompt": "yellow", "answer": "",
+    # The chain of thought is dim on purpose: it is the loudest thing on the
+    # pane by volume and the least load-bearing by content.
+    "thinking-title": "bold blue", "thinking": "dim blue",
     "tool": "magenta", "note": "bold red", "footer": "dim", "omitted": "dim italic",
 }
 _BLOCK_STYLES = {"user": "bold", "say": "", "error": "bold red", "question": "bold yellow",
                  "config": "cyan", "proposal": "bold yellow"}
 _LANE_LABEL_CELLS = 12
+# How often a streaming chain of thought repaints the wait block.  Fast enough
+# to read as live, slow enough that a 30-second reasoning burst is a few dozen
+# repaints rather than a few hundred.
+THINKING_REPAINT_SECONDS = 0.25
 _BAR_WIDTH = 22
 _BAR_FULL = "█"
 _BAR_EMPTY = "░"
@@ -213,6 +220,7 @@ class AnalyzerApp(App[TuiOutcome]):
         # estimate dressed as one: absent means nothing has measured it yet.
         self._last_benchmark: dict[str, Any] | None = None
         self._last_benchmark_at = 0.0
+        self._last_ask_rate: float | None = None
         # What a model proposed and the operator has not yet ticked, and the
         # commands a ticked proposal turned into.
         self._pending_steps: list[Any] = []
@@ -442,18 +450,70 @@ class AnalyzerApp(App[TuiOutcome]):
         from .llm.propose import propose
 
         token = self.cancel_token
+        # A chain of thought arrives one token group at a time -- hundreds of
+        # them for one answer -- and a repaint per delta would spend the whole
+        # wait laying out text.  Coalesced to a fixed cadence instead; nothing
+        # is dropped, it just arrives in fewer pieces.
+        pending: dict[str, Any] = {"text": "", "chars": 0, "at": 0.0}
+        guard = threading.Lock()
+
+        def flush() -> None:
+            with guard:
+                chunk, pending["text"] = pending["text"], ""
+                chars, pending["chars"] = pending["chars"], 0
+            if chunk or chars:
+                self.call_from_thread(self._thinking_text, chunk, chars, generation)
+
+        def due(now: float) -> bool:
+            """Caller holds the guard.  One cadence for both streams."""
+            if now - pending["at"] < THINKING_REPAINT_SECONDS:
+                return False
+            pending["at"] = now
+            return True
+
+        def thinking(text: str) -> None:
+            with guard:
+                pending["text"] += text
+                ready = due(time.monotonic())
+            if ready:
+                flush()
+
+        def counted(chars: int) -> None:
+            """Output characters, for the live rate.  An answer streams even
+            when the model does no reasoning at all, so this has its own path
+            rather than riding on `thinking`."""
+            with guard:
+                pending["chars"] += chars
+                ready = due(time.monotonic())
+            if ready:
+                flush()
+
         try:
             proposal = propose(
                 utterance, self.dialogue.config,
                 source=self.dialogue.source, report_directory=self.dialogue.report_directory,
                 cancelled=(token.is_cancelled if token else None),
                 on_phase=lambda name: self.call_from_thread(self._thinking_phase, name, generation),
+                on_thinking=thinking, on_chunk=counted,
             )
         except Exception as exc:
             self.call_from_thread(
                 self._proposed, None, f"{type(exc).__name__}: {single_line(str(exc))}", generation)
             return
+        flush()
         self.call_from_thread(self._proposed, proposal, "", generation)
+
+    def _thinking_text(self, text: str, chars: int, generation: int) -> None:
+        """The model's reasoning and its output count; one repaint, UI thread."""
+        if generation != self._ask_generation:
+            return
+        thinking = self.dialogue.live_thinking()
+        if thinking is None:
+            return
+        thinking.saw(chars)
+        if text:
+            thinking.think(text)
+        self._repaint_block(thinking.block_id)
 
     def _thinking_phase(self, name: str, generation: int) -> None:
         """The lane says what it is doing now; one repaint, on the UI thread."""
@@ -483,6 +543,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._repaint_block(thinking.block_id)
         if proposal is not None and proposal.duration_seconds:
             self._last_ask_seconds = proposal.duration_seconds
+            self._last_ask_rate = proposal.speed()[0]
         if proposal is not None and proposal.status == "completed":
             self._gate_reason = ""
         if proposal is None or proposal.status == "failed":
@@ -494,7 +555,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._offline(proposal.reason or "模型不可达", thinking)
             self._drain_queue()
             return
-        notes = []
+        notes = [line for line in [self._round_trip(proposal)] if line]
         if proposal.unclear:
             notes.append(f"  模型说不确定的地方：{proposal.unclear}")
         for item in proposal.dropped:
@@ -897,7 +958,11 @@ class AnalyzerApp(App[TuiOutcome]):
             for index, line in enumerate(block.render(frame=self._frame())):
                 if index:
                     text.append("\n")
-                text.append(line, style="dim" if block.settled else "bold yellow")
+                # The chain of thought is the model's, not the tool's: dim, so
+                # the line that says what is happening stays the loud one.
+                thought = line.lstrip().startswith(("▾ 思维链", "│ "))
+                style = "dim" if (block.settled or thought) else "bold yellow"
+                text.append(line, style=style)
             return text
         style = _BLOCK_STYLES.get(block.kind, "")
         text = Text()
@@ -1091,6 +1156,23 @@ class AnalyzerApp(App[TuiOutcome]):
         note_gate(self.dialogue.config, ok, reason)
         self._gate_reason = "" if ok else (reason or self._gate_reason)
 
+    @staticmethod
+    def _round_trip(proposal: Any) -> str:
+        """Model, seconds, tokens per second -- for the round trip just paid for.
+
+        It was measured every time and shown nowhere: only the *next* wait ever
+        mentioned it, as "上次 21.7s".
+        """
+        parts = [proposal.model or "", f"{proposal.duration_seconds:.1f}s"
+                 if proposal.duration_seconds else ""]
+        rate, basis = proposal.speed()
+        if rate is not None:
+            parts.append(f"{rate} tok/s（{basis}）")
+        if proposal.completion_tokens:
+            parts.append(f"输出 {proposal.completion_tokens} token")
+        joined = " · ".join(part for part in parts if part)
+        return f"  {joined}" if joined else ""
+
     def _scan_rate(self) -> float | None:
         """Tokens per second from the last run that measured any."""
         for block in reversed(self.dialogue.blocks):
@@ -1103,6 +1185,8 @@ class AnalyzerApp(App[TuiOutcome]):
         """The best tokens-per-second this session measured, or nothing."""
         if self._last_benchmark and self._last_benchmark.get("tokens_per_second"):
             return float(self._last_benchmark["tokens_per_second"])
+        if self._last_ask_rate is not None:
+            return self._last_ask_rate
         return self._scan_rate()
 
     def _model_mark(self) -> str:
@@ -1147,7 +1231,8 @@ class AnalyzerApp(App[TuiOutcome]):
                          f"整个请求 {benchmark.get('latency_seconds')}s"
                          f"（/llm-doctor 实测，{ago}s 前）")
         if self._last_ask_seconds:
-            lines.append(f"  · 理解一句话的往返：{self._last_ask_seconds:.1f}s（实测）")
+            rate = f"，{self._last_ask_rate} tok/s" if self._last_ask_rate is not None else ""
+            lines.append(f"  · 理解一句话的往返：{self._last_ask_seconds:.1f}s{rate}（实测）")
         rate = self._scan_rate()
         if rate is not None:
             lines.append(f"  · 扫描时的模型对话：{rate} tok/s（会话均值，实测）")

@@ -218,6 +218,9 @@ GROUND_TRUTH = {
     "llm-resume":        (True,  True,  False),
     "tools-resume":      (True,  True,  True),
     "assess":            (True,  True,  False),
+    # One session over the run's own account of itself: it writes audit/ and
+    # the manifest, and it generates, so it spends.
+    "summarize":         (True,  True,  False),
     "rebuild-dashboard": (True,  False, False),
     "recover-report":    (True,  False, False),
     "serve":             (False, False, True),

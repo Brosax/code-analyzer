@@ -272,6 +272,29 @@ def test_the_wait_spins_with_the_same_frames_as_the_rest_of_the_product() -> Non
     assert block.render(frame=3) == ["  已放弃这次理解"]
 
 
+def test_the_wait_rates_what_is_arriving_and_calls_it_an_estimate() -> None:
+    """Characters over four while it streams; the provider's count comes later."""
+    import time as _time
+
+    from code_analyzer.dialogue import ThinkingBlock
+
+    block = ThinkingBlock(utterance="扫一下固件", model="qwen3.8:27b")
+    assert block.speed() == (None, ""), "nothing has arrived yet"
+
+    start = _time.time() - 4.0
+    block.saw(200, now=start)
+    block.saw(600, now=start + 4.0)
+    rate, basis = block.speed()
+    assert basis == "估算" and rate == 50.0, (rate, basis)   # 800 chars / 4 / 4s
+    assert "≈50.0 tok/s（估算）" in "\n".join(block.render())
+
+    # A burst inside one repaint window has no span to divide by.
+    instant = ThinkingBlock(utterance="x")
+    instant.saw(400, now=start)
+    instant.saw(400, now=start + 0.01)
+    assert instant.speed() == (None, "")
+
+
 def test_a_thinking_block_never_invents_how_long_is_left() -> None:
     from code_analyzer.dialogue import ThinkingBlock
 
@@ -282,3 +305,48 @@ def test_a_thinking_block_never_invents_how_long_is_left() -> None:
     assert "ETA" not in rendered and "剩余" not in rendered
     # The first question of a session has nothing measured to report.
     assert "上次" not in "\n".join(ThinkingBlock(utterance="x").render())
+
+
+def test_the_wait_shows_the_chain_of_thought_as_it_arrives() -> None:
+    """A minute of spinner says nothing; a minute of reasoning says why."""
+    from code_analyzer.dialogue import PHASE_THINKING, PHASE_WAITING, ThinkingBlock
+
+    block = ThinkingBlock(utterance="扫一下固件", model="qwen3.8:27b", phase=PHASE_WAITING)
+    assert "思维链" not in "\n".join(block.render())
+
+    block.think("这句话里没有路径，\n")
+    block.think("所以要用当前的源码树。")
+    assert block.phase == PHASE_THINKING
+    rendered = "\n".join(block.render())
+    assert "▾ 思维链 · 21 字符" in rendered
+    assert "这句话里没有路径，" in rendered
+    assert "所以要用当前的源码树。" in rendered
+
+
+def test_a_long_chain_of_thought_does_not_push_the_conversation_off_the_screen() -> None:
+    from code_analyzer.dialogue import (
+        MAX_THINKING_CHARS,
+        THINKING_TAIL_LINES,
+        ThinkingBlock,
+    )
+
+    block = ThinkingBlock(utterance="扫一下固件")
+    block.think("\n".join(f"想法 {n}" for n in range(THINKING_TAIL_LINES * 5)))
+    tail = block.thinking_tail()
+    assert len(tail) == THINKING_TAIL_LINES
+    assert tail[-1] == f"想法 {THINKING_TAIL_LINES * 5 - 1}"
+
+    block.think("x" * (MAX_THINKING_CHARS + 100))
+    assert len(block.thinking) == MAX_THINKING_CHARS
+    # The count is what arrived, not what is kept: a trimmed display must not
+    # under-report what the model actually spent.
+    assert block.thinking_chars > MAX_THINKING_CHARS
+
+
+def test_a_settled_wait_shows_no_chain_of_thought() -> None:
+    from code_analyzer.dialogue import ThinkingBlock
+
+    block = ThinkingBlock(utterance="扫一下固件")
+    block.think("想了很久")
+    block.settled = True
+    assert block.render() == []

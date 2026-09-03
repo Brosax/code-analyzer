@@ -173,9 +173,11 @@ def run_candidate(
 
 PROPOSAL_FILENAME = "proposal.json"
 PROPOSAL_SCHEMA_VERSION = 1
+SUMMARY_FILENAME = "summary.json"
+SUMMARY_SCHEMA_VERSION = 1
 
 
-def run_proposal(
+def run_document(
     runtime: HarnessRuntime,
     *,
     run_dir: Path,
@@ -186,22 +188,27 @@ def run_proposal(
     skill_version: str,
     parse: Callable[[str | None], tuple[bool, str | None, dict[str, Any], dict[str, int]]],
     schema_sha256: str,
+    schema_version: int,
+    result_file: str,
+    record_key: str,
     input_files: list[str] | None = None,
     settings: dict[str, Any] | None = None,
     session_id: str | None = None,
     cancelled: Callable[[], bool] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Run the build-context configurator once, with the same evidence discipline.
+    """One session that returns a JSON document its caller validates.
 
-    ``proposal.json`` takes the place of findings.json: what the model
-    proposed after validation, what was dropped and why.  ``parse`` is the
-    caller's validator; it returns ``(valid, reason, result, counts)``.
+    The general form of the two lanes that are not scanners: a proposal and a
+    run summary are both "ask once, validate what came back, file it beside the
+    event stream".  ``parse`` is the caller's validator; it returns
+    ``(valid, reason, result, counts)``, and ``result_file`` names the artifact
+    so an auditor reading the directory can tell which of them it is.
     """
 
     def parsed(text: str | None) -> _Parsed:
         valid, reason, result, counts = parse(text)
-        return _Parsed(valid, reason, result, counts, {"proposal": result})
+        return _Parsed(valid, reason, result, counts, {record_key: result})
 
     return _run_session(
         runtime,
@@ -212,15 +219,43 @@ def run_proposal(
         prompt=prompt,
         unit_sha256=unit_sha256,
         skill_version=skill_version,
-        schema={"version": PROPOSAL_SCHEMA_VERSION, "sha256": schema_sha256},
+        schema={"version": schema_version, "sha256": schema_sha256},
         parse=parsed,
-        result_file=PROPOSAL_FILENAME,
+        result_file=result_file,
         input_files=input_files,
         settings=settings,
         session_id=session_id,
         cache=None,
         cancelled=cancelled,
         on_event=on_event,
+    )
+
+
+def run_proposal(
+    runtime: HarnessRuntime, **kwargs: Any
+) -> dict[str, Any]:
+    """Run the build-context configurator or the intent lane once.
+
+    ``proposal.json`` takes the place of findings.json: what the model
+    proposed after validation, what was dropped and why.
+    """
+    return run_document(
+        runtime, schema_version=PROPOSAL_SCHEMA_VERSION,
+        result_file=PROPOSAL_FILENAME, record_key="proposal", **kwargs,
+    )
+
+
+def run_summary(
+    runtime: HarnessRuntime, **kwargs: Any
+) -> dict[str, Any]:
+    """Run the whole-run summariser once.
+
+    ``summary.json`` holds what the model made of a finished run -- opinion
+    over the evidence layer, never part of it.
+    """
+    return run_document(
+        runtime, schema_version=SUMMARY_SCHEMA_VERSION,
+        result_file=SUMMARY_FILENAME, record_key="summary", **kwargs,
     )
 
 

@@ -33,7 +33,13 @@ from ..config import FIELD_BY_PATH, config_value, set_config_value, validate_con
 from ..dialogue import PHASE_WAITING
 from ..errors import UserError
 from ..harness.cordis import cordis_document, write_cordis_config
-from ..harness.runtime import HarnessRuntime, harness_available
+from ..harness.runtime import (
+    HarnessRuntime,
+    answer_text,
+    harness_available,
+    reasoning_text,
+    unwrap_notification,
+)
 from ..harness.session import run_proposal
 from ..persist import json_bytes
 from ..progress import single_line
@@ -104,10 +110,28 @@ class Proposal:
     unclear: str = ""
     duration_seconds: float | None = None
     third_party: str | None = None
+    # How much of a chain of thought arrived, for the record; the text itself
+    # was handed to ``on_thinking`` as it streamed and is not kept here.
+    thinking_chars: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
     @property
     def used(self) -> bool:
         return self.status == "completed"
+
+    def speed(self) -> tuple[float | None, str]:
+        """Output tokens per second, from the provider's own count, or nothing.
+
+        The same rule as ``chat.Turn.speed``, and the same reason: a rate the
+        provider reported is a measurement, and there is no honest way to make
+        one up when it reports nothing.  Reasoning tokens are in it because the
+        provider bills them -- this is throughput over the whole round trip,
+        first-token latency included, which is what was actually paid for.
+        """
+        if self.completion_tokens and self.duration_seconds:
+            return round(self.completion_tokens / self.duration_seconds, 1), "测量"
+        return None, ""
 
 
 def disabled_by_env() -> bool:
@@ -263,7 +287,10 @@ def catalogue() -> list[dict[str, Any]]:
 def settings_for(config: Mapping[str, Any]) -> dict[str, Any]:
     llm = config["llm"]
     return {
-        **llm, "jobs": 1, "max_steps": MAX_STEPS_PER_SESSION,
+        # This lane thinks and the scanners do not; see DEFAULTS for why the two
+        # are separate leaves rather than one.
+        **llm, "reasoning": str(llm.get("intent_reasoning") or "off"),
+        "jobs": 1, "max_steps": MAX_STEPS_PER_SESSION,
         "max_turns": max(MAX_TURNS, int(llm.get("max_turns") or 0)),
         "max_completion_tokens": max(MIN_COMPLETION_TOKENS, int(llm.get("max_completion_tokens") or 0)),
         "request_timeout_seconds": ROUTE_REQUEST_TIMEOUT,
@@ -474,6 +501,7 @@ def propose(
     utterance: str, config: Mapping[str, Any], *, source: Path | None = None,
     report_directory: Path | None = None, output_root: Path | None = None,
     cancelled: Any = None, open_runtime: Any = None, on_phase: Any = None,
+    on_thinking: Any = None, on_chunk: Any = None,
 ) -> Proposal:
     """Ask the model once.  Never raises for a model, endpoint or runtime problem.
 
@@ -481,6 +509,12 @@ def propose(
     now.  Everything before the request is local and takes milliseconds; a front
     end that shows only the first phase would be claiming to probe an endpoint
     for the whole 21-31s round trip.
+
+    ``on_thinking`` receives the model's reasoning as it streams, one delta at a
+    time.  It is what turns the 21-31s wait from a spinner into something an
+    operator can read: with ``[llm] intent_reasoning`` above "off" the model
+    says what it is weighing before it proposes a step that may spend an
+    afternoon, and that is the decision worth auditing, not the JSON.
     """
     def phase(name: str) -> None:
         # A provider must not die of a front end, the way a front end must not
@@ -489,6 +523,36 @@ def propose(
             return
         try:
             on_phase(name)
+        except Exception:
+            pass
+
+    thought = {"chars": 0}
+
+    def forward(notification: dict[str, Any]) -> None:
+        """Two things off one stream: reasoning to read, and a count to rate.
+
+        The answer's characters are counted and then dropped.  The count is what
+        a live tokens-per-second needs; the prose itself must never reach a
+        screen, because this lane routes and does not answer.
+        """
+        kind, data = unwrap_notification(notification)
+        if kind != "assistant/chunk":
+            return
+        text = reasoning_text(data)
+        # Both are billed as output tokens, so both belong in the rate.
+        produced = len(text) + len(answer_text(data))
+        if produced and on_chunk is not None:
+            try:
+                on_chunk(produced)
+            except Exception:
+                pass
+        if not text:
+            return
+        thought["chars"] += len(text)
+        if on_thinking is None:
+            return
+        try:
+            on_thinking(text)
         except Exception:
             pass
 
@@ -541,7 +605,7 @@ def propose(
                     prompt=blocks, unit_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
                     skill_version=skill.skill_version, parse=parse,
                     schema_sha256=hashlib.sha256(json_bytes(catalogue())).hexdigest(),
-                    settings=settings, cancelled=cancelled,
+                    settings=settings, cancelled=cancelled, on_event=forward,
                 )
     except Exception as exc:  # a front end must not die of a provider
         return Proposal("failed", f"{type(exc).__name__}: {single_line(str(exc))}",
@@ -553,6 +617,7 @@ def propose(
         # next sentence should not re-check what we just proved.
         _GATE_CACHE[(str(settings.get("endpoint") or ""), str(settings.get("model") or ""))] = (
             True, None, time.monotonic())
+    usage = record.get("usage_measured") if isinstance(record.get("usage_measured"), dict) else {}
     body = record.get("proposal") if isinstance(record.get("proposal"), dict) else {}
     session = None
     for artifact in record.get("artifacts") or []:
@@ -571,4 +636,7 @@ def propose(
         session=session, steps=steps, dropped=list(body.get("dropped") or []),
         unclear=str(body.get("unclear") or ""),
         duration_seconds=round(time.monotonic() - started, 3), third_party=warning,
+        thinking_chars=thought["chars"],
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
     )

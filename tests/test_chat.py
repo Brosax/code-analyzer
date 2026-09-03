@@ -366,3 +366,78 @@ def test_the_totals_include_the_session_that_settled_after_the_last_heartbeat() 
     }))
     stats = transcript.stats()
     assert (stats.prompt_tokens, stats.requests) == (90_000, 30)
+
+
+# --- the chain of thought ---------------------------------------------------
+
+
+def _thinking(text: str, *, at: float, producer: str = "llm-security", unit: str = "u1") -> AnalysisEvent:
+    return _event("output", "running", text, tool=producer, unit=unit, stream="thinking", timestamp=at)
+
+
+def test_reasoning_is_shown_beside_the_answer_and_never_folded_into_it() -> None:
+    """Concatenated, it would make every unit's JSON unparseable."""
+    transcript = Transcript()
+    transcript.apply(_started())
+    transcript.apply(_thinking("先看长度参数", at=1.0))
+    transcript.apply(_thinking("再看 memcpy 的目标缓冲区\n", at=1.5))
+    transcript.apply(_answer('{"findings": []}', at=2.0))
+
+    turn = transcript.turns()[0]
+    assert turn.answer == '{"findings": []}'
+    assert "先看长度参数" in turn.thinking
+    assert turn.thinking not in turn.answer
+    assert turn.thinking_chars == len("先看长度参数") + len("再看 memcpy 的目标缓冲区\n")
+
+    lines = _plain(transcript)
+    assert any("▾ 思维链" in line for line in lines)
+    assert any("先看长度参数" in line for line in lines)
+    assert any('{"findings": []}' in line for line in lines)
+
+
+def test_a_turn_says_it_is_thinking_until_the_answer_starts() -> None:
+    transcript = Transcript()
+    transcript.apply(_started())
+    assert transcript.turns()[0].state == "waiting"
+    transcript.apply(_thinking("嗯……", at=1.0))
+    assert transcript.turns()[0].state == "thinking"
+    assert any("思考中" in line for line in _plain(transcript))
+    transcript.apply(_answer("{", at=2.0))
+    assert transcript.turns()[0].state == "streaming"
+    # A late delta must not drag a streaming turn back.
+    transcript.apply(_thinking("补一句", at=2.5))
+    assert transcript.turns()[0].state == "streaming"
+
+
+def test_reasoning_counts_as_output_because_the_provider_bills_it_as_output() -> None:
+    """Counting only the answer reports a reasoning model as several times slower."""
+    transcript = Transcript()
+    transcript.apply(_started())
+    transcript.apply(_thinking("x" * 400, at=1.0))
+    transcript.apply(_answer("y" * 100, at=3.0))
+
+    turn = transcript.turns()[0]
+    assert turn.output_chars == 500
+    speed, basis = turn.speed()
+    assert basis == "估算"
+    assert speed == round(500 / CHARS_PER_TOKEN / 2.0, 1)
+    assert any(f"输出 ~{500 // CHARS_PER_TOKEN} tok" in line for line in _plain(transcript))
+
+
+def test_a_long_chain_of_thought_keeps_its_tail_and_says_so() -> None:
+    """The end explains the answer; the start is the model restating the prompt."""
+    from code_analyzer.chat import MAX_THINKING_CHARS, MAX_THINKING_LINES
+
+    transcript = Transcript()
+    transcript.apply(_started())
+    transcript.apply(_thinking("\n".join(f"step {n}" for n in range(MAX_THINKING_LINES * 3)), at=1.0))
+    turn = transcript.turns()[0]
+    kept, omitted = transcript.thinking_lines(turn)
+    assert len(kept) == MAX_THINKING_LINES
+    assert kept[-1] == f"step {MAX_THINKING_LINES * 3 - 1}"
+    assert omitted == MAX_THINKING_LINES * 2
+    assert any("已折叠更早的部分" in line for line in _plain(transcript))
+
+    transcript.apply(_thinking("z" * (MAX_THINKING_CHARS + 10), at=2.0))
+    assert len(transcript.turns()[0].thinking) == MAX_THINKING_CHARS
+    assert transcript.turns()[0].thinking_truncated is True
