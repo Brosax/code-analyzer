@@ -804,6 +804,8 @@ def test_the_tree_strips_endpoint_userinfo_wherever_an_endpoint_appears(tmp_path
     assert "sk-live-SUPERSECRET" not in text
     assert "svc:" not in text
     assert cordis.endpoint_url(settings) == "https://gpu-host.internal:8000/v1"
+    tags_settings = {"endpoint": "http://192.168.5.10:11434/api/tags"}
+    assert cordis.endpoint_url(tags_settings) == "http://192.168.5.10:11434/v1"
 
 
 

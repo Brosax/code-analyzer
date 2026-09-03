@@ -88,6 +88,10 @@ def render(
     if isinstance(findings, list) and len(findings) > MAX_EMBED_FINDINGS:
         data["findings"] = embedded_findings(findings, MAX_EMBED_FINDINGS)
         data["findings_omitted"] = len(findings) - len(data["findings"])
+    diagnostics = data.get("diagnostics")
+    if isinstance(diagnostics, list) and len(diagnostics) > MAX_EMBED_FINDINGS:
+        data["diagnostics"] = diagnostics[:MAX_EMBED_FINDINGS]
+        data["diagnostics_omitted"] = len(diagnostics) - len(data["diagnostics"])
     if isinstance(assessment, dict):
         candidates = assessment.get("candidates")
         embedded = dict(assessment)
@@ -95,7 +99,40 @@ def render(
             embedded["candidates"] = embedded_candidates(candidates, MAX_EMBED_FINDINGS)
             embedded["candidates_omitted"] = len(candidates) - len(embedded["candidates"])
         data["assessment"] = embedded
-    data["execution_manifest"] = manifest
+
+    data_tools = data.get("tools")
+    if isinstance(data_tools, dict):
+        data["tools"] = {
+            k: {tk: tv for tk, tv in v.items() if tk != "units"} if isinstance(v, dict) else v
+            for k, v in data_tools.items()
+        }
+    data_scanners = data.get("scanners")
+    if isinstance(data_scanners, dict):
+        data["scanners"] = {
+            k: {sk: sv for sk, sv in v.items() if sk != "units"} if isinstance(v, dict) else v
+            for k, v in data_scanners.items()
+        }
+
+    manifest_embedded = dict(manifest)
+    manifest_embedded.pop("artifacts", None)
+    manifest_embedded.pop("export", None)
+    m_tools = manifest_embedded.get("tools")
+    if isinstance(m_tools, dict):
+        manifest_embedded["tools"] = {
+            k: {tk: tv for tk, tv in v.items() if tk != "units"} if isinstance(v, dict) else v
+            for k, v in m_tools.items()
+        }
+    m_llm = manifest_embedded.get("llm")
+    if isinstance(m_llm, dict):
+        m_llm = dict(m_llm)
+        manifest_embedded["llm"] = m_llm
+        m_llm_scanners = m_llm.get("scanners")
+        if isinstance(m_llm_scanners, dict):
+            m_llm["scanners"] = {
+                k: {sk: sv for sk, sv in v.items() if sk != "units"} if isinstance(v, dict) else v
+                for k, v in m_llm_scanners.items()
+            }
+    data["execution_manifest"] = manifest_embedded
     return _TEMPLATE.replace("__CODE_ANALYZER_DATA__", _json_for_html(data))
 
 
@@ -391,7 +428,7 @@ _JS_GUARD = r"""
   window.addEventListener("unhandledrejection", () => show(
     "\u4eea\u8868\u76d8\u521d\u59cb\u5316\u5931\u8d25 / Dashboard initialization failed with an unhandled error."));
   state.timer = window.setTimeout(() => show(
-    "\u4eea\u8868\u76d8\u521d\u59cb\u5316\u672a\u5b8c\u6210 / Dashboard initialization did not complete."), 1000);
+    "\u4eea\u8868\u76d8\u521d\u59cb\u5316\u672a\u5b8c\u6210 / Dashboard initialization did not complete."), 10000);
 })();
 """
 
@@ -1212,7 +1249,7 @@ _JS_MAIN = r"""
 
   /* ---------- diagnostics ---------- */
   const renderDiagnostics = () => {
-    id("diagnostic-count").textContent = fmt("diag_n", { n: number((review.diagnostics || []).length) });
+    id("diagnostic-count").textContent = fmt("diag_n", { n: number(review.total_diagnostics != null ? review.total_diagnostics : (review.diagnostics || []).length) });
     const body = id("diagnostic-body");
     body.replaceChildren();
     (review.diagnostics || []).forEach(x => {

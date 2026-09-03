@@ -548,7 +548,7 @@ LLM 层默认**关闭**：一次可能耗时数小时的扫描，绝不能是 `a
 
 | profile | 端点 | 模型 | 源码离开本机 |
 |---|---|---|---|
-| `gpu-host`（默认） | SSH 隧道后的本机 `11435` | `qwen3.8:27b` | 否 |
+| `gpu-host`（默认） | 本网段 GPU 主机 `192.168.5.10:11434` | `qwen3.8:27b` | 否 |
 | `gpu-host-uncensored` | 同上 | `qwen3_8_uncensored:latest` | 否 |
 | `openrouter` | `openrouter.ai/api/v1` | `stealth/ox-alpha` | **是** |
 

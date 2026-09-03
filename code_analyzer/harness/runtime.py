@@ -426,6 +426,17 @@ def endpoint_context_length(settings: dict[str, Any], *, timeout: float = 5.0) -
         parts = line.split()
         if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
             return int(parts[1])
+    model_info = shown.get("model_info") if isinstance(shown.get("model_info"), dict) else {}
+    for k, v in model_info.items():
+        if k.endswith("context_length") and isinstance(v, int):
+            return v
+    tags = fetch("/api/tags", None)
+    if isinstance(tags, dict):
+        for item in tags.get("models", []) or []:
+            if isinstance(item, dict) and (item.get("name") == model or item.get("model") == model):
+                ctx = item.get("details", {}).get("context_length")
+                if isinstance(ctx, int):
+                    return ctx
     return None
 
 

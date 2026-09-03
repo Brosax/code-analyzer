@@ -130,11 +130,28 @@ def _models(base: str, key: str | None, model: str, *, timeout: float) -> dict[s
     """
     payload, error = _request(f"{base}/models", None, key, timeout=timeout)
     if payload is None:
-        return {"reachable": False, "model_present": False, "available": [], "reason": error}
-    names = sorted(
-        str(item.get("id", "")) for item in payload.get("data") or []
-        if isinstance(item, dict) and item.get("id")
-    )
+        ollama_root = base
+        if ollama_root.endswith("/v1"):
+            ollama_root = ollama_root[:-3]
+        tags_url = ollama_root if ollama_root.endswith("/api/tags") else f"{ollama_root.rstrip('/')}/api/tags"
+        tags_payload, _ = _request(tags_url, None, key, timeout=timeout)
+        if tags_payload is not None and isinstance(tags_payload, dict):
+            payload = tags_payload
+            error = None
+        else:
+            return {"reachable": False, "model_present": False, "available": [], "reason": error}
+    if "data" in payload and isinstance(payload.get("data"), list):
+        names = sorted(
+            str(item.get("id", "")) for item in payload["data"]
+            if isinstance(item, dict) and item.get("id")
+        )
+    elif "models" in payload and isinstance(payload.get("models"), list):
+        names = sorted(
+            str(item.get("name", "") or item.get("model", "")) for item in payload["models"]
+            if isinstance(item, dict) and (item.get("name") or item.get("model"))
+        )
+    else:
+        names = []
     present = _serves(names, model)
     return {
         "reachable": True,

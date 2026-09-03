@@ -149,11 +149,12 @@ code-analyzer assess /path/to/report-directory
 ```
 
 Three built-in profiles supply `endpoint`, `model` and `api_key_env`, and
-nothing else: `gpu-host` (the operator's own box, reached over an SSH
-port-forward), `gpu-host-uncensored` (the same box, a model without the safety
-tuning — scanned source is exploit-shaped by construction, and a refusal
-reaches the parser as an unparseable response), and `openrouter` (third party:
-the source leaves this machine, and both the CLI and `llm-doctor` say so).
+nothing else: `gpu-host` (the operator's GPU host, reached directly on the
+local network without SSH port-forward), `gpu-host-uncensored` (the same box,
+a model without the safety tuning — scanned source is exploit-shaped by
+construction, and a refusal reaches the parser as an unparseable response),
+and `openrouter` (third party: the source leaves this machine, and both the CLI
+and `llm-doctor` say so).
 Any other provider needs `--llm-endpoint` and `--llm-model`, not a new profile.
 
 `llm-doctor` probes the provider before a long scan commits to it: it lists the

@@ -63,7 +63,10 @@ from ..persist import json_bytes
 
 
 def endpoint_url(settings: dict[str, Any]) -> str:
-    """The endpoint with any userinfo removed, safe to persist as evidence."""
+    """The endpoint with any userinfo removed, safe to persist as evidence.
+
+    Also normalizes Ollama native /api/tags URLs to the OpenAI-compatible /v1.
+    """
     value = str(settings.get("endpoint", "") or "").strip()
     if not value:
         return ""
@@ -71,12 +74,17 @@ def endpoint_url(settings: dict[str, Any]) -> str:
         split = urlsplit(value)
     except ValueError:
         return ""
-    if not (split.username or split.password):
-        return value
     host = split.hostname or ""
     if split.port:
         host = f"{host}:{split.port}"
-    return urlunsplit(split._replace(netloc=host))
+    path = split.path.rstrip("/")
+    if path.endswith("/api/tags"):
+        path = path[:-len("/api/tags")] + "/v1"
+    else:
+        path = split.path
+    if not (split.username or split.password) and path == split.path:
+        return value
+    return urlunsplit((split.scheme, host, path, split.query, split.fragment))
 
 
 SKILL_PACKAGE = "code_analyzer"

@@ -1049,7 +1049,7 @@ Skill 发现路径——每次升版逐项复核。
 [llm]
 enabled = false
 profile = "gpu-host"                            # 内置 provider profile，见下
-endpoint = "http://127.0.0.1:11435/v1"          # 显式设置时覆盖 profile 的值
+endpoint = "http://192.168.5.10:11434/v1"          # 显式设置时覆盖 profile 的值
 api_key_env = "CODE_ANALYZER_LLM_API_KEY"
 model = "qwen3.6-27b"
 context_window = 32768
@@ -1096,7 +1096,7 @@ schema 叶子。任意命名的嵌套表会同时破坏这两者——与 §5.5 
 ```python
 # code_analyzer/llm/profiles.py
 PROFILES = {
-    "gpu-host":   {"endpoint": "http://127.0.0.1:11435/v1",   # Ollama，经 SSH 隧道
+    "gpu-host":   {"endpoint": "http://192.168.5.10:11434/v1",   # Ollama，直连局域网 GPU 主机
                    "model": "qwen3.8:27b",
                    "api_key_env": ""},                         # Ollama 无需凭据
     "openrouter": {"endpoint": "https://openrouter.ai/api/v1",
@@ -1105,17 +1105,9 @@ PROFILES = {
 }
 ```
 
-**`gpu-host` 的实际拓扑。** GPU 主机上跑的是 Ollama（监听 `127.0.0.1:11434`），
-不直接暴露；通过 SSH 端口转发到本机后，走 Ollama 的 OpenAI 兼容 `/v1`：
-
-```bash
-ssh -L 11435:127.0.0.1:11434 -p <port> <user>@<gpu-host>
-```
-
-**本地端口用 11435 而不是 11434**：开发机通常自己也跑着一个 Ollama 在 11434。
-`ssh -L` 绑定失败时**只打一行警告、不退出**，隧道悄悄不存在，扫描请求会落到本机那个
-CPU 推理实例——正是 §2.5 实测过单次调用超过 20 分钟的那个。`llm-doctor`（P3）应当
-通过 `/api/tags` 核对端点返回的模型清单与 `model` 是否匹配，把这种误路由变成显式失败。
+**`gpu-host` 的实际拓扑。** GPU 主机上跑的是 Ollama（监听 `192.168.5.10:11434`），
+通过局域网直接连接，走 Ollama 的 OpenAI 兼容 `/v1`（无需 SSH 隧道）。
+`llm-doctor`（P3）通过 `/api/tags` 或 `/v1/models` 核对端点返回的模型清单与 `model` 是否匹配，把模型不存在或不可达变成显式失败。
 
 `profile` 提供 `endpoint` / `model` / `api_key_env` 的默认值；TOML 或 CLI 中显式给出的
 同名键覆盖之。`profile` 是枚举，只占 `_ALLOWED` 与 `FIELD_REGISTRY` 各一个叶子。

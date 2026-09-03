@@ -236,3 +236,19 @@ def test_an_unset_credential_variable_is_one_clear_failure(
     assert result["ok"] is False
     assert result["credential"]["ok"] is False
     assert "CODE_ANALYZER_TEST_KEY" in result["credential"]["reason"]
+
+
+def test_models_falls_back_to_ollama_api_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request(url: str, body: Any, key: Any, *, timeout: float) -> tuple[Any, Any]:
+        if url.endswith("/models"):
+            return None, "HTTP 404 from /models"
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "qwen3.8:27b", "details": {"context_length": 262144}}]}, None
+        return None, "not found"
+
+    monkeypatch.setattr(llm_doctor, "_request", fake_request)
+    res = llm_doctor._models("http://192.168.5.10:11434/v1", None, "qwen3.8:27b", timeout=5.0)
+    assert res["reachable"] is True
+    assert res["model_present"] is True
+    assert res["available"] == ["qwen3.8:27b"]
+

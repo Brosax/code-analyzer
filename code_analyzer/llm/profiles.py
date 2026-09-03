@@ -13,13 +13,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 PROFILES: dict[str, dict[str, str]] = {
-    # The GPU host runs Ollama and is reached over an SSH tunnel
-    # (ssh -L 11435:127.0.0.1:11434 <host>).  11435 rather than 11434 on the
-    # local side: a workstation often has its own Ollama on 11434, and a tunnel
-    # that fails to bind only warns, silently routing the scan to the local
-    # CPU instance instead.  Ollama's /v1 needs no credential.
+    # The GPU host runs Ollama and is reached directly on the local network
+    # (http://192.168.5.10:11434).  Ollama's /v1 needs no credential.
     "gpu-host": {
-        "endpoint": "http://127.0.0.1:11435/v1",
+        "endpoint": "http://192.168.5.10:11434/v1",
         "model": "qwen3.8:27b",
         "api_key_env": "",
     },
@@ -31,7 +28,7 @@ PROFILES: dict[str, dict[str, str]] = {
     # a new default: which model judges the code is the operator's call, and it
     # is recorded in every manifest.
     "gpu-host-uncensored": {
-        "endpoint": "http://127.0.0.1:11435/v1",
+        "endpoint": "http://192.168.5.10:11434/v1",
         "model": "qwen3_8_uncensored:latest",
         "api_key_env": "",
     },
