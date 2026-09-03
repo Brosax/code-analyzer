@@ -26,11 +26,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..actions import BY_NAME, REGISTRY, SUBJECT_NONE
 from ..config import FIELD_BY_PATH, config_value, set_config_value, validate_config
 from ..errors import UserError
-from ..harness.cordis import cordis_document, tool_allowlist, write_cordis_config
+from ..harness.cordis import cordis_document, write_cordis_config
 from ..harness.runtime import HarnessRuntime, harness_available
 from ..harness.session import run_proposal
 from ..persist import json_bytes
@@ -55,6 +56,9 @@ MAX_CONTEXT_ROWS = 40
 # `request_timeout_seconds = 600.0` (config.py:94) -- ten minutes for a
 # question whose measured worst case is 79 seconds.  1.5x that is the budget.
 ROUTE_REQUEST_TIMEOUT = 120.0
+# How many rounds of ask evidence to keep.  Every sentence leaves a session
+# tree, and after the inversion every greeting and typo is a sentence.
+ASK_KEEP_ROUNDS = 50
 
 
 @dataclass
@@ -116,6 +120,54 @@ def gate(config: Mapping[str, Any]) -> tuple[bool, str | None]:
     return endpoint_reachable(settings, timeout=PROBE_SECONDS)
 
 
+def ask_root(override: Path | None = None) -> Path:
+    """Where this lane's evidence lives -- not the operator's working directory.
+
+    ``propose`` used to write under ``config["run"]["output_root"]``, which
+    defaults to ``./code-analyzer-reports`` resolved against the process CWD.
+    That was tolerable while ``/ask`` was an explicit, rare command.  Once every
+    sentence routes here, every greeting and every typo would mkdir a tree and
+    drop a session in whatever directory the operator happened to be standing
+    in.  ``CODE_ANALYZER_ASK_ROOT`` overrides; tests pass ``output_root``.
+    """
+    if override is not None:
+        return Path(override).expanduser() / "ask"
+    configured = os.environ.get("CODE_ANALYZER_ASK_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".code-analyzer" / "ask"
+
+
+def prune_ask_evidence(root: Path, keep: int = ASK_KEEP_ROUNDS) -> int:
+    """Keep the most recent rounds; return how many were removed.
+
+    Round ids sort lexicographically by their UTC stamp, so "most recent" is
+    the tail of a sorted listing.  Failure to prune is never fatal: this is a
+    convenience directory, not evidence a report rests on.
+    """
+    import shutil
+
+    from ..harness.session import unit_directory
+
+    # Where run_proposal actually puts a round -- `<root>/llm/sessions/<producer>/`.
+    # Derived rather than spelled out, so a change to the evidence layout cannot
+    # silently turn this into a no-op, which is exactly what a hand-written
+    # "sessions/<producer>" did on the first attempt.
+    sessions = unit_directory(root, PRODUCER, "x").parent
+    try:
+        rounds = sorted(item for item in sessions.iterdir() if item.is_dir())
+    except OSError:
+        return 0
+    removed = 0
+    for stale in rounds[:-keep] if keep > 0 else rounds:
+        try:
+            shutil.rmtree(stale)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def catalogue() -> list[dict[str, Any]]:
     """Every action the model may name, generated from the registry itself.
 
@@ -151,9 +203,38 @@ def settings_for(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def directive(skill: Any) -> dict[str, Any]:
+    """The skill, inlined, plus an order not to go looking for it.
+
+    Measured live on 2026-09-03: left to fetch its own instructions through the
+    ``skill`` tool, the model called it **seven times** and burned the whole
+    six-step ceiling before writing a single answer -- ``agent step ceiling of
+    6 reached``, zero steps left to reply. ``llm/scan.py:1001-1007`` had already
+    found and fixed the same thing for the scanners and said why: "one step,
+    one answer". This lane inherited the bug because it was rare enough to be
+    lucky.
+
+    With the skill inlined, the intent model needs no tools at all -- which is
+    also the tightest possible injection surface.
+    """
+    return {"type": "text", "text": "\n".join([
+        "# Your instructions",
+        "",
+        f"skill: {skill.name} (version {skill.skill_version})",
+        f"scope: {skill.description}",
+        "",
+        "The full skill follows. It is already loaded: do not call the skill tool,",
+        "and do not call any other tool -- you have none.",
+        "",
+        "<skill_content>",
+        skill.body.strip(),
+        "</skill_content>",
+    ])}
+
+
 def build_prompt(utterance: str, config: Mapping[str, Any], *, source: Path | None,
-                 report_directory: Path | None) -> list[dict[str, Any]]:
-    """The catalogue, the context, the sentence.  Nothing else, on purpose."""
+                 report_directory: Path | None, skill: Any = None) -> list[dict[str, Any]]:
+    """The skill, the catalogue, the context, the sentence.  Nothing else."""
     changed = []
     for path, spec in FIELD_BY_PATH.items():
         if spec.readonly:
@@ -173,6 +254,7 @@ def build_prompt(utterance: str, config: Mapping[str, Any], *, source: Path | No
         "settable_configuration_paths": sorted(FIELD_BY_PATH),
     }
     return [
+        *([directive(skill)] if skill is not None else []),
         {"type": "text", "text": "# Catalogue\n\n" + json.dumps(catalogue(), indent=2, ensure_ascii=False)},
         {"type": "text", "text": "# Context\n\n" + json.dumps(context, indent=2, ensure_ascii=False)},
         {"type": "text", "text": (
@@ -326,10 +408,13 @@ def propose(
     except UserError as exc:
         return Proposal("failed", str(exc), model=model, third_party=warning)
 
-    blocks = build_prompt(utterance, config, source=source, report_directory=report_directory)
+    blocks = build_prompt(utterance, config, source=source,
+                          report_directory=report_directory, skill=skill)
     prompt_text = render_blocks(blocks)
-    round_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    run_dir = Path(output_root or config["run"]["output_root"]).expanduser() / "ask"
+    # A second-granularity stamp collides when two sentences land in the same
+    # second, which a queue makes ordinary rather than rare.
+    round_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid4().hex[:8]
+    run_dir = ask_root(Path(output_root) if output_root is not None else None)
     run_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
 
@@ -342,8 +427,13 @@ def propose(
             session_root.mkdir(parents=True, exist_ok=True)
             cordis_path = write_cordis_config(
                 run_dir / "cordis",
+                # The skill tool and nothing else.  `cordis_document` refuses an
+                # empty allow-list, and the runtime loads a skill through that
+                # tool, so it stays declared -- but the skill is already in the
+                # prompt and the prompt says not to call it.  No `fs`, no `lsp`:
+                # the only untrusted text this model can reach is the sentence.
                 cordis_document(settings, skill_dir=skill_dir, session_root=session_root,
-                                tools=tool_allowlist([skill])),
+                                tools=("skill",)),
             )
             opener = open_runtime or (lambda: HarnessRuntime(
                 settings, cwd=Path.cwd(), session_root=session_root, cordis_path=cordis_path,
@@ -361,6 +451,7 @@ def propose(
         return Proposal("failed", f"{type(exc).__name__}: {single_line(str(exc))}",
                         model=model, third_party=warning)
 
+    prune_ask_evidence(run_dir)
     body = record.get("proposal") if isinstance(record.get("proposal"), dict) else {}
     session = None
     for artifact in record.get("artifacts") or []:

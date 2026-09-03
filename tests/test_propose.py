@@ -11,6 +11,8 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
+
 from code_analyzer.actions import REGISTRY
 from code_analyzer.config import DEFAULTS, validate_config
 from code_analyzer.llm.propose import (
@@ -237,3 +239,87 @@ def test_the_switch_is_off_by_default_so_an_operator_is_never_silently_offline(
     from code_analyzer.llm.propose import disabled_by_env
 
     assert not disabled_by_env()
+
+
+# --- where the evidence goes -------------------------------------------------
+
+
+def test_asking_a_question_writes_no_evidence_into_the_operators_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every greeting and every typo is a sentence once free text routes here."""
+    from code_analyzer.llm.propose import ask_root
+
+    working = tmp_path / "somebodys-project"
+    working.mkdir()
+    monkeypatch.chdir(working)
+    monkeypatch.delenv("CODE_ANALYZER_ASK_ROOT", raising=False)
+
+    # The default is the operator's home, never the directory they stand in.
+    assert ask_root() == Path.home() / ".code-analyzer" / "ask"
+    assert working not in ask_root().parents and ask_root() != working
+
+    monkeypatch.setenv("CODE_ANALYZER_ASK_ROOT", str(tmp_path / "elsewhere"))
+    assert ask_root() == tmp_path / "elsewhere"
+    # An explicit override still wins, which is how the tests point it at tmp.
+    assert ask_root(tmp_path / "given") == tmp_path / "given" / "ask"
+    assert list(working.iterdir()) == []
+
+
+def test_two_questions_in_the_same_second_keep_two_separate_records(tmp_path: Path) -> None:
+    """A queue makes same-second sentences ordinary rather than rare."""
+    import re
+
+    from code_analyzer.harness.session import unit_directory
+    from code_analyzer.llm.propose import PRODUCER, prune_ask_evidence
+
+    sessions = unit_directory(tmp_path, PRODUCER, "x").parent
+    sessions.mkdir(parents=True)
+    stamp = "20260903T190000Z"
+    for suffix in ("aaaaaaaa", "bbbbbbbb"):
+        (sessions / f"{stamp}-{suffix}").mkdir()
+    assert len(list(sessions.iterdir())) == 2
+    # The id shape is a sortable stamp plus enough entropy not to collide.
+    for item in sessions.iterdir():
+        assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}", item.name)
+    assert prune_ask_evidence(tmp_path, keep=50) == 0
+
+
+def test_the_ask_lanes_evidence_is_pruned_to_the_most_recent_rounds(tmp_path: Path) -> None:
+    from code_analyzer.harness.session import unit_directory
+    from code_analyzer.llm.propose import PRODUCER, prune_ask_evidence
+
+    sessions = unit_directory(tmp_path, PRODUCER, "x").parent
+    sessions.mkdir(parents=True)
+    for index in range(8):
+        (sessions / f"2026090{index}T000000Z-{index:08x}").mkdir()
+
+    assert prune_ask_evidence(tmp_path, keep=3) == 5
+    kept = sorted(item.name for item in sessions.iterdir())
+    assert len(kept) == 3 and kept[-1].startswith("20260907")
+    # A missing directory is not an error: this is a convenience, not evidence.
+    assert prune_ask_evidence(tmp_path / "absent", keep=3) == 0
+
+
+def test_the_intent_model_is_given_its_skill_and_told_not_to_go_looking_for_it() -> None:
+    """Measured: fetching the skill burned all six steps on seven tool calls.
+
+    `llm/scan.py` had already found this and inlined the skill for the same
+    reason; this lane inherited the bug and was merely lucky. With the skill in
+    the prompt: one step, zero tool calls, and the round trip fell from 58-79s
+    to 21-31s.
+    """
+    from code_analyzer.llm.propose import build_prompt, directive
+    from code_analyzer.llm.skills import load_skill
+
+    skill = load_skill("operator-intent")
+    block = directive(skill)["text"]
+    assert "<skill_content>" in block and skill.body.strip()[:40] in block
+    assert "do not call the skill tool" in block
+    assert "you have none" in block
+
+    blocks = build_prompt("随便说一句", _config(), source=None, report_directory=None, skill=skill)
+    text = "\n".join(item["text"] for item in blocks)
+    assert "<skill_content>" in text
+    # Still no findings, no source, no analyzer output.
+    assert "summary.json" not in text
