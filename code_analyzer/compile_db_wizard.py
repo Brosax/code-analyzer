@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, TextIO
 
+from .ask import CONFIRM, TEXT, Asker, Question, stdin_asker
 from .compile_db import candidate_score, discover_candidate_paths, inspect_compile_db
 from .errors import UserError
 from .persist import write_json
@@ -21,10 +22,17 @@ class _MissingComponent(Exception):
     pass
 
 
-def run_compile_db(args: Any, *, stdin: TextIO | None = None, stdout: TextIO | None = None, stderr: TextIO | None = None) -> int:
+def run_compile_db(
+    args: Any, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
+    stderr: TextIO | None = None, ask: Asker | None = None,
+) -> int:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
+    # The two prompts below are the only places this program stops and waits.
+    # They go through the asker so the conversation can render them as turns;
+    # the default reproduces exactly what the terminal did before.
+    ask = ask if ask is not None else stdin_asker(stdin, stderr)
     source = args.source.expanduser().resolve()
     if not source.is_dir():
         raise UserError(f"source is not a directory: {source}")
@@ -48,7 +56,7 @@ def run_compile_db(args: Any, *, stdin: TextIO | None = None, stdout: TextIO | N
         return 10
     try:
         if method == "cmake":
-            prepared = _prepare_cmake(args, source, report, stdin, stderr)
+            prepared = _prepare_cmake(args, source, report, ask)
         else:
             prepared = _prepare_command(args, source)
     except _MissingComponent as exc:
@@ -61,15 +69,18 @@ def run_compile_db(args: Any, *, stdin: TextIO | None = None, stdout: TextIO | N
         return 10
     _print_preview(argv, cwd, expected, impact, stderr)
     if not args.yes:
-        if not _interactive(stdin):
+        if not ask.interactive:
             print("code-analyzer: generation was not run in a non-interactive session; pass --yes to execute it", file=stderr)
             return 10
         try:
-            answer = input_from(stdin, stderr, "Continue? [y/N] ")
+            answer = ask(Question("compile-db.continue", CONFIRM, "Continue? [y/N] "))
         except KeyboardInterrupt:
             print("\ncode-analyzer: interrupted", file=stderr)
             return 130
-        if answer.strip().lower() not in {"y", "yes"}:
+        if answer.interrupted:
+            print("\ncode-analyzer: interrupted", file=stderr)
+            return 130
+        if not answer.yes:
             print("code-analyzer: generation cancelled", file=stderr)
             return 10
 
@@ -144,14 +155,17 @@ def inspect_environment(source: Path) -> dict[str, Any]:
     }
 
 
-def _prepare_cmake(args: Any, source: Path, report: dict[str, Any], stdin: TextIO, stderr: TextIO) -> tuple[list[str], Path, Path, str]:
+def _prepare_cmake(args: Any, source: Path, report: dict[str, Any], ask: Asker) -> tuple[list[str], Path, Path, str]:
     if not report["project"]["cmake_lists"]:
         raise UserError(f"CMakeLists.txt does not exist in source: {source}")
     if args.preset and (args.build_dir is not None or args.generator is not None):
         raise UserError("--preset cannot be combined with --build-dir or --generator")
     extra = list(args.cmake_arg or [])
-    if not args.yes and not extra and not args.preset and _interactive(stdin):
-        entered = input_from(stdin, stderr, "Additional CMake arguments (optional): ")
+    if not args.yes and not extra and not args.preset and ask.interactive:
+        # The only free-text question in the program.  It still splits like a
+        # shell, and an unbalanced quote is still a UserError rather than a
+        # silently different argv.
+        entered = ask(Question("compile-db.cmake-args", TEXT, "Additional CMake arguments (optional): ")).text
         try:
             extra = shlex.split(entered)
         except ValueError as exc:

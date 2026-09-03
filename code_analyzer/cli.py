@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .actions import ActionContext, ActionRequest, by_name, invoke
+from .analysis import AnalysisEvent
 from .argv import (
     add_analyze_arguments,
     add_llm_arguments,
@@ -17,22 +19,13 @@ from .argv import (
     positive_float,
     positive_int,
 )
-from .compile_db_wizard import run_compile_db
+from .ask import stdin_asker
 from .config import load_config
 from .control import auto_no, auto_yes, stdin_decider
-from .dashboard import rebuild_dashboard
-from .doctor import probe_all
 from .errors import UserError
 from .events import EVENTS_FILE, JsonlEventSink, events_file
-from .llm.doctor import probe_llm
 from .llm.profiles import third_party_warning
-from .llm.resume import run_resume
-from .reconfigure import run_tools_resume
-from .recovery import recover_report
-from .runner import analyze
 from .serve import DEFAULT_PORT, serve
-from .status import EXIT_COMPLETE, EXIT_PARTIAL
-from .validate import run_assess
 
 
 def parser() -> argparse.ArgumentParser:
@@ -54,6 +47,14 @@ def parser() -> argparse.ArgumentParser:
     llm_resume.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     llm_resume.add_argument("--config", type=Path)
     add_llm_arguments(llm_resume)
+    pre = commands.add_parser("preflight", help="read-only checks before a scan")
+    pre.add_argument("source", type=Path)
+    pre.add_argument("--config", type=Path)
+    cfg = commands.add_parser("config", help="show the effective configuration")
+    cfg.add_argument("source", nargs="?", type=Path)
+    cfg.add_argument("--config", type=Path)
+    cfg.add_argument("--filter", help="only paths or labels containing this")
+    cfg.add_argument("--all", action="store_true", help="include the advanced fields")
     compile_db = commands.add_parser("compile-db", help="discover or prepare a JSON compilation database")
     compile_db.add_argument("source", type=Path)
     compile_db.add_argument("--json", action="store_true", dest="as_json", help="report discovery without executing anything")
@@ -128,37 +129,64 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             config = load_config(Path.cwd(), args.config, None)
             _warn_third_party(config)
-            result = probe_all(config)
+            outcome = _invoke("doctor", ActionRequest("doctor", config=config, args=args))
+            result = outcome.data or {}
             if args.as_json:
                 print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
             else:
                 _print_doctor(result)
-            return 0 if result["ok"] else 20
+            return outcome.exit_code
         if args.command == "llm-doctor":
             source = (args.source or Path.cwd()).expanduser().resolve()
             config = load_config(source, args.config, {"llm": llm_overrides(args)} if llm_overrides(args) else None)
-            result = probe_llm(config, source if args.source is not None else None)
+            outcome = _invoke("llm-doctor", ActionRequest(
+                "llm-doctor", source=source if args.source is not None else None, config=config, args=args))
+            result = outcome.data or {}
             if args.as_json:
                 print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
             else:
                 _print_llm_doctor(result)
-            return 0 if result["ok"] else 20
+            return outcome.exit_code
         if args.command == "compile-db":
-            return run_compile_db(args)
+            return _invoke("compile-db", ActionRequest(
+                "compile-db", source=args.source, args=args),
+                ask=stdin_asker(sys.stdin, sys.stderr)).exit_code
+        if args.command == "preflight":
+            source = args.source.expanduser().resolve()
+            config = load_config(source, args.config, None)
+            outcome = _invoke("preflight", ActionRequest("preflight", source=source, config=config, args=args))
+            for line in outcome.lines:
+                print(f"code-analyzer: {line}", file=sys.stderr)
+            print(outcome.summary)
+            return outcome.exit_code
+        if args.command == "config":
+            source = (args.source or Path.cwd()).expanduser().resolve()
+            config = load_config(source, args.config, None)
+            outcome = _invoke("config", ActionRequest(
+                "config", source=source, config=config, args=args,
+                values={"filter": args.filter, "all": args.all}))
+            for line in outcome.lines:
+                print(line)
+            return outcome.exit_code
         if args.command == "rebuild-dashboard":
-            print(rebuild_dashboard(args.report_directory))
-            return 0
+            outcome = _invoke("rebuild-dashboard", ActionRequest(
+                "rebuild-dashboard", report_directory=args.report_directory, args=args))
+            print((outcome.data or {}).get("index"))
+            return outcome.exit_code
         if args.command == "recover-report":
-            print(recover_report(args.report_directory))
-            return 0
+            outcome = _invoke("recover-report", ActionRequest(
+                "recover-report", report_directory=args.report_directory, args=args))
+            print((outcome.data or {}).get("index"))
+            return outcome.exit_code
         if args.command == "llm-resume":
             report_directory = args.report_directory.expanduser().resolve()
             config = load_config(_scanned_source(report_directory), args.config, assess_overrides(args))
             _warn_third_party(config)
-            block = run_resume(report_directory, config,
-                               progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+            outcome = _invoke("llm-resume", ActionRequest(
+                "llm-resume", report_directory=report_directory, config=config, args=args),
+                emit=_stderr_emitter("code-analyzer: "))
             print(report_directory)
-            return int(block["exit_code"])
+            return outcome.exit_code
         if args.command == "tools-resume":
             if args.build_assist_yes:
                 decider = auto_yes
@@ -168,22 +196,22 @@ def main(argv: list[str] | None = None) -> int:
                 decider = auto_no
             report_dir = args.report_directory.expanduser().resolve()
             with JsonlEventSink(report_dir / EVENTS_FILE, append=True) as sink:
-                block = run_tools_resume(
-                    report_dir, tool=args.tool, assist=args.build_assist, decider=decider,
-                    progress=lambda message: print(f"[code-analyzer] {message}", file=sys.stderr, flush=True),
-                    event_sink=sink,
-                )
+                outcome = _invoke("tools-resume", ActionRequest(
+                    "tools-resume", report_directory=report_dir, args=args),
+                    emit=_stderr_emitter("[code-analyzer] "), decide=decider, event_sink=sink)
+            block = outcome.data or {}
             print(report_dir)
             print(f"[code-analyzer] build-context {block.get('outcome')}: {block.get('reason') or 'see manifest.json build_context'}", file=sys.stderr)
-            return EXIT_COMPLETE if block.get("outcome") in {"applied", "skipped"} else EXIT_PARTIAL
+            return outcome.exit_code
         if args.command == "assess":
             report_directory = args.report_directory.expanduser().resolve()
             config = load_config(_scanned_source(report_directory), args.config, assess_overrides(args))
             _warn_third_party(config)
-            block = run_assess(report_directory, config,
-                               progress=lambda text: print(f"code-analyzer: {text}", file=sys.stderr))
+            outcome = _invoke("assess", ActionRequest(
+                "assess", report_directory=report_directory, config=config, args=args),
+                emit=_stderr_emitter("code-analyzer: "))
             print(report_directory)
-            return int(block["exit_code"])
+            return outcome.exit_code
         if args.command == "serve":
             if args.analyze is None and args.report_directory is None:
                 raise UserError("serve needs REPORT_DIR or --analyze SOURCE")
@@ -208,9 +236,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             decider = auto_no
         with JsonlEventSink(events_file(config)) as sink:
-            exit_code, run_dir = analyze(source, config, event_sink=sink, decider=decider)
-        print(run_dir)
-        return exit_code
+            outcome = _invoke("analyze", ActionRequest("scan", source=source, config=config, args=args),
+                              decide=decider, event_sink=sink, terminal=True)
+        print(outcome.report_directory)
+        return outcome.exit_code
     except UserError as exc:
         print(f"code-analyzer: error: {exc}", file=sys.stderr)
         return 2
@@ -223,6 +252,26 @@ def main(argv: list[str] | None = None) -> int:
 # a slash command with the very parser this file builds.  Kept as a name here
 # because it is what the CLI's own tests reach for.
 _overrides = analyze_overrides
+
+
+def _invoke(command: str, request: ActionRequest, **context: Any) -> Any:
+    """Run the registry action behind one subcommand.
+
+    The CLI keeps its own printing: the registry says what happened, this file
+    says what reaches a terminal.  Unifying the two is exactly where a stdout
+    contract or an exit code gets changed by accident.
+    """
+    return invoke(by_name(request.action), ActionContext(request=request, **context))
+
+
+def _stderr_emitter(prefix: str) -> Any:
+    """The progress line these commands printed, now derived from an event."""
+
+    def emit(event: AnalysisEvent) -> None:
+        if event.status == "info":
+            print(f"{prefix}{event.message}", file=sys.stderr, flush=True)
+
+    return emit
 
 
 def _warn_third_party(config: dict[str, Any]) -> None:

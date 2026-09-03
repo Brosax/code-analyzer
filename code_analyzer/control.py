@@ -378,22 +378,19 @@ def auto_yes(request: DecisionRequest) -> Decision:
 
 
 def stdin_decider(stdin: Any, stderr: Any) -> Callable[[DecisionRequest], Decision]:
-    """The terminal's version of the dialog: a preview, then ``[y/N]``."""
+    """The terminal's version of the dialog: a preview, then ``[y/N]``.
+
+    One of the three places this program stops to ask something; all three now
+    go through ``ask.Asker`` so a front end renders them one way.  The lines
+    are the ones this function printed before, in the same order.
+    """
+    from .ask import question_from_decision, stdin_asker
+
+    asker = stdin_asker(stdin, stderr, interactive=True)
 
     def decide(request: DecisionRequest) -> Decision:
-        print(f"\nBuild-context patch ({request.kind}, round {request.round}): {request.summary}", file=stderr)
-        for index, item in enumerate(request.items):
-            tick = "x" if index in request.preselected else " "
-            print(f"  [{tick}] {item.get('label', item.get('op'))}  {item.get('evidence', '')}  ({item.get('origin', '')})", file=stderr)
-        if request.probe:
-            print(f"  probe: {request.probe.get('reached_after', 0)}/{request.probe.get('sampled', 0)} sampled unit(s) now preprocess", file=stderr)
-        print("  impact: re-runs only the failed units into new unit directories; no source, config file or build is touched.", file=stderr)
-        print("Apply the pre-ticked items and re-run? [y/N] ", end="", file=stderr, flush=True)
-        try:
-            answer = stdin.readline().strip().lower()
-        except (OSError, ValueError):
-            answer = ""
-        if answer in {"y", "yes"}:
+        answer = asker(question_from_decision(request))
+        if answer.yes:
             return Decision("apply", tuple(request.preselected), decided_by="cli")
         return Decision("reject", decided_by="cli", note="declined at the prompt")
 

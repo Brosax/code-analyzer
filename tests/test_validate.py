@@ -553,7 +553,7 @@ def test_the_verdict_file_ships_and_recover_report_keeps_the_verdicts(
 def test_the_assess_command_uses_the_run_s_source_config_and_cli_overrides(
     tmp_path: Path, fake: FakeHarness, closed_endpoint: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
 ) -> None:
-    from code_analyzer import cli
+    from code_analyzer import cli, validate
 
     run_dir, _config = _analyzed(tmp_path, fake, closed_endpoint)
     seen: dict[str, Any] = {}
@@ -563,7 +563,10 @@ def test_the_assess_command_uses_the_run_s_source_config_and_cli_overrides(
         seen["config"] = config
         return {"exit_code": 10}
 
-    monkeypatch.setattr(cli, "run_assess", fake_assess)
+    # Patched where it is defined rather than where the CLI re-exported it:
+    # the registry action imports it from validate at call time, and the
+    # definition site is the honest target either way.
+    monkeypatch.setattr(validate, "run_assess", fake_assess)
     code = cli.main(["assess", str(run_dir), "--max-candidates", "3", "--llm-model", "judge", "--llm-no-cache"])
     assert code == 10
     assert seen["report_directory"] == run_dir
