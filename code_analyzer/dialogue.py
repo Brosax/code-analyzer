@@ -34,7 +34,8 @@ from .analysis import AnalysisEvent
 from .ask import Answer, Question
 from .chat import Transcript
 from .flow import RunFlow
-from .progress import multi_line, single_line
+from .progress import BRAILLE_FRAMES, multi_line, single_line
+from .status import STATE_GLYPHS
 
 # What a block is.  The front end resolves these to widgets and colours.
 USER = "user"
@@ -104,6 +105,26 @@ class UserBlock(Block):
         return lines
 
 
+# What the operator is told is happening while a sentence is with the model.
+# Two, and both are true: the gate is a real probe, and everything after it is
+# one request whose first token is the 18-52s that dominates.  `llm.propose`
+# reads them from here rather than the other way round -- this module must not
+# import the harness.
+PHASE_PROBING = "探测端点"
+PHASE_WAITING = "等待模型的第一个 token"
+
+
+def spin(frame: int) -> str:
+    """One frame of the shared spinner; ``frame < 0`` means motion is off.
+
+    Mirrors ``flow._glyph``: a terminal that asked for no animation still gets a
+    mark saying something is running, it just does not move.
+    """
+    if frame < 0:
+        return STATE_GLYPHS["running"]
+    return BRAILLE_FRAMES[frame % len(BRAILLE_FRAMES)]
+
+
 @dataclass
 class ThinkingBlock(Block):
     """A model is reading one sentence; this is the only thing on screen.
@@ -111,25 +132,30 @@ class ThinkingBlock(Block):
     It shows elapsed seconds and, once a session has measured one, how long the
     last question took.  It never shows an ETA: nothing here has measured how
     long *this* one will take, and the codebase does not invent measurements.
+
+    A spinner carries what the seconds cannot: the first token takes 18-52s, and
+    a counter that only moves once a second is indistinguishable from a hung
+    counter for most of that window.  The frames are the flow panel's and the
+    CLI's -- one product, one idle animation -- and the frame is passed in like
+    ``RunFlow.rows`` takes it, so this stays a pure function of what it is given.
     """
 
     kind: str = THINKING
     utterance: str = ""
     started_at: float = field(default_factory=time.time)
-    phase: str = "探测端点"
+    phase: str = PHASE_PROBING
     last_seconds: float | None = None
     settled: bool = False
     abandoned: bool = False
 
-    def render(self, now: float | None = None) -> list[str]:
+    def render(self, now: float | None = None, frame: int = -1) -> list[str]:
         if self.settled:
             return [f"  {self.summary}"] if self.summary else []
         now = time.time() if now is None else now
         elapsed = max(0, int(now - self.started_at))
-        line = f"  正在理解这句话… {elapsed}s · {self.phase} · Ctrl+C 放弃"
-        lines = [line]
+        lines = [f"  {spin(frame)} 正在理解这句话… {elapsed}s · {self.phase} · Ctrl+C 放弃"]
         if self.last_seconds is not None:
-            lines.append(f"     上次 {self.last_seconds:.1f}s（本会话测量）")
+            lines.append(f"    上次 {self.last_seconds:.1f}s（本会话测量）")
         return lines
 
 

@@ -35,7 +35,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Collapsible, Footer, Header, Input, RichLog, Static
 
@@ -62,7 +62,7 @@ from .config import (
     validate_config,
 )
 from .control import RunControl
-from .dialogue import Block, Dialogue, RunBlock
+from .dialogue import Block, Dialogue, RunBlock, spin
 from .errors import UserError
 from .flow import WIDE_BREAKPOINT, Lane, RunFlow, capacity
 from .intent import (
@@ -170,8 +170,9 @@ class AnalyzerApp(App[TuiOutcome]):
     #log { display: none; dock: bottom; height: 12; border-top: solid $primary;
            background: $surface-darken-1; }
     .show-log #log { display: block; }
-    #status { dock: bottom; height: 1; padding: 0 1; background: $boost; color: $text-muted; }
-    #prompt { dock: bottom; border: none; background: $surface-darken-1; }
+    #bottom { dock: bottom; height: auto; }
+    #status { height: 1; padding: 0 1; background: $boost; color: $text-muted; }
+    #prompt { border: none; background: $surface-darken-1; }
     #prompt:focus { border: none; }
     """
 
@@ -207,6 +208,7 @@ class AnalyzerApp(App[TuiOutcome]):
         # Questions a worker is blocked on, by block id.
         self._waiting: dict[str, tuple[threading.Event, dict[str, Answer]]] = {}
         self._busy = False
+        self._busy_since = 0.0
         # What a model proposed and the operator has not yet ticked, and the
         # commands a ticked proposal turned into.
         self._pending_steps: list[Any] = []
@@ -231,8 +233,12 @@ class AnalyzerApp(App[TuiOutcome]):
         yield Static("终端至少需要 80×24；当前尺寸不足。", id="too-small")
         yield VerticalScroll(id="transcript")
         yield RichLog(max_lines=2000, auto_scroll=True, wrap=True, markup=False, id="log")
-        yield Static("", id="status")
-        yield Input(placeholder="说点什么，或输入 / 开头的命令…", id="prompt")
+        # Both docked bottom inside one container, because `Footer` keeps the
+        # last row to itself: a sibling with `dock: bottom` lands *under* it and
+        # is painted over, which is where the status line has been living.
+        with Vertical(id="bottom"):
+            yield Static("", id="status")
+            yield Input(placeholder="说点什么，或输入 / 开头的命令…", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -419,6 +425,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._mount(self.dialogue.said(utterance, queued=len(self._queued)))
             return
         self._busy = True
+        self._busy_since = time.time()
         self._ask_inflight = True
         self.cancel_token = CancellationToken()
         block = self.dialogue.thinking(utterance, last_seconds=self._last_ask_seconds)
@@ -435,12 +442,22 @@ class AnalyzerApp(App[TuiOutcome]):
                 utterance, self.dialogue.config,
                 source=self.dialogue.source, report_directory=self.dialogue.report_directory,
                 cancelled=(token.is_cancelled if token else None),
+                on_phase=lambda name: self.call_from_thread(self._thinking_phase, name, generation),
             )
         except Exception as exc:
             self.call_from_thread(
                 self._proposed, None, f"{type(exc).__name__}: {single_line(str(exc))}", generation)
             return
         self.call_from_thread(self._proposed, proposal, "", generation)
+
+    def _thinking_phase(self, name: str, generation: int) -> None:
+        """The lane says what it is doing now; one repaint, on the UI thread."""
+        if generation != self._ask_generation:
+            return
+        thinking = self.dialogue.live_thinking()
+        if thinking is not None and thinking.phase != name:
+            thinking.phase = name
+            self._repaint_block(thinking.block_id)
 
     def _proposed(self, proposal: Any, error: str, generation: int = 0) -> None:
         """Render what the model suggested: unticked, itemised, with its reasons."""
@@ -631,6 +648,7 @@ class AnalyzerApp(App[TuiOutcome]):
             self._mount(self.dialogue.failed(single_line(str(exc))))
             return
         self._busy = True
+        self._busy_since = time.time()
         block_id = ""
         # Every action gets a token, because Ctrl+C has to mean cancel for all
         # of them; only a long-running one gets a RunControl and a run block.
@@ -852,13 +870,12 @@ class AnalyzerApp(App[TuiOutcome]):
         transcript.scroll_end(animate=False)
         return widget
 
-    @staticmethod
-    def _block_text(block: Block) -> Text:
+    def _block_text(self, block: Block) -> Text:
         from .dialogue import ThinkingBlock
 
         if isinstance(block, ThinkingBlock):
             text = Text()
-            for index, line in enumerate(block.render()):
+            for index, line in enumerate(block.render(frame=self._frame())):
                 if index:
                     text.append("\n")
                 text.append(line, style="dim" if block.settled else "bold yellow")
@@ -883,6 +900,10 @@ class AnalyzerApp(App[TuiOutcome]):
         widget.display = bool(text.plain.strip())
         widget.update(text)
 
+    def _frame(self) -> int:
+        """The frame every animated thing on screen shares; -1 when motion is off."""
+        return self._flow_frame if self._flow_animated else -1
+
     def _tick(self) -> None:
         if not self.is_mounted:
             return
@@ -892,6 +913,16 @@ class AnalyzerApp(App[TuiOutcome]):
         run = self.dialogue.live_run()
         if run is not None and (moved or self._flow_animated):
             self._repaint_run(run)
+        if self._flow_animated and self._busy:
+            # A spinner at 1 Hz reads as a stuck spinner, so the two things that
+            # move without a run block are driven from here instead of the clock.
+            thinking = self.dialogue.live_thinking()
+            if thinking is not None:
+                self._repaint_block(thinking.block_id)
+            if run is None:
+                # A short action has no run block to spin.  `/llm-doctor` is a
+                # real generation -- 18-52s measured -- with nothing else moving.
+                self._update_status()
 
     def _tick_clock(self) -> None:
         run = self.dialogue.live_run()
@@ -901,7 +932,7 @@ class AnalyzerApp(App[TuiOutcome]):
         thinking = self.dialogue.live_thinking()
         if thinking is not None:
             self._repaint_block(thinking.block_id)
-        self._update_status()
+        self._update_status()  # the seconds still advance with the animation off
 
     def _drain_events(self) -> int:
         with self._events_lock:
@@ -931,7 +962,7 @@ class AnalyzerApp(App[TuiOutcome]):
         if flow is None:
             return text
         now = time.time()
-        frame = self._flow_frame if self._flow_animated else -1
+        frame = self._frame()
         rows = flow.rows(capacity=self._flow_capacity, now=now, frame=frame)
         text.append_text(self._flow_text(rows))
         lanes = [lane for lane in flow.lanes() if lane.id != "total"]
@@ -1044,13 +1075,20 @@ class AnalyzerApp(App[TuiOutcome]):
         run = self.dialogue.live_run()
         thinking = self.dialogue.live_thinking()
         if thinking is not None:
-            parts.append(f"模型思考中 {max(0, int(time.time() - thinking.started_at))}s")
+            parts.append(f"{spin(self._frame())} 模型思考中 "
+                         f"{max(0, int(time.time() - thinking.started_at))}s")
             parts.append("Ctrl+C 放弃")
         elif run is not None and run.flow is not None:
             head = run.flow.headline(time.time())
             parts.append(f"{head.percent}%")
             if run.flow.llm_enabled:
                 parts.append("LLM ⏸" if run.flow.paused["llm"] else "LLM ▶")
+            parts.append("Ctrl+C 取消")
+        elif self._busy:
+            # Not every action draws a run block; this is the only sign of life
+            # a `/doctor` or an `/llm-doctor` has, and both take real minutes.
+            elapsed = max(0, int(time.time() - self._busy_since))
+            parts.append(f"{spin(self._frame())} 运行中 {elapsed}s")
             parts.append("Ctrl+C 取消")
         elif self.dialogue.pending_question() is not None:
             parts.append("等你回答上面的问题")

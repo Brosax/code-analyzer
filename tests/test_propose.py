@@ -15,6 +15,7 @@ import pytest
 
 from code_analyzer.actions import REGISTRY
 from code_analyzer.config import DEFAULTS, validate_config
+from code_analyzer.dialogue import PHASE_WAITING
 from code_analyzer.llm.propose import (
     MAX_STEPS,
     build_prompt,
@@ -401,3 +402,40 @@ def test_a_model_may_not_repoint_the_session_at_a_different_provider(tmp_path: P
     dropped = " ".join(result["dropped"])
     for leaf in ("llm.profile", "llm.endpoint", "llm.api_key_env"):
         assert leaf in dropped and "不能由模型改动" in dropped
+
+
+# --- what the operator is told is happening ---------------------------------
+
+
+class _NeverConnects:
+    """A runtime the caller opens and `run_proposal` then chokes on."""
+
+    def __enter__(self) -> object:
+        return object()
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
+def test_the_lane_says_it_is_waiting_only_after_the_local_work_is_done(
+    tmp_path: Path,
+) -> None:
+    """Loading the skill and building the prompt are milliseconds, not the wait."""
+    seen: list[str] = []
+    proposal = propose("帮我看看哪些单元最值得先扫", _config(enabled=True),
+                       output_root=tmp_path, open_runtime=_NeverConnects,
+                       on_phase=seen.append)
+
+    assert proposal.status == "failed", "the fake runtime cannot answer"
+    assert seen == [PHASE_WAITING]
+
+
+def test_a_front_end_that_throws_on_a_phase_does_not_take_the_request_with_it(
+    tmp_path: Path,
+) -> None:
+    def explode(_name: str) -> None:
+        raise RuntimeError("a repaint blew up")
+
+    proposal = propose("帮我看看", _config(enabled=True), output_root=tmp_path,
+                       open_runtime=_NeverConnects, on_phase=explode)
+    assert "a repaint blew up" not in (proposal.reason or "")

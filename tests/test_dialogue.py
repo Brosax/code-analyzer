@@ -250,6 +250,28 @@ def test_the_session_record_says_whether_the_parser_or_the_model_read_the_line()
         assert auto["action"] == "doctor" and "no writes" in auto["reason"]
 
 
+def test_the_wait_spins_with_the_same_frames_as_the_rest_of_the_product() -> None:
+    """A counter that moves once a second cannot be told from a hung counter."""
+    from code_analyzer.dialogue import PHASE_PROBING, ThinkingBlock, spin
+    from code_analyzer.progress import BRAILLE_FRAMES
+    from code_analyzer.status import STATE_GLYPHS
+
+    block = ThinkingBlock(utterance="帮我看看")
+    glyphs = [block.render(frame=index)[0].strip()[0]
+              for index in range(len(BRAILLE_FRAMES) + 1)]
+    assert glyphs[:-1] == list(BRAILLE_FRAMES)
+    assert glyphs[-1] == BRAILLE_FRAMES[0], "the frames wrap"
+
+    # A terminal that asked for no motion still gets a mark: it just stands still.
+    assert spin(-1) == STATE_GLYPHS["running"]
+    assert block.render()[0].strip().startswith(spin(-1))
+    assert PHASE_PROBING in block.render()[0]
+
+    # Nothing spins once the answer is in.
+    block.settled, block.summary = True, "已放弃这次理解"
+    assert block.render(frame=3) == ["  已放弃这次理解"]
+
+
 def test_a_thinking_block_never_invents_how_long_is_left() -> None:
     from code_analyzer.dialogue import ThinkingBlock
 

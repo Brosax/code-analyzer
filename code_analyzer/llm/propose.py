@@ -30,6 +30,7 @@ from uuid import uuid4
 
 from ..actions import BY_NAME, REGISTRY, SUBJECT_NONE
 from ..config import FIELD_BY_PATH, config_value, set_config_value, validate_config
+from ..dialogue import PHASE_WAITING
 from ..errors import UserError
 from ..harness.cordis import cordis_document, write_cordis_config
 from ..harness.runtime import HarnessRuntime, harness_available
@@ -441,9 +442,25 @@ def _first_object(text: str) -> dict[str, Any] | None:
 def propose(
     utterance: str, config: Mapping[str, Any], *, source: Path | None = None,
     report_directory: Path | None = None, output_root: Path | None = None,
-    cancelled: Any = None, open_runtime: Any = None,
+    cancelled: Any = None, open_runtime: Any = None, on_phase: Any = None,
 ) -> Proposal:
-    """Ask the model once.  Never raises for a model, endpoint or runtime problem."""
+    """Ask the model once.  Never raises for a model, endpoint or runtime problem.
+
+    ``on_phase`` is called from this thread with the name of what is happening
+    now.  Everything before the request is local and takes milliseconds; a front
+    end that shows only the first phase would be claiming to probe an endpoint
+    for the whole 21-31s round trip.
+    """
+    def phase(name: str) -> None:
+        # A provider must not die of a front end, the way a front end must not
+        # die of a provider.
+        if on_phase is None:
+            return
+        try:
+            on_phase(name)
+        except Exception:
+            pass
+
     settings = settings_for(config)
     warning = third_party_warning(config["llm"])
     model = str(settings.get("model") or None)
@@ -487,6 +504,7 @@ def propose(
                 cancelled=cancelled,
             ))
             with opener() as runtime:
+                phase(PHASE_WAITING)
                 record = run_proposal(
                     runtime, run_dir=run_dir, producer=PRODUCER, round_id=round_id,
                     prompt=blocks, unit_sha256=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),

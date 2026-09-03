@@ -913,6 +913,73 @@ def test_a_sentence_typed_while_the_model_thinks_is_queued_and_runs_in_order(
     asyncio.run(exercise())
 
 
+def test_the_status_line_has_a_row_of_its_own_instead_of_the_footers(tmp_path: Path) -> None:
+    """It docked bottom beside `Footer`, which keeps that row: it drew under it.
+
+    Every state the status line reports -- the queue depth, the unsaved-config
+    dot, the elapsed seconds -- had been rendering to a row nobody could see.
+    """
+    from textual.widgets import Footer
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            status, footer = app.query_one("#status"), app.query_one(Footer)
+            assert status.region.height == 1 and status.region.width > 0
+            assert not status.region.overlaps(footer.region)
+            assert str(tmp_path) in status.render().plain
+
+    asyncio.run(exercise())
+
+
+def test_an_action_with_no_run_block_still_shows_that_something_is_running(
+    tmp_path: Path,
+) -> None:
+    """`/llm-doctor` is 18-52s of real generation and draws no run block."""
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._busy = True
+            app._busy_since = time.time() - 7
+            app._update_status()
+            await pilot.pause()
+
+            line = app.query_one("#status").render().plain
+            assert "运行中 7s" in line and "Ctrl+C 取消" in line
+            assert line.strip()[0] in (*BRAILLE_FRAMES, "●")
+
+    asyncio.run(exercise())
+
+
+def test_the_wait_stops_saying_it_is_probing_once_the_request_is_out(
+    tmp_path: Path,
+) -> None:
+    """The probe is milliseconds; the request is the whole 21-31s."""
+    from code_analyzer.dialogue import PHASE_PROBING, PHASE_WAITING
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            block = _thinking(app)
+            assert block.phase == PHASE_PROBING
+
+            app._thinking_phase(PHASE_WAITING, app._ask_generation)
+            await pilot.pause()
+            assert block.phase == PHASE_WAITING
+            assert PHASE_WAITING in _transcript(app)
+
+            # A phase from a round the operator already walked away from.
+            app._ask_generation += 1
+            app._thinking_phase("探测端点", app._ask_generation - 1)
+            assert block.phase == PHASE_WAITING
+
+    asyncio.run(exercise())
+
+
 def test_the_box_says_how_long_it_has_been_thinking_and_never_guesses_how_long_is_left(
     tmp_path: Path,
 ) -> None:
