@@ -125,10 +125,29 @@
 | **验证判定** | P2 | 显式 `code-analyzer assess` | candidate + 源码 + 全部证据 | `verdict.label` |
 | **有界重规划** | P4 | `[llm] max_replan_rounds > 0` | **只看结构化信号** | 动作词汇表中的一个动作 |
 
-可选的自然语言前端（"帮我重点看内存安全和硬件相关问题"）放在 `_analyze` **之外**：
-NL → 受约束的 config patch（只能改 `[llm] scanners`、`risk_overrides`、`min_tier`）
-→ `validate_config`（`config.py:306`）→ 正常确定性运行。
-主干对 NL 前端无感知。
+可选的自然语言前端（"帮我重点看内存安全和硬件相关问题"）放在 `_analyze` **之外**。
+
+**2026-09-03 修订（用户决定，已交付）。** 原文把该前端限制为"只能产出受约束的 config
+patch（`[llm] scanners`、`risk_overrides`、`min_tier`）"。这一条**有意放宽**：`/ask`
+（`llm/propose.py`）的模型可以提议 action 注册表里的**任何** action。放宽的边界与仍然
+成立的部分：
+
+- **主干依然无感知。** 模型产出的是一个待确认的提议；勾选后它被转成"操作员本来也能敲出
+  来的那条斜杠命令"，走的是与手敲**完全相同**的代码路径。`runner._analyze` 不知道有
+  这条通道。
+- **§2.3 不放宽。** 用户选的是"可提任何 action"而**不是**"还能读已完成的报告"，所以
+  finding 的自由文本**从不**进入任何规划模型的输入。`tests/test_propose.py` 用一个
+  确实含 findings 的运行目录钉死这一点。skill 的 frontmatter 也不授予 `fs`
+  （`tool_allowlist` 只给 `skill`），所以意图模型能看到的唯一不可信文本就是操作员
+  自己那句话。
+- **护栏**：目录（catalogue）从注册表生成，模型说得出的 action 必然存在；目录外的按
+  名字丢弃；提议的配置改动必须是真实叶子、可写、且过 `validate_config`；目标不存在也
+  丢弃；每一条丢弃写明理由；每一步默认不勾选，最多三步。与 build-context configurator
+  同构。
+- **provider 不可达是闸门而非异常**（`propose.gate`）：`/ask` 说明原因，确定性主干
+  不受影响。非 TTY 下 `/ask` 直接拒绝，免得一次 provider 故障改变无人值守的退出码。
+- **延迟是这条设计的理由之一。** 实测一次 `/ask` 58–79 秒（qwen3.8:27b，2026-09-03）；
+  "把并发改成 4"不该等半分钟，所以确定性解析器是主干而不是回退。
 
 规范的流程 "理解需求 → 分析项目 → 制定计划 → 选择工具 → 执行扫描 → AI 深度审查 →
 汇总 → 去重/验证 → 生成报告" 与主干一一对应，只是其中只有"AI 深度审查"和"验证"是模型步骤。
@@ -866,8 +885,27 @@ Code Review · run 2026-08-21T13:02:11Z-ab12cd34ef56
 
 模型在 `code_analyzer/flow.py`，纯逻辑、零 UI 依赖，像 `serve.graph` 一样单测
 （`tests/test_flow.py` 有一条测试专门断言 import 它不会拉进 textual / rich / http）。
-渲染在 `tui.py`：一个 `Static`、一个 5Hz 定时器、逐段构造的 `rich.text.Text`
-——**绝不用标记字符串**，因为被扫描文件名会进入这些行。
+渲染在 `tui.py`：逐段构造的 `rich.text.Text`——**绝不用标记字符串**，因为被扫描文件名
+会进入这些行。
+
+**2026-09-03 修订：前端从表单变成对话。** 三段式（表单 → 运行 → 结果）与五个模态屏
+删除，`tui.py` 1504 → 876 行。现在是一个滚动记录 + 一个输入框，一次运行是记录里的一个
+`Collapsible` 块：折叠是一行活摘要，`Enter` 展开就是上面这张图。四条实现期决定：
+
+1. **一轮一个组件，绝不一事件一个。** 实测（Textual 8.2.8）：挂 60 个 `Collapsible`
+   273 ms、活动块重绘 0.54 ms/帧（5 Hz 预算 200 ms）。事件管线原样保留——两个队列、
+   state 不丢 / liveness 可丢、5 Hz 折叠、绝不 per-event `call_from_thread`——那是用
+   一次一小时 52 万事件的运行换来的。队列条目多带一个 block id，因为现在不止一个
+   action 会发事件。
+2. **三处「停下来问一句」收敛成一个缝**（`ask.Asker`）：build-context 补丁对话、
+   compile-db 的两处 `input_from`。CLI 传 `stdin_asker`，对话界面把问题渲染成一轮，
+   测试传脚本。终端输出逐字节不变。
+3. **模型的对话与操作员的对话是两个模型**：`chat.Transcript` 折叠 provider 事件、
+   一个扫描单元一轮、会淘汰已结束的轮；`dialogue.Dialogue` 持有操作员的块、一小时后
+   还要能往上翻。`RunBlock` 组合二者。`Dialogue.apply` 返回**变化的块 id** 而不是
+   bool，所以只重绘动了的那个块。
+4. **一处定义两个前端**：`actions.py` 是唯一的「操作员能做什么」，`cli.py` 与对话界面
+   都是它的薄壳；action 只发事件、不打印，前端决定什么进终端。
 
 ---
 

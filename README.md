@@ -47,10 +47,10 @@ by running each tool over a canary rather than by reading its `--help`, so a
 build that implements an option without advertising it is accepted — and said
 to be, on the line beneath.
 
-## Full-screen configuration
+## Talking to it
 
-Run `code-analyzer` with no arguments in an interactive terminal, or invoke the
-interface explicitly:
+Run `code-analyzer` with no arguments in an interactive terminal, or name the
+tree explicitly:
 
 ```bash
 code-analyzer
@@ -58,80 +58,78 @@ code-analyzer tui /path/to/project
 code-analyzer tui /path/to/project --config ./review-config.toml
 ```
 
-The UTF-8 Chinese TUI is a single-page basic scan interface for the source,
-output, compile database, analyzer selection, shareable export, and fail gate.
-The page adapts to terminal width — two balanced columns at 120 columns or
-wider, a single column below that — and the action buttons stay pinned below
-the form instead of scrolling away. `F1` shows the grading reference.
-Advanced schema-v2 values remain available through TOML and the CLI; loaded
-hidden values are preserved when the TUI runs or saves a full snapshot. `F5`
-performs a read-only preflight, `F9` shows the run impact, and `Ctrl+S` saves the
-validated snapshot. The interface never generates a compile database, invokes
-CMake, or installs tools. It requires a TTY and at least 80×24 cells; a non-TTY
-no-argument invocation prints help and exits `2`.
+The interface is a conversation: one scrolling transcript and an input box.
+There is no form and no mode. What you type is a block, what the tool answers
+is a block, a scan is a block you can open, and every question it stops to ask
+is a turn you answer in the same place. All of it stays scrollable.
 
-During a scan the form gives way to a live flow of the run: discovery fans out
-to every analyzer and LLM scanner and converges on review, export and the
-report, drawn with the same four states and glyphs the dashboard and `serve`
-use. Static analysis and the LLM scanners run concurrently, so more than one
-lane really is in flight at once. Each row carries the method actually in use —
-Cppcheck's build-aware pass versus its source-only fallback, a Flawfinder
-shard, the translation unit Splint is on, the unit and risk tier a scanner is
-reading — plus unit counters that stay unknown rather than invented when a
-producer has not announced its plan. Two columns at 120 columns or wider, one
-below that, where the flow collapses to a summary that never hides a running
-node; `F2` hides it entirely and gives the log its rows back.
-`CODE_ANALYZER_NO_ANIMATION=1` and `TERM=dumb` freeze the animation without
-hiding anything, exactly as they do for the CLI spinner.
+```text
+› ~/fw/tfm
+  ↳ scan
+● 对一个 C/C++ 源码树执行完整扫描
+    在输出目录下新建一个报告目录；不修改源码树。
+    开始吗？ [y/N]
+› y
+▼ 正在扫描 · llm-memory-safety copy.c · 85% · 已运行 03:32 · 静态 3/3 · LLM 1/2
+```
 
-A run with a model in it opens on the conversation. One turn per scan unit:
-the answer streams in chunk by chunk, tool calls and retries are marked where
-they happened, and a footer settles the account once the session ends —
-throughput, time to the first token, the tokens in and out, the duration, the
-findings. Two speeds are reported and never conflated. While an answer is
-still arriving only its characters can be counted, so the pane divides them by
-the `4` the prompt budget already uses and labels the number *估算* (estimated);
-once the provider reports its own `outputTokens` the pane switches to output
-tokens over session seconds and labels it *测量* (measured). Showing one as the
-other would be reporting a throughput nobody measured. The header strip
-aggregates the same two ways — a 10-second window while answers stream, the
-mean of recent sessions when they do not, and nothing at all once the window
-expires, because a stalled provider must not read as a fast one.
+**What understands you is deterministic.** A slash command, a bare path or a
+short phrase resolves instantly, offline, with nothing reachable. A slash
+command hands its tail to the very parser `code-analyzer analyze` uses, so
+`/scan ~/fw --llm-jobs 4` accepts exactly what the subcommand accepts and
+refuses `--llm-jobs 0` in the same words. What the parser cannot resolve it
+reports as unresolved — a phrase matching two verbs comes back with both
+named, and a directory holding a `manifest.json` comes back with all five
+things one might want from a finished run, because choosing between them is a
+coin flip you can settle instantly.
 
-`F6` shows the prompt each unit was sent; it is off by default, because a
-prompt is a whole scan unit plus its context and the skill, and an operator
-watching answers arrive does not want the question repeated in front of every
-one of them. What the pane shows is a preview — 24 lines per block, 4000
-characters in all, each omission marked where it happened — and it points at
-`llm/units/<unit_id>.json`, which holds the prompt in full beside the
-`prompt_sha256` the session's `request.json` records. Prompt previews stay out
-of the log pane, where one of them would bury a page of one-row-per-event
-lines.
+**`/ask` hands a sentence to the model**, and is the only thing here that
+needs a provider. The model may propose any action in the registry, each shown
+unticked with what it would do; a proposed action outside the catalogue is
+dropped by name, a proposed setting is dropped unless `validate_config`
+accepts it, and every drop says why. A ticked step becomes the very command
+you could have typed. The model is given the catalogue, the current paths and
+the settings that differ from default — never a finding, never analyzer
+output, never source. When the provider is unreachable `/ask` says so and
+everything else keeps working.
 
-Above the panes: the overall progress bar, then one bar per lane — static
-analysis by tool, the LLM lane by unit. The overall number is a weighted sum of
-the lanes, which answers "how far is this run" and cannot answer "how far is
-the LLM"; both are drawn so neither has to stand for the other.
+**Configuration is part of the conversation.** `/config` lists what is set and
+where it came from, `/config --all` includes the 59 advanced fields, and
+`/set <path> <value>` reaches any of the 83 schema leaves — `build.overrides`
+excepted, which is a table and says so rather than pretending. Values are
+checked where you typed them, `Ctrl+S` writes the TOML snapshot.
 
-The run is controllable while it runs: `p`/`P` pause and resume the LLM or
-static lane at the next unit boundary, `s` skips the selected producer's
-remaining units, `+`/`-` change the LLM concurrency, `r` re-runs the LLM units
-that never got an answer as a round of their own, `d` reopens a deferred
-build-context patch dialog, `Enter` shows a node's reasons and steps,
-`F3`/`F4`/`F6` switch the side pane, the log filter and the prompts. Every
-action is journalled as a `control/*` line in `events.jsonl` and
-`logs/runner.log`.
+**A run is a block.** Collapsed it is one live line — elapsed, percent, the
+lane bars, which producers are running. `Enter` opens the whole diagram:
+discovery fanning out to every analyzer and scanner and converging on review,
+export and the report, plus the model's own transcript with its prompts (`F6`)
+and its speed. Two speeds are reported and never conflated: while an answer is
+arriving only its characters are known, so the rate is labelled *估算*; once
+the provider reports its own `outputTokens` it becomes output tokens over
+session seconds, labelled *测量*. When the run settles the block collapses to
+one line with the exit code, the duration and the report directory, and the
+history stays above it.
 
-The transcript is a live view, not evidence: 240 turns, 400 answer lines each,
-older ones summarised as `… 更早的 N 个单元` and a turn still streaming never
-evicted. Under display overload answer chunks are dropped before state events,
-so a busy interface cannot make a counter lie. `code-analyzer serve` lays the
-same run out the same way in the browser, from the same events, with a
-checkbox where the TUI has `F6`.
+`/pause`, `/resume`, `/skip`, `/jobs`, `/retry` and `/decide` steer a run while
+it runs — the single letters that used to do this are now names you can
+discover, complete and read back. Every one is journalled as a `control/*`
+event. `F5` opens the log pane, `F4` filters it. `Ctrl+C` requests cooperative
+cancellation; running process groups get the same bounded TERM/KILL cleanup as
+the CLI, and an existing run directory is retained with an `interrupted`
+manifest and exit code `130`.
 
-During a scan, `Ctrl+C` requests cooperative cancellation. Running process
-groups receive the same bounded TERM/KILL cleanup as the CLI; an existing run
-directory is retained with an `interrupted` manifest and exit code `130`.
+The conversation is written to `~/.code-analyzer/sessions/<stamp>.jsonl` —
+what you typed, how it was read, what you confirmed, which report came out.
+Same status as `events.jsonl`: a progress log, not evidence, never in the
+archive. `CODE_ANALYZER_NO_JOURNAL=1` turns it off.
+
+Every action the conversation can perform, the CLI can too, from the same
+registry: `doctor`, `llm-doctor`, `preflight`, `compile-db`, `analyze`,
+`llm-resume`, `tools-resume`, `assess`, `rebuild-dashboard`, `recover-report`,
+`serve`, `config`. `code-analyzer <something you said>` works too, though a
+bare path off a terminal prints the command it would have run rather than
+running it — a scan is not a side effect.
+
 
 ## Analyze
 
