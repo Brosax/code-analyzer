@@ -222,6 +222,17 @@ class _Validation(_Phase):
             # object; the first character of the reply has to be the brace.
             "Your reply must begin with `{` -- no analysis, heading or fence before it.",
             "Put your reasoning inside the rationale field, not outside the object.",
+            # The validator's job is to read -- the candidate, its callers, the
+            # bound that decides it -- so it is the likeliest of all the lanes
+            # to spend its ceiling and answer nothing.  Measured on TF-M: two
+            # of the first three candidates came back `agent step ceiling of 12
+            # reached`, which is not a worse verdict, it is no verdict.
+            "",
+            f"You may call tools at most {max(1, int(self.settings.get('max_steps') or 1))} times, "
+            "and running out is a failure: the session ends where it stands and returns no "
+            "verdict at all. If you cannot settle the deciding fact inside that budget, answer "
+            "`UNCERTAIN` and name the fact you could not read -- that is a useful verdict, and "
+            "silence is not.",
         ])}
 
     def _session(

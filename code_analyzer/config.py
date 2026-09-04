@@ -128,7 +128,12 @@ DEFAULTS: dict[str, Any] = {
         "validation_max_candidates": 200,
         # The validator traces values through callers with the file tool, so
         # it gets its own step ceiling instead of the scanner's.
-        "validation_max_steps": 12,
+        # The validator reads the candidate, its callers and the bound that
+        # decides it, and a step is one tool call.  Twelve was thin enough that
+        # two of the first three TF-M candidates were cut off with no verdict
+        # (2026-09-04); the ceiling is a bound on a runaway, not a budget the
+        # ordinary case should reach.
+        "validation_max_steps": 32,
     },
     "tools": {
         "cppcheck": {"enabled": True, "executable": "cppcheck", "timeout_seconds": 7200.0, "heartbeat_seconds": 10.0},

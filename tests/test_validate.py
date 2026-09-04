@@ -574,3 +574,29 @@ def test_the_assess_command_uses_the_run_s_source_config_and_cli_overrides(
     assert seen["config"]["llm"]["model"] == "judge" and seen["config"]["llm"]["cache"] is False
     # Not a run directory: a user error, exit 2, never a traceback.
     assert cli.main(["assess", str(tmp_path / "nowhere")]) == 2
+
+
+def test_the_validator_is_told_its_tool_budget_and_what_running_out_costs() -> None:
+    """The one lane whose job is reading is the likeliest to be cut off.
+
+    Measured on TF-M: two of the first three candidates came back `agent step
+    ceiling of 12 reached` -- which is not a worse verdict, it is no verdict.
+    `UNCERTAIN` naming the fact it could not read is worth more than silence.
+    """
+    from types import SimpleNamespace
+
+    from code_analyzer.validate import _Validation
+
+    phase = _Validation.__new__(_Validation)
+    phase.settings = {"max_steps": 32}
+    phase.skills = {"llm-validator": SimpleNamespace(
+        name="llm-validator", skill_version="1.2.0", description="second layer",
+        body="# Validator\n\nJudge one candidate.")}
+
+    text = phase._directive("llm-validator", {"id": "MEM-001"})["text"]
+    assert "at most 32 times" in text
+    assert "running out is a failure" in text
+    assert "UNCERTAIN" in text
+
+    phase.settings = {"max_steps": 12}
+    assert "at most 12 times" in phase._directive("llm-validator", {"id": "MEM-001"})["text"]
