@@ -51,6 +51,9 @@ MAX_MESSAGE_CHARS = 600
 # the first bucket, and static-only candidates have a native tool behind them.
 _ORIGIN_PRIORITY = {"llm-only": 0, "both": 1, "static-only": 2}
 UNDISPATCHED = frozenset({"unscheduled", "interrupted"})
+# The floor on what one verdict may generate; see _settings for the measurement
+# that set it.
+MIN_COMPLETION_TOKENS = 6000
 
 
 def run_assess(
@@ -220,7 +223,6 @@ class _Validation(_Phase):
             # With reasoning switched off the model reasons in its answer
             # instead, and a budget spent on prose leaves no room for the
             # object; the first character of the reply has to be the brace.
-            "Your reply must begin with `{` -- no analysis, heading or fence before it.",
             "Put your reasoning inside the rationale field, not outside the object.",
             # The validator's job is to read -- the candidate, its callers, the
             # bound that decides it -- so it is the likeliest of all the lanes
@@ -233,6 +235,11 @@ class _Validation(_Phase):
             "verdict at all. If you cannot settle the deciding fact inside that budget, answer "
             "`UNCERTAIN` and name the fact you could not read -- that is a useful verdict, and "
             "silence is not.",
+            "",
+            # Last, because the last instruction is the one a model honours
+            # most reliably, and this is the one that decides whether a session
+            # produced a verdict or a wall of prose.
+            "Your reply must begin with `{` -- no analysis, heading or fence before it.",
         ])}
 
     def _session(
@@ -305,6 +312,14 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
         **config["llm"],
         "model": model,
         "max_steps": steps,
+        # A verdict object is small; the reasoning that reaches it is not, and
+        # with thinking switched off the model does that reasoning in the open.
+        # Measured on TF-M under the scanners' 2000-token ceiling: 7253
+        # characters of argument, cut off at `max-tokens` before the object --
+        # the same failure `llm/configure.py:49` records, arriving here for the
+        # same reason.
+        "max_completion_tokens": max(
+            MIN_COMPLETION_TOKENS, int(config["llm"].get("max_completion_tokens") or 0)),
         # One model reply per step plus the final answer; never below the
         # scanner's own turn ceiling.
         "max_turns": max(int(config["llm"]["max_turns"]), steps + 1),

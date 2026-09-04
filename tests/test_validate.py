@@ -600,3 +600,40 @@ def test_the_validator_is_told_its_tool_budget_and_what_running_out_costs() -> N
 
     phase.settings = {"max_steps": 12}
     assert "at most 12 times" in phase._directive("llm-validator", {"id": "MEM-001"})["text"]
+
+
+def test_a_verdict_gets_room_for_the_reasoning_that_reaches_it() -> None:
+    """The object is small; the argument that reaches it is not.
+
+    Measured on TF-M under the scanners' 2000-token ceiling: 7253 characters of
+    open reasoning, cut off at `max-tokens` before the verdict was written.
+    """
+    import copy
+
+    from code_analyzer.config import DEFAULTS, validate_config
+    from code_analyzer.validate import MIN_COMPLETION_TOKENS, _settings
+
+    config = validate_config(copy.deepcopy(DEFAULTS))
+    config["llm"]["model"] = "qwen3.8:27b"
+    assert config["llm"]["max_completion_tokens"] < MIN_COMPLETION_TOKENS
+    assert _settings(config)["max_completion_tokens"] == MIN_COMPLETION_TOKENS
+
+    # An operator who asks for more keeps it.
+    config["llm"]["max_completion_tokens"] = MIN_COMPLETION_TOKENS * 2
+    assert _settings(config)["max_completion_tokens"] == MIN_COMPLETION_TOKENS * 2
+
+
+def test_the_brace_rule_is_the_last_thing_the_validator_is_told() -> None:
+    """The last instruction is the one a model honours most reliably."""
+    from types import SimpleNamespace
+
+    from code_analyzer.validate import _Validation
+
+    phase = _Validation.__new__(_Validation)
+    phase.settings = {"max_steps": 32}
+    phase.skills = {"llm-validator": SimpleNamespace(
+        name="llm-validator", skill_version="1.2.0", description="second layer",
+        body="# Validator\n\nJudge one candidate.")}
+
+    lines = [line for line in phase._directive("llm-validator", {"id": "X"})["text"].splitlines() if line]
+    assert lines[-1].startswith("Your reply must begin with `{`")
