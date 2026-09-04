@@ -13,6 +13,7 @@ from .audit import assessment_summary, build_assessment, carry_verdicts, load_as
 from .config import DEFAULTS, load_config, validate_config
 from .errors import UserError
 from .html_report import render
+from .llm.recover import recover_phase, unfinished
 from .persist import json_bytes, manifest_structure_problem
 from .review import REVIEW_SCHEMA_VERSION, build_review, markdown_report
 from .sanitize import ExportError, export_shareable
@@ -41,6 +42,13 @@ def recover_report(report_directory: Path) -> Path:
         for key in ("status", "exit_code", "started_at", "finished_at", "tools")
     }
     source = Path(str(inventory_document.get("source") or manifest.get("source") or "."))
+    # A run killed mid-LLM-phase keeps every unit result on disk and indexes
+    # none of them, because the index is written when the phase ends.  The
+    # review walks the manifest, so without this the findings are present and
+    # invisible -- 52 of them, seventeen high, measured on TF-M.
+    recovered_phase = recover_phase(report_directory, manifest) if unfinished(manifest) else None
+    if recovered_phase is not None:
+        manifest = {**manifest, "llm": recovered_phase}
     try:
         review = build_review(source, report_directory, manifest, inventory)
     except Exception as exc:
