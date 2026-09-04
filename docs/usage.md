@@ -576,11 +576,23 @@ code-analyzer analyze ./project \
 5. **决定**：TUI 弹出逐项勾选的对话框；终端上是 `[y/N]`；无 TTY 的运行只记录不应用，
    除非给了 `--build-assist-yes`。`assist = "auto"` 只在补丁全部来自确定性推断且探针有
    改善时自动应用。
-   对话框里 `y` 就是提示词说的那个意思——**只取预选项**；输入编号（`3`、`1,4`、`1-6`）
-   或 `全部` 才能取到它画成未勾选的那些项。这一条 2026-09-04 才真正接上：在那之前答案
-   只有 y/n 两种，于是「默认不勾选」的桩头文件在唯一称自己为复选框的前端里根本选不中，
-   而一棵没有工具链的树（TF-M：1588 个 Splint 单元里 1465 个死在 `psa/crypto.h` 之类
-   的头文件上）恰恰只能靠它们过预处理。
+   ```text
+   Build-context patch (build-context, round 1): splint: round 1: 3 item(s)
+      1 [x] -I platform/include  satisfies 987 unit(s)  (deterministic)
+      2 [ ] stub psa/crypto.h  the tree carries no psa/crypto.h  (llm)
+      3 [ ] stub cmsis_compiler.h  external toolchain header  (llm)
+     probe: 5/12 sampled unit(s) now preprocess
+     impact: re-runs only the failed units into new unit directories; …
+   Apply and re-run? (y=已勾选的 · 编号 1,3 · 范围 1-6 · 全部 · 回车或 n 全拒绝)
+   ```
+
+   **选项带编号，提示语说清能答什么。** `y` 只取预选项；`2,3`、`1-6`、`全部` 才能取到它
+   画成**未勾选**的那些。这一条 2026-09-04 才真正接上，而且分三处才补齐：在那之前答案
+   只有 y/n 两种（于是「默认不勾选」的桩头文件根本选不中），选项**没有编号**（于是"输入
+   编号"无从下手），而两个前端的 decider 都只读 `answer.yes`、把解析出来的选择丢掉。
+   一棵没有工具链的树（TF-M：1588 个 Splint 单元里 1465 个死在 `psa/crypto.h` 之类的
+   头文件上）恰恰只能靠这些桩头文件过预处理。**两个前端现在共用 `ask.selection` 这一套
+   词汇**——在对话里管用而在终端上不管用的答案，比一个只认 y 的对话框更糟。
    对话框滚上去了也不要紧：`/decide` 会把它原样重述一遍（读的是同一个问题块，不是另写一份），
    `/decide 全部` 则一步作答。状态栏在有待答问题时一直显示「等你回答上面的问题」。
    **在对话框上敲斜杠命令仍然是命令，不是答案**——此前待答问题会吞掉一切输入，而对一个

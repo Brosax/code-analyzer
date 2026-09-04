@@ -35,7 +35,7 @@ from code_analyzer.ask import (
     stdin_asker,
 )
 from code_analyzer.cli import parser
-from code_analyzer.control import DecisionRequest, stdin_decider
+from code_analyzer.control import Decision, DecisionRequest, stdin_decider
 
 
 def test_every_registry_action_declares_a_subject_a_confirmation_policy_and_an_impact_line() -> None:
@@ -132,11 +132,14 @@ def test_the_patch_dialog_keeps_the_lines_and_the_order_it_always_printed() -> N
     lines = stderr.getvalue().splitlines()
     # Title, then the items, then the probe and the impact, then the prompt.
     assert lines[1].startswith("Build-context patch (build-context, round 1)")
-    assert lines[2] == "  [x] -I src/hal  hal.h x12  (deterministic)"
-    assert lines[3] == "  [ ] -I vendor  board.h x4  (llm)"
+    # Numbered since 2026-09-04: the prompt asks for numbers, and unnumbered
+    # ticks beside it made the operator count rows.
+    assert lines[2] == "   1 [x] -I src/hal  hal.h x12  (deterministic)"
+    assert lines[3] == "   2 [ ] -I vendor  board.h x4  (llm)"
     assert lines[4].startswith("  probe: 9/12")
     assert lines[5].startswith("  impact: re-runs only the failed units")
-    assert stderr.getvalue().endswith("Apply the pre-ticked items and re-run? [y/N] ")
+    # And the prompt says what it takes rather than advertising two answers.
+    assert stderr.getvalue().rstrip().endswith("全部 · 回车或 n 全拒绝)")
     assert decision.answer == "apply" and decision.selected == (0,) and decision.decided_by == "cli"
     assert stdin_decider(io.StringIO("\n"), io.StringIO())(request).answer == "reject"
 
@@ -145,6 +148,23 @@ def test_a_select_question_takes_the_pre_ticked_set_on_a_bare_yes() -> None:
     question = Question("q", SELECT, "? ", options=("a", "b", "c"), preselected=(0, 2))
     assert stdin_asker(io.StringIO("y\n"), io.StringIO())(question).selected == (0, 2)
     assert stdin_asker(io.StringIO("n\n"), io.StringIO())(question).selected == ()
+
+
+def test_a_terminal_can_pick_the_items_the_dialog_drew_unticked() -> None:
+    """The CLI took `y` and nothing else, so an unticked item -- a stub header
+    is never pre-ticked -- could not be applied from a terminal at all. One
+    vocabulary now, shared with the conversation."""
+    question = Question("q", SELECT, "? ", options=("a", "b", "c"), preselected=(0,))
+    def pick(text: str) -> tuple[int, ...]:
+        return stdin_asker(io.StringIO(text + "\n"), io.StringIO())(question).selected
+
+    assert pick("2") == (1,)
+    assert pick("1,3") == (0, 2)
+    assert pick("1-3") == (0, 1, 2)
+    assert pick("全部") == (0, 1, 2)
+    assert pick("") == () and pick("n") == ()
+    # Out of range is dropped rather than guessed at.
+    assert pick("9") == () and pick("2,9") == (1,)
 
 
 # --- the compile-db wizard, whose questions moved onto the seam -------------
@@ -333,3 +353,29 @@ def test_an_unknown_action_is_a_user_error_naming_what_was_asked_for() -> None:
 
     with pytest.raises(UserError, match="unknown action: 不存在"):
         by_name("不存在")
+
+
+def test_the_terminal_applies_the_items_it_was_told_to_apply() -> None:
+    """`stdin_decider` read only `answer.yes` and dropped the parsed selection.
+
+    So even once the asker understood numbers, an item the run drew unticked --
+    every stub header -- could not be applied from a terminal. The TUI's
+    decider had exactly this bug.
+    """
+    request = DecisionRequest(
+        id="p1", kind="build-context", summary="3 item(s)",
+        items=[{"label": "-I platform/include", "evidence": "987 unit(s)", "origin": "deterministic"},
+               {"label": "stub psa/crypto.h", "evidence": "absent", "origin": "llm"},
+               {"label": "stub cmsis_compiler.h", "evidence": "absent", "origin": "llm"}],
+        round=1, preselected=(0,),
+    )
+
+    def decide(text: str) -> Decision:
+        return stdin_decider(io.StringIO(text + "\n"), io.StringIO())(request)
+
+    picked = decide("2,3")
+    assert picked.answer == "apply" and picked.selected == (1, 2)
+    assert decide("全部").selected == (0, 1, 2)
+    # `y` still means exactly what it always meant.
+    assert decide("y").selected == (0,)
+    assert decide("n").answer == "reject" and decide("").answer == "reject"

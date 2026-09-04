@@ -260,9 +260,12 @@ class QuestionBlock(Block):
         if self.question is None:
             return []
         lines = [*self.question.preview]
-        for index, option in enumerate(self.question.options):
-            tick = "x" if index in self.question.preselected else " "
-            lines.append(f"  [{tick}] {option}")
+        # Numbered, because the answer is a number.  Unnumbered ticks beside a
+        # prompt that asks for `1,3` make the operator count rows -- and the
+        # dialog that most needs picking has 79 of them.
+        for index, option in enumerate(self.question.options, 1):
+            tick = "x" if index - 1 in self.question.preselected else " "
+            lines.append(f"  {index:>2} [{tick}] {option}")
         lines.extend(self.question.footer)
         lines.append(f"  {self.question.prompt.strip()}")
         if self.answer is not None:
@@ -357,9 +360,9 @@ class ProposalBlock(Block):
         # ticked, which is the single most important thing on the block; it was
         # being dropped because `text` was never rendered.
         lines = ([self.text] if self.text else []) + list(self.lines)
-        for index, step in enumerate(self.steps):
-            tick = "x" if index in self.chosen else " "
-            lines.append(f"  [{tick}] {step.get('label') or step.get('action')}")
+        for index, step in enumerate(self.steps, 1):
+            tick = "x" if index - 1 in self.chosen else " "
+            lines.append(f"  {index:>2} [{tick}] {step.get('label') or step.get('action')}")
             for note in step.get("impact", ()):
                 lines.append(f"      {note}")
         return lines

@@ -27,7 +27,44 @@ CHOOSE = "choose"
 SELECT = "select"
 KINDS = frozenset({CONFIRM, TEXT, CHOOSE, SELECT})
 
-_YES = frozenset({"y", "yes"})
+_YES = frozenset({"y", "yes", "确认"})
+_ALL = frozenset({"全部", "all", "都要", "都跑"})
+_NO = frozenset({"n", "no", "否", "不", "取消", "全部拒绝"})
+# What a `select` answer may say, in the words the prompt offers.  One
+# definition, because two front ends ask the same question and an answer that
+# works in the conversation and not on the terminal is a worse dialog than one
+# that only ever took yes.
+SELECT_HELP = "y=已勾选的 · 编号 1,3 · 范围 1-6 · 全部 · 回车或 n 全拒绝"
+
+
+def selection(question: "Question", text: str) -> tuple[int, ...]:
+    """Which options an answer names.
+
+    ``y`` means the pre-ticked set, which is what the dialog opened with.
+    Numbers, ranges and `全部` reach the items it drew *unticked* -- a stub
+    header is offered per item and deliberately never pre-ticked, so without
+    them the checkbox dialog was a yes/no question with checkboxes painted on
+    it.
+    """
+    answer = text.strip().lower()
+    if not answer or answer in _NO:
+        return ()
+    if answer in _YES:
+        return tuple(question.preselected)
+    if answer in _ALL:
+        return tuple(range(len(question.options)))
+    chosen: list[int] = []
+    for piece in answer.replace("，", ",").replace("、", ",").split(","):
+        piece = piece.strip()
+        low, dash, high = piece.partition("-")
+        if dash and low.strip().isdigit() and high.strip().isdigit():
+            chosen.extend(
+                index - 1 for index in range(int(low), int(high) + 1)
+                if 1 <= index <= len(question.options)
+            )
+        elif piece.isdigit() and 1 <= int(piece) <= len(question.options):
+            chosen.append(int(piece) - 1)
+    return tuple(dict.fromkeys(chosen))
 
 
 @dataclass(frozen=True)
@@ -96,9 +133,11 @@ def stdin_asker(stdin: TextIO, stderr: TextIO, *, interactive: bool | None = Non
         for line in question.preview:
             print(line, file=stderr)
         if question.kind in {CHOOSE, SELECT}:
-            for index, option in enumerate(question.options):
-                tick = "x" if index in question.preselected else " "
-                print(f"  [{tick}] {option}", file=stderr)
+            for index, option in enumerate(question.options, 1):
+                tick = "x" if index - 1 in question.preselected else " "
+                # Numbered, because the prompt asks for numbers.  Unnumbered
+                # ticks with a "type 1,3" prompt made the operator count rows.
+                print(f"  {index:>2} [{tick}] {option}", file=stderr)
         for line in question.footer:
             print(line, file=stderr)
         print(question.prompt, end="", file=stderr, flush=True)
@@ -110,10 +149,10 @@ def stdin_asker(stdin: TextIO, stderr: TextIO, *, interactive: bool | None = Non
             return Answer(interrupted=True)
         text = "" if value == "" else value.rstrip("\n")
         if question.kind == SELECT:
-            # A bare yes takes the pre-ticked set, which is the choice the
-            # terminal dialog has always offered.
-            selected = question.preselected if text.strip().lower() in _YES else ()
-            return Answer(text=text, selected=tuple(selected))
+            # The same vocabulary the conversation takes.  A bare yes still
+            # means the pre-ticked set; the terminal used to accept nothing else,
+            # so an item the run drew unticked could not be applied from a CLI.
+            return Answer(text=text, selected=selection(question, text))
         return Answer(text=text)
 
     if interactive is None:
@@ -169,7 +208,7 @@ def question_from_decision(request: Any) -> Question:
     return Question(
         id=f"build-context.{request.id}",
         kind=SELECT,
-        prompt="Apply the pre-ticked items and re-run? [y/N] ",
+        prompt=f"Apply and re-run? ({SELECT_HELP}) ",
         options=options,
         preselected=tuple(request.preselected),
         preview=(f"\nBuild-context patch ({request.kind}, round {request.round}): {request.summary}",),

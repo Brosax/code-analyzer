@@ -1003,22 +1003,16 @@ class AnalyzerApp(App[TuiOutcome]):
 
     @staticmethod
     def _ticked(spec: Any, text: str) -> tuple[int, ...]:
-        """Which items a select answer names.
+        """Which items a select answer names -- `ask.selection` decides.
 
-        ``y`` keeps its historical meaning -- the pre-ticked set, which is
-        exactly what the build-context dialog's own prompt offers -- and
-        numbers, ranges and `全部` reach the items the dialog draws *unticked*.
-        Without them the checkbox dialog was a yes/no question with checkboxes
-        painted on it: a stub header is offered per item and deliberately never
-        pre-ticked, so until now it could not be accepted at all, in the one
-        front end whose documentation calls this a checkbox dialog.
+        Kept as a method because the tests and `_answer_pending` name it, but
+        the vocabulary lives in `ask.py`: two front ends ask the same question,
+        and an answer that works here and not on the terminal would be a worse
+        dialog than one that only ever took yes.
         """
-        answer = text.strip().lower()
-        if answer in {"y", "yes", "确认"}:
-            return tuple(spec.preselected)
-        if answer in {"全部", "all", "都要", "都跑"}:
-            return tuple(range(len(spec.options)))
-        return tuple(AnalyzerApp._chosen(text, len(spec.options)))
+        from .ask import selection
+
+        return selection(spec, text)
 
     def _decider(self) -> Any:
         """The build-context patch, asked as the conversation asks anything."""

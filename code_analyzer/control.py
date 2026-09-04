@@ -384,11 +384,12 @@ def auto_yes(request: DecisionRequest) -> Decision:
 
 
 def stdin_decider(stdin: Any, stderr: Any) -> Callable[[DecisionRequest], Decision]:
-    """The terminal's version of the dialog: a preview, then ``[y/N]``.
+    """The terminal's version of the dialog: a numbered preview, then an answer.
 
     One of the three places this program stops to ask something; all three now
     go through ``ask.Asker`` so a front end renders them one way.  The lines
-    are the ones this function printed before, in the same order.
+    are the ones this function printed before, in the same order, with the
+    numbers the prompt asks for.
     """
     from .ask import question_from_decision, stdin_asker
 
@@ -396,6 +397,13 @@ def stdin_decider(stdin: Any, stderr: Any) -> Callable[[DecisionRequest], Decisi
 
     def decide(request: DecisionRequest) -> Decision:
         answer = asker(question_from_decision(request))
+        # What was ticked, not what the dialog opened with.  Reading only
+        # `answer.yes` threw the parsed selection away, so an item the run drew
+        # unticked -- every stub header -- could not be applied from a terminal
+        # even once the asker understood the numbers.  The TUI's decider had
+        # exactly this bug.
+        if answer.selected:
+            return Decision("apply", tuple(answer.selected), decided_by="cli")
         if answer.yes:
             return Decision("apply", tuple(request.preselected), decided_by="cli")
         return Decision("reject", decided_by="cli", note="declined at the prompt")

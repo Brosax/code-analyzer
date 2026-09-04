@@ -137,8 +137,10 @@ def test_a_patch_question_shows_every_item_and_what_is_pre_ticked() -> None:
         preview=("构建上下文补丁",), footer=("  影响：只重跑失败的单元",),
     ))
     rendered = block.render()
-    assert "  [x] -I src/hal" in rendered and "  [ ] -I vendor" in rendered
-    assert rendered.index("  [x] -I src/hal") < rendered.index("  影响：只重跑失败的单元")
+    # Numbered: the answer is a number, and the dialog that most needs picking
+    # has 79 items.  Counting rows is not an interface.
+    assert "   1 [x] -I src/hal" in rendered and "   2 [ ] -I vendor" in rendered
+    assert rendered.index("   1 [x] -I src/hal") < rendered.index("  影响：只重跑失败的单元")
 
 
 # --- the state the parser reads ---------------------------------------------
