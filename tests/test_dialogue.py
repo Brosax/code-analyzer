@@ -350,3 +350,34 @@ def test_a_settled_wait_shows_no_chain_of_thought() -> None:
     block.think("想了很久")
     block.settled = True
     assert block.render() == []
+
+
+def test_a_settled_run_tells_the_conversation_where_its_report_is(tmp_path: Path) -> None:
+    """`add` reads the directory off the block, and a fresh block has none.
+
+    So the conversation never learned it, and every action whose subject is a
+    report directory had no subject: a bare `/assess` after a scan parsed as
+    *unknown*, in the front end whose whole premise is that a scan is followed
+    by questions about it.
+    """
+    from code_analyzer.dialogue import Dialogue
+    from code_analyzer.flow import RunFlow
+
+    dialogue = Dialogue(source=tmp_path, config=_config())
+    assert dialogue.report_directory is None
+
+    block = dialogue.run("scan", RunFlow(dialogue.config))
+    assert dialogue.report_directory is None, "the run has not made one yet"
+
+    report = tmp_path / "20260904T000000Z-abcdef"
+    report.mkdir()
+    dialogue.settled(block, 10, "扫描结束", report)
+
+    assert dialogue.report_directory == report
+    assert dialogue.state().report_directory == report
+    assert block.settled and block.exit_code == 10
+
+    # A run that produced no directory must not erase the one before it.
+    second = dialogue.run("scan", RunFlow(dialogue.config))
+    dialogue.settled(second, 2, "失败", None)
+    assert dialogue.report_directory == report

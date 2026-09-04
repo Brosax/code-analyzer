@@ -822,8 +822,9 @@ class AnalyzerApp(App[TuiOutcome]):
         run = self.dialogue.get(block_id) if block_id else None
         if isinstance(run, RunBlock):
             code = outcome.exit_code if outcome is not None else 130
-            run.settle(code, outcome.summary if outcome is not None else note,
-                       outcome.report_directory if outcome is not None else None)
+            self.dialogue.settled(
+                run, code, outcome.summary if outcome is not None else note,
+                outcome.report_directory if outcome is not None else None)
             self._repaint_run(run)
         if outcome is not None:
             self.last_outcome = TuiOutcome(outcome.exit_code, outcome.report_directory)

@@ -1597,3 +1597,41 @@ def test_a_run_can_ask_the_conversation_for_a_decision(tmp_path: Path) -> None:
             assert app.control.pending() == []
 
     asyncio.run(exercise())
+
+
+def test_a_scan_is_followed_by_a_question_about_the_report_it_made(tmp_path: Path) -> None:
+    """The premise of the whole front end, and it did not hold.
+
+    After a scan settled, `/assess` and `/summarize` had no subject: the
+    conversation never learned the directory the run had just created, so the
+    parser saw a report action with nothing to act on and read it as unknown.
+    """
+    from code_analyzer.actions import ActionOutcome, by_name
+    from code_analyzer.flow import RunFlow
+    from code_analyzer.intent import parse
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert parse("/assess", app.dialogue.state()).kind == "unknown"
+
+            report = tmp_path / "20260904T000000Z-abcdef"
+            (report / "review").mkdir(parents=True)
+            (report / "manifest.json").write_text("{}", encoding="utf-8")
+
+            run = app.dialogue.run("scan", RunFlow(app.dialogue.config))
+            app._mount(run)
+            await pilot.pause()
+            app._finished(run.block_id, "scan", ActionOutcome(
+                exit_code=10, summary="扫描结束", report_directory=report), "")
+            await pilot.pause()
+
+            assert app.dialogue.report_directory == report
+            for command in ("/assess", "/summarize", "/汇总"):
+                intent = parse(command, app.dialogue.state())
+                assert intent.kind == "action", f"{command} still has no subject"
+            request = app._request(by_name("assess"), parse("/assess", app.dialogue.state()))
+            assert request.report_directory == report
+
+    asyncio.run(exercise())

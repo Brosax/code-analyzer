@@ -411,6 +411,22 @@ class Dialogue:
         block = RunBlock(action=action, flow=flow, chat=Transcript(), control=control, text=action)
         return self.add(block)  # type: ignore[return-value]
 
+    def settled(self, block: RunBlock, exit_code: int, summary: str,
+                report_directory: Path | None = None) -> None:
+        """Settle a run, and remember where it put its report.
+
+        ``add`` reads the directory off the block, and a block has none when it
+        is added -- the run has not created it yet.  So the conversation never
+        learned it at all, and every action whose subject is a report directory
+        (`assess`, `summarize`, `rebuild-dashboard`, `llm-resume`, `serve`)
+        had no subject to work on: a bare `/assess` after a scan parsed as
+        *unknown*, in the front end whose whole premise is that a scan is
+        followed by questions about it.
+        """
+        block.settle(exit_code, summary, report_directory)
+        if block.report_directory is not None:
+            self.report_directory = block.report_directory
+
     # --- folding ------------------------------------------------------------
 
     def apply(self, block_id: str, event: AnalysisEvent) -> str | None:
