@@ -1544,3 +1544,56 @@ def test_a_ticked_item_reaches_the_patch_instead_of_being_thrown_away(tmp_path: 
             assert decide(_Request()).answer == "reject"
 
     asyncio.run(exercise())
+
+
+def test_a_run_can_ask_the_conversation_for_a_decision(tmp_path: Path) -> None:
+    """The build-context patch is answered in the conversation, or nowhere.
+
+    `ActionContext.decide` reaches the runner only on the terminal branch, so
+    without a decider on the control a run's `request_decision` fell through to
+    `RunControl`'s pending map and blocked until the run was cancelled -- with
+    `/decide` able to count the pending items and not to answer one.
+    """
+    from code_analyzer.control import DecisionRequest
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            from code_analyzer.intent import parse
+
+            (tmp_path / "a.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+            app._start(parse(f"/scan {tmp_path}", app.dialogue.state()))
+            await pilot.pause()
+            assert app.control is not None, "a long-running action gets a control"
+
+            request = DecisionRequest(
+                id="bc1", kind="build-context", summary="splint: round 1: 2 item(s)",
+                items=({"label": "include interface/include"}, {"label": "stub psa/crypto.h"}),
+                preselected=(0,),
+            )
+            decided: dict[str, object] = {}
+
+            def ask_and_answer() -> None:
+                decided["decision"] = app.control.request_decision(request)
+
+            worker = threading.Thread(target=ask_and_answer, daemon=True)
+            worker.start()
+            for _ in range(60):
+                await pilot.pause()
+                pending = app.dialogue.pending_question()
+                if pending is not None:
+                    app._answer_pending(pending.block_id, "全部")
+                    break
+            worker.join(timeout=5)
+            app.control.cancel("test")
+
+            decision = decided.get("decision")
+            assert decision is not None, "the run was never asked in the conversation"
+            assert decision.answer == "apply"
+            assert decision.selected == (0, 1)
+            assert decision.decided_by == "tui"
+            # Nothing is left waiting in the control's own pending map.
+            assert app.control.pending() == []
+
+    asyncio.run(exercise())

@@ -721,8 +721,18 @@ class AnalyzerApp(App[TuiOutcome]):
         self.cancel_token = CancellationToken()
         self._stop_event = threading.Event()
         if action.long_running:
+            # The decider goes on the control, because that is the only channel
+            # a run in flight has back to the conversation.  Without it
+            # `RunControl.request_decision` fell through to its `_pending` map
+            # and blocked forever: `ActionContext.decide` reaches the runner
+            # only on the terminal branch, so the build-context patch -- which
+            # `docs/usage.md` calls "a checkbox dialog in the TUI", and which
+            # `_decider` below was written for -- could not be answered from
+            # the conversation at all. Measured on TF-M: every run since the
+            # feature landed sat at "待决策" until it was cancelled.
             self.control = RunControl(self.cancel_token,
-                                      llm_jobs=int(request.config["llm"].get("jobs") or 1))
+                                      llm_jobs=int(request.config["llm"].get("jobs") or 1),
+                                      decider=self._decider())
             # From the config this run will actually use, not from the session's.
             # The old run view drew its skeleton from `self.config` while the run
             # used the collected one, so a `--llm-scanner` on the command line

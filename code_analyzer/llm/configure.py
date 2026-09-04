@@ -44,10 +44,15 @@ from .scan import OpenRuntime, Task, _Cache, _Phase
 from .skills import CONFIGURATOR_SKILL, Skill, load_skill, skills_directory
 
 PRODUCER = CONFIGURATOR_SKILL
-# Bounds of one configurator session; the model may read a few headers and
-# must answer inside them.
-MAX_STEPS = 6
-MAX_TURNS = 4
+# Bounds of one configurator session.  This is the one lane whose whole job is
+# to read the tree -- "fill in what only reading the tree can tell" -- and a
+# step is one tool call, so six of them is six files.  Measured on TF-M
+# (2026-09-04): it opened seven in two steps, hit the ceiling, answered
+# nothing, and the round cost 320 seconds and produced zero items while the
+# deterministic half of the same patch had already found 64. Twenty-four is
+# still a bound and no longer one a board inference trips over.
+MAX_STEPS = 24
+MAX_TURNS = 6
 # A model that always thinks spends its completion budget before it writes
 # the object: glm-5.3-flash burned 4000 tokens of reasoning on a 10k-token
 # diagnosis and answered nothing.  The ceiling is per session, once a round.
