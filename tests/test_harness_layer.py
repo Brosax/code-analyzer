@@ -5,13 +5,16 @@ optional extra nor a network.
 """
 from __future__ import annotations
 
+import errno
 import json
+import os
 import subprocess
 import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -978,7 +981,6 @@ def test_the_redactor_walks_containers_a_provider_can_really_return() -> None:
     """
     secret = "sk-live-CREDENTIAL-abcdef123456"
     settings = {"api_key_env": "CODE_ANALYZER_TEST_KEY"}
-    import os
 
     os.environ["CODE_ANALYZER_TEST_KEY"] = secret
     try:
@@ -1032,3 +1034,48 @@ def test_the_sandbox_can_resolve_a_hostname_and_trust_a_certificate(tmp_path: Pa
     for entry in present:
         assert f"--ro-bind {entry} {entry}" in script
     assert "--ro-bind /etc /etc" not in script, "only the name service and certificates are exposed, never all of /etc"
+
+
+def test_the_sandbox_launcher_is_never_written_in_place(tmp_path: Path) -> None:
+    """ETXTBSY, measured on TF-M at eight concurrent scanner jobs.
+
+    Every session of a run writes the same launcher to the same path and then
+    executes it, so a plain write lands on a file another worker is running and
+    the kernel answers `Text file busy`. That killed a unit outright and filed
+    it as a scanner failure rather than as the race it was. The launcher must
+    therefore arrive by rename: the running process keeps the old inode, the
+    name points at the new one.
+    """
+    from code_analyzer.harness.runtime import HarnessRuntime
+
+    runtime = HarnessRuntime.__new__(HarnessRuntime)
+    runtime.cwd = tmp_path / "tree"
+    runtime.cwd.mkdir()
+    runtime.session_root = tmp_path / "sessions"
+    runtime.cordis_path = tmp_path / "cordis" / "cordis.json"
+    runtime.cordis_path.parent.mkdir(parents=True)
+
+    target = runtime.cordis_path.parent / "runtime-sandbox.sh"
+    real_write_text = Path.write_text
+
+    def refuse_in_place(self: Path, *args: object, **kwargs: object) -> int:
+        if self == target:
+            raise OSError(errno.ETXTBSY, "Text file busy", str(self))
+        return real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    document = {"skills": {"customSkillDirs": []}}
+    with mock.patch.object(Path, "write_text", refuse_in_place):
+        written = runtime._write_launcher("/usr/bin/bwrap", document)
+
+    assert written == target
+    assert target.read_text(encoding="utf-8").startswith("#!/bin/sh")
+    assert target.stat().st_mode & 0o777 == 0o700
+    # Nothing staged is left behind, whatever the name it was staged under.
+    assert sorted(item.name for item in target.parent.iterdir()) == ["runtime-sandbox.sh"]
+
+    # And a second writer replaces it rather than truncating it: a reader
+    # holding the old file keeps reading a complete script.
+    before = target.stat().st_ino
+    with mock.patch.object(Path, "write_text", refuse_in_place):
+        runtime._write_launcher("/usr/bin/bwrap", document)
+    assert target.stat().st_ino != before

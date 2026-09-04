@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from importlib import metadata
@@ -671,8 +672,20 @@ class HarnessRuntime:
             "",
         ]
         path = self.cordis_path.parent / "runtime-sandbox.sh"
-        path.write_text("\n".join(lines), encoding="utf-8")
-        path.chmod(0o700)
+        # Written by every session of a run, to one path, and then executed --
+        # so at `[llm] jobs > 1` one worker's `write_text` lands on a file
+        # another worker is running, and the kernel answers ETXTBSY.  Measured
+        # on TF-M at jobs=8: `OSError: [Errno 26] Text file busy` killed a unit
+        # outright, and the unit was recorded as a scanner failure rather than
+        # as the race it was.  A rename cannot fail that way: the running
+        # process keeps the old inode, the name points at the new one.  The
+        # content is a property of the run, not of the session, so every writer
+        # writes the same bytes and the last one wins harmlessly.
+        body = "\n".join(lines)
+        staged = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident():x}")
+        staged.write_text(body, encoding="utf-8")
+        staged.chmod(0o700)
+        os.replace(staged, path)
         return path
 
     def run(
