@@ -309,12 +309,12 @@ class AnalyzerApp(App[TuiOutcome]):
         if self.journal is not None:
             self.journal.said(line)
 
+        intent = parse(line, self.dialogue.state())
         pending = self.dialogue.pending_question()
-        if pending is not None:
+        if pending is not None and not self._commands_over(pending, intent):
             self._answer_pending(pending.block_id, line)
             return
 
-        intent = parse(line, self.dialogue.state())
         by = "model" if intent.kind == ASK else "parser"
         # A slash command answers in 0 ms and never waits behind a model, so
         # /cancel and /help stay reachable while one is thinking.  Anything
@@ -946,6 +946,26 @@ class AnalyzerApp(App[TuiOutcome]):
                 and question.question.id == "ask.steps":
             self._run_proposed(text)
         self._update_status()
+
+    @staticmethod
+    def _commands_over(pending: Any, intent: Any) -> bool:
+        """Whether a line typed at a question is a command rather than an answer.
+
+        A pending question used to swallow everything, slash commands included,
+        so `/help` at the build-context dialog was read as an answer -- and for
+        a `select` question anything that is not `y` or a number means *reject*.
+        Asking what the dialog is silently threw the patch away.
+
+        Only for questions whose answers are a closed set. A `text` question
+        asks for a path or an argument, and `/usr/include` is a legitimate
+        answer there, not a command.
+        """
+        from .ask import TEXT
+
+        question = getattr(pending, "question", None)
+        if question is None or question.kind == TEXT:
+            return False
+        return intent.kind in {META, CONFIG_SET, CONFIG_SHOW}
 
     def _restate_decision(self, argv: tuple[str, ...] | list[str]) -> None:
         """Say the outstanding decision again, or answer it outright.

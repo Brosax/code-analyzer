@@ -1750,3 +1750,58 @@ def test_the_build_context_rounds_say_what_they_did_in_the_conversation(tmp_path
             assert "configurator heartbeat" not in _transcript(app)
 
     asyncio.run(exercise())
+
+
+def test_a_command_typed_at_a_dialog_is_a_command_not_an_answer(tmp_path: Path) -> None:
+    """A pending question swallowed everything, slash commands included.
+
+    For a `select` question anything that is not `y` or a number means
+    *reject*, so typing `/help` at the build-context dialog to ask what it was
+    silently threw the patch away.
+    """
+    from code_analyzer.ask import CONFIRM, SELECT, TEXT, Question
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+
+            patch = app.dialogue.ask(Question(
+                "build-context.r1", SELECT, "Apply the pre-ticked items and re-run? [y/N] ",
+                options=("stub board_config.h", "stub missing_vendor.h"), preselected=()))
+            app._mount(patch)
+            await pilot.pause()
+
+            # The command runs, and the patch is still waiting to be decided.
+            app.submit("/decide")
+            await pilot.pause()
+            assert patch.answer is None, "asking about the dialog must not answer it"
+            assert app.dialogue.pending_question() is patch
+            assert "还有一项等你决定" in _transcript(app)
+
+            # An actual answer still answers it.
+            app.submit("全部")
+            await pilot.pause()
+            assert patch.answer is not None and patch.answer.selected == (0, 1)
+
+            # A confirm question is a closed set too.
+            confirm = app.dialogue.ask(Question("scan.confirm", CONFIRM, "开始吗？ [y/N] "))
+            app._mount(confirm)
+            await pilot.pause()
+            app.submit("/help")
+            await pilot.pause()
+            assert confirm.answer is None
+
+            app.submit("n")
+            await pilot.pause()
+            assert confirm.answer is not None
+
+            # But a free-text question takes a path that happens to start with `/`.
+            asked = app.dialogue.ask(Question("compile-db.cmake-args", TEXT, "Extra args: "))
+            app._mount(asked)
+            await pilot.pause()
+            app.submit("/usr/include")
+            await pilot.pause()
+            assert asked.answer is not None and asked.answer.text == "/usr/include"
+
+    asyncio.run(exercise())
