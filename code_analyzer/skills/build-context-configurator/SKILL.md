@@ -1,7 +1,7 @@
 ---
 name: build-context-configurator
 description: Completes the build context — include roots, per-subtree overrides, defines, the C standard, typed Splint options, names of headers the tree lacks — for a C tree whose units the static analyzers could not preprocess, from the analyzers' own diagnosis, and returns one JSON proposal.
-skill_version: 1.0.0
+skill_version: 1.1.0
 engine: llm
 role: configurator
 allowed-tools:
@@ -43,8 +43,20 @@ You may read files under the source tree with the filesystem tool, read-only:
 a top-level `CMakeLists.txt`, a `Kconfig`, a board's `config.cmake`, a header
 that another header includes, a `partition/flash_layout.h`. Read to answer a
 question the diagnosis raises — "which board has `rse_memory_sizes.h`?",
-"what does `config_impl.h` expect to be defined?" — and stop. Six tool calls
-are your budget; spend them on the headers that block the most units.
+"what does `config_impl.h` expect to be defined?" — and stop.
+
+**Twenty tool calls are your budget, and running out of them is a failure.**
+The session is cut off at its ceiling, and a session cut off has answered
+nothing at all: the round then costs its whole wall clock and contributes zero
+items, however much you learned. Measured on Trusted Firmware-M (2026-09-04):
+one round spent every call reading board `config.cmake` files to decide which
+of them owned the shared CMSIS drivers, was cut off, and returned nothing —
+while the deterministic patch beside it already held 64 include roots.
+
+So: spend your reads on the headers that block the most units, and **answer
+before the budget is gone**. A question you could not settle belongs in
+`unresolved`, which is what that field is for. An answer with two items and
+three unresolved entries is worth more than a perfect one you never wrote.
 
 ## What you may propose
 
