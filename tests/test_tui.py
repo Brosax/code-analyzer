@@ -1635,3 +1635,118 @@ def test_a_scan_is_followed_by_a_question_about_the_report_it_made(tmp_path: Pat
             assert request.report_directory == report
 
     asyncio.run(exercise())
+
+
+def test_decide_restates_the_outstanding_decision_instead_of_counting_it(tmp_path: Path) -> None:
+    """`/decide` called itself "re-open the pending patch" and printed a count.
+
+    That is a dead end for the one person who needs it: the operator who
+    scrolled past the dialog while a long run kept printing.
+    """
+    from code_analyzer.ask import SELECT, Question
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._restate_decision(())
+            await pilot.pause()
+            assert "当前没有待决策项" in _transcript(app)
+
+            app._mount(app.dialogue.ask(Question(
+                "build-context.r1", SELECT, "Apply the pre-ticked items and re-run? [y/N] ",
+                options=("include root interface/include  satisfies 248 unit(s)",
+                         "stub header psa/crypto.h  external"),
+                preselected=(0,),
+                preview=("\nBuild-context patch (splint, round 1): 2 item(s)",),
+                footer=("  probe: 5/12 sampled unit(s) now preprocess",),
+            )))
+            await pilot.pause()
+
+            app._restate_decision(())
+            await pilot.pause()
+            text = _transcript(app)
+            assert "还有一项等你决定" in text
+            # Every item, its tick and its evidence -- read back from the block
+            # rather than reassembled, so the two cannot drift.
+            assert "[x] include root interface/include" in text
+            assert "[ ] stub header psa/crypto.h" in text
+            assert "probe: 5/12" in text
+            assert "全部" in text and "1-6" in text
+
+    asyncio.run(exercise())
+
+
+def test_decide_can_answer_outright(tmp_path: Path) -> None:
+    from code_analyzer.ask import SELECT, Question
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            block = app.dialogue.ask(Question(
+                "build-context.r1", SELECT, "Apply the pre-ticked items and re-run? [y/N] ",
+                options=("a", "b", "stub c"), preselected=(0, 1)))
+            app._mount(block)
+            await pilot.pause()
+
+            app._restate_decision(("全部",))
+            await pilot.pause()
+
+            assert app.dialogue.pending_question() is None, "it was answered"
+            assert block.answer is not None and block.answer.selected == (0, 1, 2)
+
+    asyncio.run(exercise())
+
+
+def test_the_build_context_rounds_say_what_they_did_in_the_conversation(tmp_path: Path) -> None:
+    """The round that fails is the one worth reading, and it looked like the rest."""
+    from code_analyzer.flow import RunFlow
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            run = app.dialogue.run("scan", RunFlow(app.dialogue.config))
+            app._mount(run)
+            emit = app._emitter(run.block_id)
+
+            def announce(events: list[AnalysisEvent]) -> None:
+                # `_emitter` is called on a worker thread, and `call_from_thread`
+                # refuses to run on the app's own.
+                for event in events:
+                    emit(event)
+
+            worker = threading.Thread(target=announce, args=([
+                AnalysisEvent("build_context", "consulted",
+                              "splint: configurator failed: agent step ceiling of 24 reached; "
+                              "the deterministic patch proceeds alone"),
+                AnalysisEvent("build_context", "probed",
+                              "splint: 3/12 sampled unit(s) now reach Finished checking"),
+                AnalysisEvent("build_context", "applied",
+                              "splint: attempt 2 partial; analysis reached 173/1588 (was 123)"),
+            ],), daemon=True)
+            worker.start()
+            for _ in range(40):
+                await pilot.pause()
+                if not worker.is_alive():
+                    break
+            worker.join(timeout=5)
+            await pilot.pause()
+
+            text = _transcript(app)
+            assert "修补 · splint: configurator failed" in text
+            assert "step ceiling of 24" in text
+            assert "3/12 sampled" in text
+            assert "173/1588" in text
+
+            # A heartbeat is not notable; the conversation is not a log.
+            quiet = threading.Thread(target=announce, args=([
+                AnalysisEvent("build_context", "consulting", "splint: configurator heartbeat"),
+            ],), daemon=True)
+            quiet.start()
+            quiet.join(timeout=5)
+            await pilot.pause()
+            assert "configurator heartbeat" not in _transcript(app)
+
+    asyncio.run(exercise())

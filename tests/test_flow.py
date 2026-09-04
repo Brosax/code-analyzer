@@ -357,3 +357,51 @@ def test_the_flow_module_never_imports_a_ui(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == []
+
+
+def test_the_collapsed_line_names_the_phase_the_run_is_waiting_in() -> None:
+    """A phase that owns the run never appeared on the collapsed line.
+
+    `headline` names running *producers*, so build context asking the model --
+    sixty minutes of it, measured on TF-M -- read as "正在扫描 · llm-security",
+    which is indistinguishable from a scan that is simply slow.
+    """
+    from code_analyzer.flow import RunFlow
+
+    now = 1_000_000.0
+    flow = RunFlow(_config())
+    assert flow.waiting_on(now) == ""
+
+    flow.apply(_event("build_context", "consulting",
+                      "splint: configurator heartbeat; elapsed 750.0s", timestamp=now - 750))
+    waiting = flow.waiting_on(now)
+    assert waiting == "修补 · 问模型 · 已等 12:30"
+    assert waiting in flow.headline(now).detail
+
+    # The word comes from the phase's own status, and each one reads differently.
+    flow.apply(_event("build_context", "awaiting", "splint: waiting for a decision on 79 item(s)"))
+    assert "等你决定" in flow.waiting_on(now)
+    flow.apply(_event("build_context", "applying", "splint: re-running 1415 unit(s)"))
+    assert "重跑失败单元" in flow.waiting_on(now)
+
+    # An unmapped status falls back to the label rather than to a guess.
+    flow.apply(_event("build_context", "somethingnew", "splint: ?"))
+    assert flow.waiting_on(now).startswith("修补 · 已等")
+
+    # And it stops once the phase settles.
+    flow.apply(_event("build_context", "finished", "build-context assistance applied"))
+    assert flow.waiting_on(now) == ""
+
+
+def test_a_phase_and_a_producer_are_both_named_when_both_are_running() -> None:
+    """They are different facts, and the build-context loop runs beside the scan."""
+    from code_analyzer.flow import RunFlow
+
+    now = 1_000_000.0
+    flow = RunFlow(_config())
+    flow.apply(_event("tool", "started", "cppcheck starting", tool="cppcheck"))
+    flow.apply(_event("build_context", "consulting", "splint: configurator", timestamp=now - 60))
+
+    headline = flow.headline(now)
+    assert "cppcheck" in f"{headline.title} {headline.detail}" or "cppcheck" in flow.running_producers()
+    assert "修补 · 问模型" in headline.detail

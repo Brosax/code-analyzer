@@ -212,3 +212,35 @@ def test_skipping_a_producer_unschedules_its_units_and_marks_the_tool(tmp_path: 
     assert ("flawfinder", "skipped") in tool_events and ("splint", "partial") in tool_events
     batches = [e for e in events if e.phase == "units" and e.status == "unscheduled"]
     assert len(batches) == 1 and batches[0].data == {"count": 2, "reason": "skipped by operator", "first_index": 3, "last_index": 4, "total": 4}
+
+
+def test_a_decision_is_announced_when_it_is_asked_not_only_when_it_is_answered() -> None:
+    """The decider path announced only the answer.
+
+    `approval_timeout_seconds` defaults to 0, so the window in which a person
+    is being waited on is unbounded -- and for all of it nothing said a
+    decision was outstanding: not `RunFlow.pending_decisions`, not the live
+    page, not events.jsonl. The run looked exactly like one that was busy.
+    """
+    from code_analyzer.control import Decision, DecisionRequest, RunControl
+
+    seen: list[tuple[str, str, str]] = []
+    request = DecisionRequest(
+        id="bc1", kind="build-context", summary="splint: round 1: 64 item(s)",
+        items=({"label": "a"}, {"label": "b"}), preselected=(0,),
+    )
+
+    def listener(phase: str, status: str, text: str, _data: object) -> None:
+        seen.append((phase, status, text))
+
+    def decider(_request: DecisionRequest) -> Decision:
+        # By the time anyone is asked, the request has already been announced.
+        assert [row[1] for row in seen] == ["requested"], seen
+        return Decision("apply", (0, 1), decided_by="tui")
+
+    control = RunControl(listener=listener, decider=decider)
+    decision = control.request_decision(request)
+
+    assert decision.answer == "apply" and decision.selected == (0, 1)
+    assert [row[1] for row in seen] == ["requested", "decided"]
+    assert "splint: round 1: 64 item(s)" in seen[0][2]

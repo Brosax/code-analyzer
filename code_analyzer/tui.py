@@ -89,6 +89,20 @@ RUN_ONLY_ACTIONS = frozenset({"cycle_filter", "toggle_prompts", "toggle_log"})
 # Whether a model-resolved read-only step runs without a second human beat.
 # One boolean, so the whole of that decision reverts by flipping it.
 AUTO_RUN_READ_ONLY = True
+# What a run says that belongs in the conversation and not only inside the
+# expanded run block.  The build-context loop is the case that forced this: its
+# rounds are the one part of a scan an operator has to act on, its whole
+# account of itself was a phase event nobody sees without pressing Enter, and
+# the round that *fails* -- the one worth reading -- looked exactly like the
+# round that worked.  Deliberately short: these fire at most a handful of times
+# per run (`[build] assist_rounds` is 1 or 2), so the transcript is not a log.
+NOTABLE_EVENTS: frozenset[tuple[str, str]] = frozenset({
+    ("build_context", "consulted"),   # what the model returned, or why it did not
+    ("build_context", "probed"),      # how many failed units the patch actually fixes
+    ("build_context", "applied"),     # what re-running them bought
+    ("build_context", "rejected"),    # and that nothing was applied
+})
+NOTABLE_LABEL = {"build_context": "修补"}
 
 # How many queued events one 5 Hz tick folds at most, and how many liveness
 # events may pile up before the oldest are dropped.  Unchanged.
@@ -386,10 +400,8 @@ class AnalyzerApp(App[TuiOutcome]):
             control.request_retry("llm", ids or None, "tui")
             self._mount(self.dialogue.say(
                 f"已请求重试 {len(ids) if ids else '全部未得到回答的'} 个 LLM 单元；本轮结束后执行"))
-        elif name == "decide" and control is not None:
-            pending = control.pending()
-            self._mount(self.dialogue.say(
-                f"待决策 {len(pending)} 项" if pending else "当前没有待决策项"))
+        elif name == "decide":
+            self._restate_decision(argv)
         elif name == "save":
             self.action_save(Path(argv[0]) if argv else None)
         else:
@@ -862,6 +874,13 @@ class AnalyzerApp(App[TuiOutcome]):
 
         def emit(event: AnalysisEvent) -> None:
             self._queue_log_event(event)
+            if (event.phase, event.status) in NOTABLE_EVENTS:
+                label = NOTABLE_LABEL.get(event.phase, event.phase)
+                self.call_from_thread(
+                    self._mount,
+                    self.dialogue.say(f"{label} · {single_line(event.message)}"))
+                # Falls through: the run block still folds it, so the flow
+                # diagram and the collapsed line stay correct.
             if event.status == "info" and not has_block:
                 # An action with no run block has nowhere for progress to land,
                 # so it was being dropped -- which is how `serve` announced its
@@ -927,6 +946,40 @@ class AnalyzerApp(App[TuiOutcome]):
                 and question.question.id == "ask.steps":
             self._run_proposed(text)
         self._update_status()
+
+    def _restate_decision(self, argv: tuple[str, ...] | list[str]) -> None:
+        """Say the outstanding decision again, or answer it outright.
+
+        `/decide` described itself as re-opening the pending build-context
+        patch and only printed a count, which is a dead end for the one person
+        who needs it: the operator who scrolled past the dialog. The question
+        block is still there and still unanswered -- `submit` routes anything
+        typed to it -- so restating it is all that was missing.
+
+        `ask.question_from_decision` already composed the preview, the ticks,
+        the evidence and the probe line; this reads that back rather than
+        assembling a second version of the same text, which would drift.
+        """
+        pending = self.dialogue.pending_question()
+        if pending is None or pending.question is None:
+            self._mount(self.dialogue.say("当前没有待决策项。"))
+            return
+        answer = " ".join(str(item) for item in argv).strip()
+        if answer:
+            self._answer_pending(pending.block_id, answer)
+            return
+        # The block's own rendering, minus its trailing prompt line -- that
+        # prompt becomes the heading, so repeating it would say it twice.
+        rendered = pending.render()
+        lines = rendered[:-1] if rendered else []
+        question = pending.question
+        self._mount(self.dialogue.say(
+            f"还有一项等你决定：{single_line(question.prompt)}",
+            [*lines, "",
+             "  `y` 取预选项（对话框里已经打勾的那些）；"
+             "编号如 `1,3`、范围如 `1-6`、或 `全部` 取它画成未勾选的那些；"
+             "直接回车或 `n` 全部拒绝。",
+             "  也可以一步到位：`/decide 全部`。"]))
 
     @staticmethod
     def _ticked(spec: Any, text: str) -> tuple[int, ...]:

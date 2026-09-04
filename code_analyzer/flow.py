@@ -45,6 +45,19 @@ SPINE_RAMP = 3
 RETRYABLE_CLASSES = frozenset({"transport", "provider"})
 MAX_RETRYABLE = 5000
 
+# What a phase is doing, for the collapsed line.  Keyed by the status word the
+# phase itself emits, so an unmapped one falls back to the label alone rather
+# than to a guess -- the same rule the node glyphs follow.
+PHASE_DOING: dict[str, str] = {
+    "consulting": "问模型",
+    "consulted": "模型已答",
+    "probing": "试补丁",
+    "probed": "补丁已试",
+    "awaiting": "等你决定",
+    "applying": "重跑失败单元",
+    "diagnosing": "诊断",
+}
+
 TAIL_NODES: tuple[tuple[str, str], ...] = (
     ("build_context", "修补"),
     ("stability", "稳定"),
@@ -790,6 +803,9 @@ class RunFlow:
             parts.append("LLM ⏸")
         if self.paused["static"]:
             parts.append("静态 ⏸")
+        waiting = self.waiting_on(now)
+        if waiting:
+            parts.append(waiting)
         if self.pending_decisions:
             parts.append(f"待决策 {len(self.pending_decisions)}")
         return Headline(title=_clean(title), detail=" · ".join(parts), percent=int(self.percent * 100))
@@ -810,6 +826,33 @@ class RunFlow:
             rows.append(Row("", "│", " ", f"… 另外 {len(omitted)} 个", _summarise(omitted), "pending"))
         rows.append(self._tail(frame))
         return rows
+
+    def waiting_on(self, now: float) -> str:
+        """The phase running right now, what it is doing, and for how long.
+
+        `headline` names the running *producers* and nothing else, so a phase
+        that owns the run alone -- build context asking the model, review
+        folding a hundred thousand findings, export zipping them -- never
+        appeared on the collapsed line at all.  Measured on TF-M: the
+        configurator held the run for sixty minutes while the line read
+        "正在扫描 · llm-security", which is indistinguishable from a scan that
+        is simply slow.
+
+        The node already carries its own status and start; this only puts them
+        where someone who has not expanded the run can see them.  The status
+        word rather than the heartbeat text, because the heartbeat is a
+        sentence and this is one segment of one line.
+        """
+        for node in self.nodes.values():
+            # Phase nodes only -- the producers already have their own segment,
+            # and naming them twice would just make the line longer.
+            if node.kind != "phase" or node.state != "running":
+                continue
+            parts = [node.label, PHASE_DOING.get(node.status, "")]
+            if node.started_at is not None:
+                parts.append(f"已等 {_clock(node.started_at, now)}")
+            return " · ".join(part for part in parts if part)
+        return ""
 
     def _producers(self) -> list[Node]:
         return [node for node in self.nodes.values() if node.kind in {"static", "llm"}]

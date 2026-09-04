@@ -266,6 +266,29 @@ qwen3.8:27b @ http://192.168.5.10:11434/v1
 - 五档结论：`clean` / `minor` / `serious` / `blocked` / `inconclusive`。模型编一个别的
   档位出来，会被记为 `inconclusive` 并在 `dropped` 里写明。
 
+### 3.2.6 这一步在跑什么，模型说了什么
+
+修补这一段可以很久——实测 TF-M 上配置器问模型问了 60 分钟——所以它不再只在展开的运行块里
+出声：
+
+- **折叠行说出它正等在哪个阶段**：`修补 · 问模型 · 已等 12:30`。此前折叠行只点名正在跑的
+  *生产者*，于是一个独占整次运行的阶段一个字都不会出现，读起来和"扫描比较慢"完全一样。
+  阶段词来自阶段自己发的 status（`问模型` / `试补丁` / `等你决定` / `重跑失败单元`），
+  没有对应词就只显示阶段名——不猜。`审查`、`导出` 在大树上同样会静默好几分钟，一并适用。
+- **每一轮的结论直接落进对话**，不用展开：
+
+  ```text
+  修补 · splint: configurator failed: agent step ceiling of 24 reached; the deterministic patch proceeds alone
+  修补 · splint: 3/12 sampled unit(s) now reach Finished checking
+  修补 · splint: attempt 2 partial; analysis reached 173/1588 (was 123); 1465 unit(s) superseded
+  ```
+
+  **失败的那一轮也说**——那恰恰是最该被看见的一条，此前它和成功的那轮长得一模一样。
+  只有这四种事件（`consulted`/`probed`/`applied`/`rejected`）会这样，心跳不会：对话不是日志。
+- **决策一被提出就广播**，而不是只广播答案。于是折叠行出现 `待决策 1`、`serve` 实时页同步、
+  `events.jsonl` 里也留下"何时问的人"。此前走 TUI 这条路时，等人的那整段窗口里没有任何记录。
+- 模型的提示词、工具调用、流式回复和思维链仍在运行块里（`Enter`/`F2` 展开），那里是全文。
+
 ### 3.3 配置
 
 `/config` 列出已设的项与它们的来源（default / 某个 TOML / session），
@@ -311,7 +334,7 @@ TOML 里改，而不是假装能改。
 | `/skip <producer>` | 跳过某个 producer 尚未开始的单元 |
 | `/jobs 4` | 调整 LLM 并发 |
 | `/retry` | 把未得到模型回答的单元作为新一轮重扫 |
-| `/decide` | 查看待决策的构建上下文补丁 |
+| `/decide` | 把待决策的构建上下文补丁**重新完整陈述**一遍（逐项的勾选状态、evidence、探针结果）；`/decide 全部` 直接作答 |
 | `Ctrl+C` | 放弃正在进行的理解 → 取消正在跑的操作 → 回答待答问题 → 退出（按此顺序） |
 | `Esc` | 回到输入框；输入框为空时清空排队 |
 | `F2` | 展开 / 折叠最后一个运行块 |
@@ -558,6 +581,8 @@ code-analyzer analyze ./project \
    只有 y/n 两种，于是「默认不勾选」的桩头文件在唯一称自己为复选框的前端里根本选不中，
    而一棵没有工具链的树（TF-M：1588 个 Splint 单元里 1465 个死在 `psa/crypto.h` 之类
    的头文件上）恰恰只能靠它们过预处理。
+   对话框滚上去了也不要紧：`/decide` 会把它原样重述一遍（读的是同一个问题块，不是另写一份），
+   `/decide 全部` 则一步作答。状态栏在有待答问题时一直显示「等你回答上面的问题」。
 6. **重跑**：只重跑失败单元，作为 attempt 2 写进**新的**单元目录；原尝试保留并标记
    `superseded_by`，审查表中对应行的 `evidence_context` 带 `/superseded` 后缀，
    dashboard 可按"已被替代的尝试"过滤。

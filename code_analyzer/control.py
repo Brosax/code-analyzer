@@ -277,17 +277,23 @@ class RunControl:
 
     def request_decision(self, request: DecisionRequest, timeout: float | None = None) -> Decision:
         """Block the caller until someone decides, the timeout passes, or the run is cancelled."""
+        # Announced before anyone is asked, on both paths.  The decider path
+        # used to announce only the answer, so for the whole time a person was
+        # being waited on -- which is unbounded, `approval_timeout_seconds`
+        # defaults to 0 -- nothing said a decision was outstanding: not
+        # `RunFlow.pending_decisions`, not the live page, not events.jsonl.
+        # The run looked identical to one that was simply busy.
+        self._announce(
+            "decision", "requested", f"decision requested: {request.summary}",
+            id=request.id, kind=request.kind, round=request.round, items=len(request.items),
+            probe=request.probe, evidence=request.evidence_path,
+        )
         if self._decider is not None:
             decision = self._decider(request)
             self._announce_decision(request, decision)
             return decision
         with self._condition:
             self._pending[request.id] = _Pending(request)
-        self._announce(
-            "decision", "requested", f"decision requested: {request.summary}",
-            id=request.id, kind=request.kind, round=request.round, items=len(request.items),
-            probe=request.probe, evidence=request.evidence_path,
-        )
         deadline = time.monotonic() + timeout if timeout else None
         with self._condition:
             while True:
