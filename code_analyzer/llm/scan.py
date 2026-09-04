@@ -1034,6 +1034,17 @@ class _Phase:
             # object; the first character of the reply has to be the brace.
             "Your reply must begin with `{` -- no analysis, heading or fence before it.",
             "Put any rationale inside each finding's description field, not outside the object.",
+            # A scanner may read; a scanner that only reads reports nothing.
+            # The step ceiling ends the session where it stands, and a session
+            # ended there has produced no findings at all -- measured on TF-M,
+            # three units were lost that way, each after spending its whole
+            # budget on the filesystem.  So the number is said out loud, and so
+            # is what running out of it costs.
+            "",
+            f"You may call tools at most {max(1, int(self.settings.get('max_steps') or 1))} times, "
+            "and running out is a failure: the session ends where it stands and reports nothing. "
+            "The unit's own source is already in this prompt -- read only what you cannot "
+            "answer without, and answer before the budget is gone.",
         ])}
 
     def _forward(self, producer: str, unit_id: str) -> Callable[[dict[str, Any]], None]:

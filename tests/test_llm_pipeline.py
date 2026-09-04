@@ -879,3 +879,30 @@ def test_the_llm_phase_publishes_a_running_placeholder_that_never_survives_the_r
     assert started["endpoint"] == closed_endpoint and started["planned_units"] == 0
     assert result.manifest["llm"]["status"] == "completed"
     assert "running" not in json.dumps(result.manifest["llm"])
+
+
+def test_a_scanner_is_told_its_tool_budget_and_what_running_out_costs(tmp_path: Path) -> None:
+    """A scanner may read; a scanner that only reads reports nothing.
+
+    The step ceiling ends the session where it stands, so a unit spent entirely
+    on the filesystem yields no findings at all -- measured on TF-M, three
+    units were lost that way. The number the runtime enforces is therefore in
+    the prompt, with what exhausting it costs.
+    """
+    from types import SimpleNamespace
+
+    from code_analyzer.llm.scan import _Phase
+
+    scan = _Phase.__new__(_Phase)
+    scan.settings = {"max_steps": 4}
+    scan.skills = {"llm-security": SimpleNamespace(
+        name="llm-security", skill_version="1.0.0", description="security defects",
+        body="# Security scanner\n\nReview one unit.")}
+
+    text = scan._directive("llm-security", {"unit_id": "u1"})["text"]
+    assert "at most 4 times" in text
+    assert "running out is a failure" in text
+    assert "reports nothing" in text
+
+    scan.settings = {"max_steps": 12}
+    assert "at most 12 times" in scan._directive("llm-security", {"unit_id": "u1"})["text"]
