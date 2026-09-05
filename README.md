@@ -181,8 +181,9 @@ code-analyzer tools-resume /path/to/report-directory --tool splint  # finish a r
 Without a compile database Splint tends to die at the first `#include`. The
 run ends its static lane with a build-context loop: it aggregates the failed
 units' diagnosis, infers only what the tree proves (include roots, per-subtree
-overrides, typed Splint options, optional empty stub headers that are never
-pre-ticked), asks the configured LLM endpoint to fill in what only reading the
+overrides, typed Splint options, the host's architecture macro when glibc's
+`gnu/stubs.h` reached for a branch that is not installed, optional empty stub
+headers that are never pre-ticked), asks the configured LLM endpoint to fill in what only reading the
 tree can tell (a board, a define, which headers are external — every item
 validated like hand-written TOML), tries the patch on a sample of failed
 units, and puts the result to the operator: a checkbox dialog in the TUI, a

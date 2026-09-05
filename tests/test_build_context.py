@@ -79,6 +79,30 @@ def test_inference_proves_include_roots_resolves_ambiguity_per_tree_and_never_pr
     assert all(item.origin == "deterministic" and item.evidence for item in patch.items)
 
 
+def test_glibc_arch_dispatch_becomes_the_host_define_and_not_a_stub(tmp_path: Path) -> None:
+    """Splint predefines no architecture macro, so glibc's ``gnu/stubs.h`` reaches
+    for the 32-bit list on a 64-bit host.  On the Juliet subset this killed all
+    10 units, and the only offer was an unticked stub of a glibc-internal header.
+    The host proves the macro; the define is pre-ticked, the stub is not offered."""
+    record = {"units": [
+        _unit("u1", "bl1/main.c", ["gnu/stubs-32.h"]),
+        _unit("u2", "bl1/lib/image.c", ["gnu/stubs-32.h", "vendor_sdk.h"]),
+    ]}
+    patch = infer_patch(diagnose_units(record, INVENTORY), _config(tmp_path), source=tmp_path, machine="x86_64")
+    ops = [(item.op, item.value, item.preselected) for item in patch.items]
+    assert ops == [("add_define", "__x86_64__", True), ("add_stub_header", "vendor_sdk.h", False)]
+    define = patch.items[0]
+    assert define.units_affected == 2 and "gnu/stubs-32.h" in define.evidence and "x86_64" in define.evidence
+    # Already in the configuration: nothing to propose, and still no stub for the dispatch.
+    again = infer_patch(diagnose_units(record, INVENTORY), _config(tmp_path, define=["__x86_64__"]), source=tmp_path, machine="x86_64")
+    assert [(item.op, item.value) for item in again.items] == [("add_stub_header", "vendor_sdk.h")]
+    # A host the table does not know: the header stays external and may be stubbed, unticked.
+    unknown = infer_patch(diagnose_units(record, INVENTORY), _config(tmp_path), source=tmp_path, machine="riscv64")
+    assert [(item.op, item.value, item.preselected) for item in unknown.items] == [
+        ("add_stub_header", "gnu/stubs-32.h", False), ("add_stub_header", "vendor_sdk.h", False),
+    ]
+
+
 def test_inference_skips_roots_already_configured_and_stubs_when_disallowed(tmp_path: Path) -> None:
     config = _config(tmp_path, include=[str(tmp_path / "include")], stub_headers=False)
     patch = infer_patch(diagnose_units(RECORD, INVENTORY), config, source=tmp_path)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import platform
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -52,6 +53,28 @@ MAX_STUBS = 16
 MAX_FILES_PER_HEADER = 200
 _DEFINE = re.compile(r"^[A-Za-z_]\w*(\([A-Za-z_,\s]*\))?(=.{0,200})?$")
 _ORIGINS = ("deterministic", "llm", "operator")
+# glibc's ``gnu/stubs.h`` includes one architecture's list of unimplemented
+# calls, chosen by the compiler's own predefined macro.  Splint's preprocessor
+# predefines none of them, so on a 64-bit host it reaches for the 32-bit list,
+# which is not installed, and every unit that includes any libc header dies at
+# ``features.h``.  The host proves the macro: the missing name says glibc's
+# dispatch was reached, the machine says which branch is installed.
+_GLIBC_STUBS = re.compile(r"^gnu/stubs-[\w-]+\.h$")
+_HOST_ARCH_DEFINE: dict[str, str] = {
+    "x86_64": "__x86_64__", "amd64": "__x86_64__",
+    "aarch64": "__LP64__", "arm64": "__LP64__",
+}
+
+
+def host_arch_define(header: str, machine: str | None = None) -> str | None:
+    """The macro glibc's dispatch header needs, when ``header`` is the branch it reached for on this host.
+
+    ``None`` for any other header, and for a host this table does not know:
+    then the header stays what it was, external, and may be stubbed.
+    """
+    if not _GLIBC_STUBS.match(header):
+        return None
+    return _HOST_ARCH_DEFINE.get((machine or platform.machine()).lower())
 EVIDENCE_DIR = ("inputs", "build-context")
 AUTHORITY = "non-authoritative-configuration-proposal"
 
@@ -247,6 +270,7 @@ def diagnose_units(record: Mapping[str, Any], inventory: Sequence[Mapping[str, A
 
 def infer_patch(
     diagnosis: BuildDiagnosis, config: Mapping[str, Any], *, source: Path, round: int = 1,
+    machine: str | None = None,
 ) -> ConfigPatch:
     """The patch code can stand behind: include roots the tree proves, nothing guessed.
 
@@ -254,12 +278,16 @@ def infer_patch(
     directory, ranked by units); an ambiguous header is resolved per TU
     group by the candidate nearest to the failing file (an override); when
     reserved-name noise is the only failure class the Splint switch is
-    offered; a header the tree does not carry becomes a stub only when the
-    configuration allows stubs, and it is never pre-ticked.  ``#error``
-    directives are reported, never turned into a define: a macro's value is
-    the operator's knowledge.
+    offered; glibc's architecture dispatch missing its branch becomes the
+    host's architecture macro (the one fact the host proves, so it is
+    pre-ticked); any other header the tree does not carry becomes a stub
+    only when the configuration allows stubs, and it is never pre-ticked.
+    ``#error`` directives are reported, never turned into a define: a
+    macro's value is the operator's knowledge.  ``machine`` is the host
+    architecture, ``platform.machine()`` unless a test says otherwise.
     """
     build = config["build"]
+    machine = machine or platform.machine()
     known = {str(Path(item).resolve()) for item in list(build.get("include") or []) + list(build.get("system_include") or [])}
     items: list[PatchItem] = []
     roots: dict[str, dict[str, Any]] = {}
@@ -308,8 +336,25 @@ def infer_patch(
             "set_splint_option", ("report_reserved_names", False), "deterministic",
             f"{diagnosis.reserved_name_warnings} reserved-name warning(s) are the only failure class", 0,
         ))
+    defined = {str(item).split("=", 1)[0] for item in build.get("define") or []}
+    dispatched: set[str] = set()
+    for header in diagnosis.missing_headers:
+        macro = host_arch_define(header.name, machine) if header.kind == "external" else None
+        if macro is None:
+            continue
+        dispatched.add(header.name)
+        if macro in defined:
+            continue
+        defined.add(macro)
+        items.append(PatchItem(
+            "add_define", macro, "deterministic",
+            f"{header.units} unit(s): glibc's gnu/stubs.h reached for {header.name} because nothing defines {macro}; this host is {machine}",
+            header.units,
+        ))
     if build.get("stub_headers", True):
         for header in diagnosis.missing_headers:
+            if header.name in dispatched:
+                continue
             if header.kind == "external" and len([item for item in items if item.op == "add_stub_header"]) < MAX_STUBS:
                 items.append(PatchItem(
                     "add_stub_header", header.name, "deterministic",

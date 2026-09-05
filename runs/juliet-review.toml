@@ -1,0 +1,85 @@
+# Juliet CWE subset: the short example.  Twelve files, four CWE groups, every
+# testcase carrying a `bad` and a `good` function -- so the run has ground
+# truth, and the whole pipeline (static, build-context patch, LLM, validation,
+# summary) fits in well under an hour instead of TF-M's eight.
+config_schema_version = 2
+
+[run]
+output_root = "/home/ubuntu/workspace/code-analyzer/code-analyzer-reports"
+profile = "exhaustive"
+shareable_export = true
+log_level = "info"
+
+[source]
+follow_symlinks = false
+respect_gitignore = false
+
+[build]
+compile_database_mode = "auto"
+# What the loop has to find on this tree: `-I testcasesupport` (the tree
+# proves it) and `-D __x86_64__` (the host proves it: Splint predefines no
+# architecture macro, so glibc's gnu/stubs.h reaches for the 32-bit list that
+# is not installed).  Both are pre-ticked, so a headless run applies them.
+assist = "propose"
+assist_rounds = 2
+assist_probe_units = 12
+stub_headers = true
+approval_timeout_seconds = 0
+
+[review]
+enabled = true
+fail_on = "none"
+gate_includes_llm = false
+
+[tools.splint]
+scope = "auto"
+jobs = 4
+tu_timeout_seconds = 60
+total_timeout_seconds = 1800
+heartbeat_seconds = 10
+
+[llm]
+enabled = true
+profile = "gpu-host"
+# The three scanners the four CWE groups are about: 121 and 476 are memory
+# safety, 401 is a resource error, 457 is undefined behaviour.  Six scanners
+# over the whole tree was 798 sessions, three hours by llm-doctor's estimate;
+# this is 129, so the run is an example, not an afternoon.
+scanners = [
+  "llm-memory-safety",
+  "llm-undefined-behavior",
+  "llm-resource-error",
+]
+# Same host measurements as runs/tfm-review.toml: prompt evaluation is the
+# whole cost, eight concurrent buys a third more throughput than four.
+jobs = 8
+context_window = 24576
+reasoning = "off"
+intent_reasoning = "low"
+max_completion_tokens = 2000
+request_timeout_seconds = 600.0
+# Generous: the tree is small enough that the wall clock is not the bound,
+# and a deadline that bit first would hide a slow unit instead of showing it.
+total_timeout_seconds = 3600.0
+total_prompt_tokens = 2000000
+total_completion_tokens = 200000
+cache = true
+# The plan is the 43 testcase functions (bad, good, goodG2B, goodB2G, main):
+# the index ranks every testcase function medium and every module-scope
+# segment low, and testcasesupport/io.c is Juliet's printing helpers, which
+# carry no CWE.  Declared rather than filtered: the manifest still says what
+# the run did not reach.
+risk_overrides = ["testcasesupport/**=low"]
+risk_profile = "auto"
+min_tier = "medium"
+heartbeat_seconds = 15.0
+consecutive_failure_limit = 8
+export_sessions = false
+
+[audit]
+enabled = true
+# A validation is a tool-using session of two to eight minutes on this host
+# (measured on the TF-M run, sequential).  Twenty is an hour at most, and the
+# subset has nine defective testcases: enough to see the validator earn or
+# lose its keep on known answers.
+validation_max_candidates = 20
