@@ -433,12 +433,31 @@ def _apply(
 
 
 def _tasks(units: list[dict[str, Any]], scanners: list[str]) -> list[Task]:
-    """Dispatch order: highest risk first, so a short budget buys the most."""
+    """Dispatch order: highest risk first, and within a tier one scanner at a time.
+
+    The tier order is what makes a short budget buy the most.  The scanner
+    order inside a tier is what makes the provider fast: every session of one
+    scanner opens with the same skill text (``_directive``), and the server
+    reuses the cached prefix -- measured on the gpu-host, a request that
+    shares its first 4 200 tokens with the previous one costs 4 s instead of
+    21 s.  Interleaving the scanners per unit, the previous order, threw that
+    away on almost every request: the Juliet subset ran at 0.7 sessions a
+    minute, eight at a time.  Within a tier every unit ranks the same, so
+    nothing riskier waits for this.
+    """
     ordered = sorted(
         units,
         key=lambda unit: (tier_rank(unit["risk_tier"]), unit["path"], unit["start_byte"], unit["unit_id"]),
     )
-    pairs = [(producer, unit) for unit in ordered for producer in scanners]
+    tiers: dict[int, list[dict[str, Any]]] = {}
+    for unit in ordered:
+        tiers.setdefault(tier_rank(unit["risk_tier"]), []).append(unit)
+    pairs = [
+        (producer, unit)
+        for _rank, members in sorted(tiers.items())
+        for producer in scanners
+        for unit in members
+    ]
     return [(index, producer, unit) for index, (producer, unit) in enumerate(pairs, 1)]
 
 

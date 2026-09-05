@@ -440,6 +440,27 @@ run_dir=$(code-analyzer analyze ./project)
 echo "报告目录：$run_dir"
 ```
 
+### 4.1 跑几个小时的扫描要脱离终端会话
+
+从一个交互会话里用 `nohup … &` 甚至 `setsid` 起的长扫描，会随会话一起消失（2026-09-04
+的 TF-M 全量审查在 480 分钟里的第 423 分钟就是这样没的）。交给一个不属于会话的监督者：
+
+```bash
+UNIT=code-analyzer-$(date -u +%Y%m%dT%H%M%SZ)
+systemd-run --user --unit=$UNIT --working-directory="$PWD" \
+  --setenv=PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  -p StandardOutput=append:$HOME/.code-analyzer/launch/$UNIT.log \
+  -p StandardError=append:$HOME/.code-analyzer/launch/$UNIT.log \
+  "$PWD/.venv/bin/code-analyzer" analyze /path/to/project --config runs/juliet-review.toml --build-assist-yes
+systemctl --user status $UNIT        # 还在跑吗
+systemctl --user stop $UNIT          # 停：SIGTERM 走 Ctrl+C 的路，manifest 记 interrupted
+```
+
+报告目录才是检查点：被杀的运行只损失最后一个单元之后的壁钟，`recover-report` 从原生证据
+重建派生产物，`llm-resume` 接着扫没调度到的单元。`runs/` 下放着两份现成配置：
+`runs/juliet-review.toml`（12 个文件、四类 CWE、有 bad/good 标准答案的短示例）和
+`runs/tfm-review.toml`（TF-M 全量、8 小时）。
+
 ## 5. Compile database
 
 自动模式会在以下有界位置查找并校验 `compile_commands.json`，不会跟随符号
@@ -568,8 +589,17 @@ code-analyzer analyze ./project \
 1. **诊断**：汇总失败单元记录下的原因——缺哪些头文件、哪些 `#error`、几处解析错误。
 2. **推断**（确定性代码）：只提出树能证明的东西——唯一地携带某个缺失头文件的目录成为
    `-I`；同名头文件出现在多个板级目录时，按失败文件所在子树给出 `[[build.overrides]]`；
-   保留名警告是唯一失败原因时提出 `report_reserved_names = false`；树里根本没有的头文件
+   保留名警告是唯一失败原因时提出 `report_reserved_names = false`；缺的是 glibc 的
+   `gnu/stubs-32.h` 时提出 `-D __x86_64__`（预选）；树里根本没有的其他头文件
    可以生成**空的桩头文件**（默认不勾选，永远由代码生成、放在报告目录内、排在 `-I` 最后）。
+
+   **`gnu/stubs-32.h` 这一条是主机证明的，不是猜的。** Splint 自带的预处理器不预定义任何
+   架构宏，于是 glibc 的 `gnu/stubs.h` 在 64 位主机上去找 32 位那份清单，而它没有安装——
+   任何 `#include <stdio.h>` 的单元都死在 `features.h`。Juliet 子集 2026-09-04 那次就是
+   10/10 单元全死于此，而对话框里唯一的选项是一个不勾选的桩头文件。缺失的名字说明 glibc
+   走到了这一分支，`platform.machine()` 说明装的是哪一份：`-D __x86_64__` 让 glibc 选中真
+   实存在的 `stubs-64.h`，比用空文件把分支藏起来诚实。表里没有的主机架构仍按外部头文件
+   处理（可桩、不预选）。
 3. **咨询模型**（8.2 节）：只要 `[llm]` 端点可达就会问一次，与 `llm.enabled` 无关。
 4. **探针**：先在 ≤ `assist_probe_units`（默认 12）个失败单元上试跑补丁，报告有几个
    现在能到达 `Finished checking`。
@@ -874,6 +904,12 @@ code-analyzer analyze ./project --llm --llm-profile gpu-host
 `total_prompt_tokens` / `total_completion_tokens` 是**单个 scanner** 的基数，未显式设置
 时按启用 scanner 数线性放大；显式设置则原样使用。
 
+**调度顺序：先按风险层，层内按扫描器分组。** 每个扫描器的每次会话都以同一段技能文本
+开头，Ollama 会复用这段共同前缀的 KV cache——在 gpu-host 上实测，与上一请求共享前
+4 200 个 token 的请求耗时 4s，不共享的 21s。2026-09-05 之前的顺序是逐单元轮换全部扫描
+器，几乎每次请求都打散缓存：Juliet 子集 8 并发只有每分钟 0.7 次会话。同一层内所有单元
+排名相同，所以分组不让任何更高风险的单元多等。
+
 ### 12.3 续扫与验证
 
 运行**中**，TUI 的 `r` 键（或 `serve` 页面的"重试 LLM"）把未得到模型回答的单元——
@@ -929,7 +965,7 @@ gate_includes_llm = true
 | `10` | 至少有一个有效报告，但某些工具、子单元、源码稳定性或导出有问题 |
 | `20` | 没有请求且适用的工具产生有效报告 |
 | `2` | CLI、配置、输入、compile database 或输出路径错误 |
-| `130` | 用户中断 |
+| `130` | 用户中断：`Ctrl+C`，或监督进程发来的 `SIGTERM`（`systemctl stop`、`tmux kill-pane`）——两者走同一条路，manifest 记为 `interrupted`，各条通道都有交代 |
 
 默认 `--fail-on none`，findings 不影响退出码。只有运行原本完整时才应用显式
 severity gate；错误优先级为 `130 > 2 > 20 > 10 > 1 > 0`。可用

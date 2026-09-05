@@ -906,3 +906,21 @@ def test_a_scanner_is_told_its_tool_budget_and_what_running_out_costs(tmp_path: 
 
     scan.settings = {"max_steps": 12}
     assert "at most 12 times" in scan._directive("llm-security", {"unit_id": "u1"})["text"]
+
+
+
+def test_dispatch_is_riskiest_first_and_one_scanner_at_a_time_within_a_tier() -> None:
+    """Every session of a scanner opens with the same skill text, and the
+    provider caches that prefix (measured: 4 s instead of 21 s a request).
+    Interleaving scanners per unit threw the cache away; grouping by scanner
+    inside a tier keeps it, and keeps the riskier tier ahead of the safer one."""
+    from code_analyzer.llm.scan import _tasks
+
+    def unit(unit_id: str, tier: str, path: str = "x.c") -> dict:
+        return {"unit_id": unit_id, "path": path, "start_byte": 0, "risk_tier": tier}
+
+    tasks = _tasks([unit("low1", "low"), unit("crit2", "critical", "b.c"), unit("crit1", "critical", "a.c")], ["s1", "s2"])
+    assert [(producer, item["unit_id"]) for _index, producer, item in tasks] == [
+        ("s1", "crit1"), ("s1", "crit2"), ("s2", "crit1"), ("s2", "crit2"), ("s1", "low1"), ("s2", "low1"),
+    ]
+    assert [index for index, _p, _u in tasks] == [1, 2, 3, 4, 5, 6]
