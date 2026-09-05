@@ -141,8 +141,13 @@ def discover(
     follow = config["source"]["follow_symlinks"]
     custom_excludes = list(config["source"]["exclude"])
     custom_includes = list(config["source"]["include"])
+    respect_gitignore = bool(config["source"]["respect_gitignore"])
     anomalies: list[ScopeAnomaly] = []
-    gitignore = _gitignore_patterns(source, anomalies) if config["source"]["respect_gitignore"] else []
+    # One entry per visited directory: the rules in force there, ancestors
+    # first.  os.walk is top-down, so a directory's parent is always already
+    # in the map, and a directory with no rules of its own shares its parent's
+    # tuple rather than copying it.
+    rules_by_directory: dict[str, tuple[_IgnoreRule, ...]] = {}
     dynamic: Path | None = None
     try:
         dynamic = output_root.resolve().relative_to(source.resolve())
@@ -158,12 +163,19 @@ def discover(
             raise InterruptedError("run interrupted")
         root_path = Path(root)
         rel_root = root_path.relative_to(source)
+        here = "" if rel_root == Path(".") else rel_root.as_posix()
+        rules: tuple[_IgnoreRule, ...] = ()
+        if respect_gitignore:
+            inherited = rules_by_directory.get(here.rpartition("/")[0], ()) if here else ()
+            own = _ignore_rules(root_path / ".gitignore", here, anomalies)
+            rules = (*inherited, *own) if own else inherited
+            rules_by_directory[here] = rules
         kept = []
         for dirname in dirs:
             rel = (rel_root / dirname).as_posix()
             excluded = dirname in DEFAULT_DIRS or dirname.startswith("cmake-build-")
             excluded |= dynamic is not None and (Path(rel) == dynamic or dynamic in Path(rel).parents)
-            excluded |= _matches(rel, custom_excludes) or _gitignored(rel + "/", gitignore)
+            excluded |= _matches(rel, custom_excludes) or _gitignored(rel, rules, directory=True)
             child = root_path / dirname
             try:
                 excluded |= child.is_symlink() and not follow
@@ -182,7 +194,7 @@ def discover(
             path = root_path / filename
             rel = path.relative_to(source).as_posix()
             included = "**/*" in custom_includes or not custom_includes or _matches(rel, custom_includes)
-            if path.suffix not in EXTENSIONS or not included or _matches(rel, custom_excludes) or _gitignored(rel, gitignore):
+            if path.suffix not in EXTENSIONS or not included or _matches(rel, custom_excludes) or _gitignored(rel, rules, directory=False):
                 continue
             try:
                 symlink = path.is_symlink()
@@ -252,44 +264,175 @@ def _matches(relative: str, patterns: list[str]) -> bool:
     )
 
 
-def _gitignore_patterns(source: Path, anomalies: list[ScopeAnomaly]) -> list[str]:
-    path = source / ".gitignore"
+@dataclass(frozen=True)
+class _IgnoreRule:
+    """One .gitignore line, bound to the directory whose file it was read in.
+
+    Git resolves a path against the rules of every directory from the
+    repository root down to the one holding it, with the deeper file winning
+    and, within one file, the last matching line winning.  ``base`` is what
+    makes that possible: a rule from ``vendor/.gitignore`` applies only under
+    ``vendor/`` and matches relative to it, which is why a single flat list of
+    root patterns was never able to express a nested ignore file.
+    """
+
+    base: str
+    negate: bool
+    directory_only: bool
+    regex: re.Pattern[str]
+
+    def matches(self, relative: str, *, directory: bool) -> bool:
+        if self.directory_only and not directory:
+            return False
+        if self.base:
+            if not relative.startswith(self.base + "/"):
+                return False
+            relative = relative[len(self.base) + 1:]
+        return self.regex.fullmatch(relative) is not None
+
+
+def _ignore_rules(path: Path, base: str, anomalies: list[ScopeAnomaly]) -> tuple[_IgnoreRule, ...]:
+    """Compile one .gitignore file, or record why its rules are unknown.
+
+    Only ``.gitignore`` files inside the scanned tree are read.  Git's other
+    rule sources -- ``.git/info/exclude``, ``core.excludesFile``, the skip-worktree
+    bits in the index -- are deliberately not consulted: they live outside the
+    tree being analysed, so honouring them would make the same source produce
+    different scopes on two machines.
+    """
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
+        return ()
     except (OSError, UnicodeError) as exc:
         # An unreadable rule file leaves the scope undecidable rather than
         # empty: without it we cannot say which paths Git would have hidden.
-        anomalies.append(_anomaly(".gitignore", IGNORE_RULES, exc))
-        return []
-    return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        anomalies.append(_anomaly(f"{base}/.gitignore" if base else ".gitignore", IGNORE_RULES, exc))
+        return ()
+    compiled = (_compile_ignore(line, base) for line in text.splitlines())
+    return tuple(rule for rule in compiled if rule is not None)
 
 
-def _gitignored(relative: str, patterns: list[str]) -> bool:
+def _gitignored(relative: str, rules: tuple[_IgnoreRule, ...], *, directory: bool) -> bool:
+    """Whether Git would ignore ``relative``; the last matching rule decides.
+
+    Directories are pruned by the walk when this says yes, which is also how
+    Git behaves: a file whose parent directory is excluded cannot be brought
+    back by a negation on the file itself, because Git never descends far
+    enough to read one.
+    """
     ignored = False
-    relative = relative.rstrip("/")
-    path = Path(relative)
-    for raw in patterns:
-        negate = raw.startswith("!")
-        pattern = raw[1:] if negate else raw
-        directory_only = pattern.endswith("/")
-        pattern = pattern.rstrip("/")
-        anchored = pattern.startswith("/")
-        pattern = pattern.lstrip("/")
-        if not pattern:
-            continue
-        if "/" not in pattern:
-            matched = pattern in path.parts or path.match(pattern)
-        elif anchored:
-            matched = relative == pattern or relative.startswith(pattern + "/") or path.match(pattern)
-        else:
-            matched = path.match(pattern) or path.match("**/" + pattern) or relative.startswith(pattern + "/")
-        if directory_only:
-            matched |= any(Path(*path.parts[:index]).as_posix() == pattern for index in range(1, len(path.parts) + 1))
-        if matched:
-            ignored = not negate
+    for rule in rules:
+        if rule.matches(relative, directory=directory):
+            ignored = not rule.negate
     return ignored
+
+
+def _compile_ignore(line: str, base: str) -> _IgnoreRule | None:
+    """One raw line as a rule, or None when it is a comment or blank."""
+    pattern = _without_trailing_spaces(line)
+    if not pattern or pattern.startswith("#"):
+        return None
+    negate = pattern.startswith("!")
+    if negate:
+        pattern = pattern[1:]
+    elif pattern[:1] == "\\" and pattern[1:2] in {"#", "!"}:
+        pattern = pattern[1:]
+    directory_only = pattern.endswith("/") and not _escaped_at(pattern, len(pattern) - 1)
+    if directory_only:
+        pattern = pattern.rstrip("/")
+    # A separator anywhere but the end anchors the pattern to ``base``; without
+    # one it is a name matched at any depth below it.
+    anchored = "/" in pattern
+    pattern = pattern.lstrip("/")
+    if not pattern:
+        return None
+    body = _ignore_regex(pattern)
+    try:
+        regex = re.compile(("" if anchored else "(?:.+/)?") + body)
+    except re.error:
+        regex = re.compile(("" if anchored else "(?:.+/)?") + re.escape(pattern))
+    return _IgnoreRule(base, negate, directory_only, regex)
+
+
+def _ignore_regex(pattern: str) -> str:
+    """Git's glob for a whole path: ``**`` spans directories, ``*`` does not."""
+    segments = pattern.split("/")
+    parts: list[str] = []
+    separator = False
+    for index, segment in enumerate(segments):
+        if segment == "**":
+            if index == len(segments) - 1:
+                # A trailing ``/**`` matches everything inside, not the
+                # directory itself.
+                parts.append("/.+" if separator else ".+")
+            else:
+                # ``**/`` in front, or ``a/**/b`` in the middle: zero or more
+                # directories, so ``a/**/b`` still matches ``a/b``.
+                parts.append("/(?:.+/)?" if separator else "(?:.+/)?")
+            separator = False
+            continue
+        piece = _segment_regex(segment)
+        parts.append("/" + piece if separator else piece)
+        separator = True
+    return "".join(parts)
+
+
+def _segment_regex(segment: str) -> str:
+    """One path segment's glob; nothing here may match a separator."""
+    out: list[str] = []
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if char == "\\" and index + 1 < len(segment):
+            out.append(re.escape(segment[index + 1]))
+            index += 2
+            continue
+        if char == "*":
+            while index + 1 < len(segment) and segment[index + 1] == "*":
+                index += 1
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "[":
+            end = _class_end(segment, index)
+            if end is None:
+                out.append(re.escape(char))
+            else:
+                body = segment[index + 1:end]
+                out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
+                index = end
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+def _class_end(segment: str, start: int) -> int | None:
+    """Index of the ``]`` closing a bracket expression opened at ``start``."""
+    index = start + 1
+    if index < len(segment) and segment[index] in {"!", "^"}:
+        index += 1
+    if index < len(segment) and segment[index] == "]":
+        index += 1
+    while index < len(segment) and segment[index] != "]":
+        index += 2 if segment[index] == "\\" else 1
+    return index if index < len(segment) else None
+
+
+def _without_trailing_spaces(line: str) -> str:
+    """Git drops trailing spaces unless a backslash quotes them."""
+    index = len(line)
+    while index > 0 and line[index - 1] == " " and not _escaped_at(line, index - 1):
+        index -= 1
+    return line[:index]
+
+
+def _escaped_at(value: str, index: int) -> bool:
+    backslashes = 0
+    while index - backslashes > 0 and value[index - backslashes - 1] == "\\":
+        backslashes += 1
+    return backslashes % 2 == 1
 
 
 def git_state(source: Path) -> dict[str, Any]:

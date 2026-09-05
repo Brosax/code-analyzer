@@ -199,7 +199,7 @@ FIELD_REGISTRY: tuple[FieldSpec, ...] = (
     FieldSpec("source.include", "list", "包含规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.exclude", "list", "排除规则", "源码相对路径 glob 列表。"),
     FieldSpec("source.follow_symlinks", "bool", "跟随符号链接", "扫描符号链接指向的文件。", advanced=True),
-    FieldSpec("source.respect_gitignore", "bool", "遵循 .gitignore", "从源码范围中排除 Git 忽略项。"),
+    FieldSpec("source.respect_gitignore", "bool", "遵循 .gitignore", "按 Git 的规则排除被忽略的项：读取源码树内每一层 .gitignore，深层文件覆盖浅层，同一文件内最后匹配的规则生效；不读取 .git/info/exclude 与全局 core.excludesFile。exclude、默认排除目录与报告输出目录的优先级更高。"),
     FieldSpec("source.hash_algorithm", "string", "哈希算法", "固定为 sha256。", choices=("sha256",), readonly=True),
     FieldSpec("build.compile_database_mode", "choice", "Compile DB 模式", "自动发现、显式路径或禁用。", choices=("auto", "explicit", "disabled")),
     FieldSpec("build.compile_database", "optional_path", "Compile DB 路径", "compile_commands.json 的显式路径。"),
