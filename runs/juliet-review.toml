@@ -11,6 +11,18 @@ shareable_export = true
 log_level = "info"
 
 [source]
+# The quick example: three defective testcases, one per scanner --
+# CWE121 (stack overflow -> memory-safety), CWE401 (leak -> resource-error),
+# CWE457 (uninitialised -> undefined-behavior) -- plus the support headers so
+# the build-context loop proves `-I testcasesupport` instead of stubbing it.
+# testcasesupport/io.c is left out: it is Juliet's printing helpers, no CWE,
+# and 45 of the subset's 133 units.  Delete this `include` to scan all 12.
+include = [
+  "testcases/CWE121_Stack_Based_Buffer_Overflow/s03/CWE121_Stack_Based_Buffer_Overflow__CWE805_char_alloca_memcpy_01.c",
+  "testcases/CWE401_Memory_Leak/s03/CWE401_Memory_Leak__wchar_t_malloc_01.c",
+  "testcases/CWE457_Use_of_Uninitialized_Variable/s01/CWE457_Use_of_Uninitialized_Variable__int_pointer_01.c",
+  "testcasesupport/*.h",
+]
 follow_symlinks = false
 respect_gitignore = false
 
