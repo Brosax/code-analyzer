@@ -267,7 +267,13 @@ timestamps, and exit code, and writes a new timestamped shareable ZIP.
 The command prints the unique private run directory. Exit codes are `0` for a
 complete run, `10` for a partial run with at least one valid native report, `20`
 when no requested/applicable tool produced a valid report, `2` for input or
-configuration errors, and `130` for interruption. Findings do not affect the
+configuration errors, and `130` for interruption. A source file that could not
+be read, a directory that could not be traversed or a `.gitignore` that could
+not be parsed makes the scan scope incomplete, which lowers the run the same
+way -- to `10` while valid reports survive, `20` when none do -- and a
+successful export never lifts it back. Every such gap is recorded per path in
+`inputs/source-inventory.json`, counted in the manifest, and named by the CLI,
+the TUI, the live page and the offline report. Findings do not affect the
 exit code unless an explicit `--fail-on medium|high|critical` gate is used; a
 completed run that hits the gate exits `1`. A missing compile database is
 degraded analysis context, not a failure by itself. Auto mode searches common

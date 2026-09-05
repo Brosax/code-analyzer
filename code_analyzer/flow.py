@@ -198,6 +198,20 @@ def _clean(value: Any) -> str:
     return single_line(str(value))[:MAX_DETAIL]
 
 
+def _scope_gap(scope: dict[str, Any]) -> str:
+    """The discovery row's word for a walk that could not see the whole tree."""
+    parts = [
+        f"{scope.get(key, 0)} {label}"
+        for key, label in (
+            ("unreadable_files", "文件不可读"),
+            ("unreadable_directories", "目录不可进"),
+            ("unreadable_ignore_files", ".gitignore 不可读"),
+        )
+        if scope.get(key)
+    ]
+    return ("范围不完整（" + "，".join(parts) + "）") if parts else "范围不完整"
+
+
 def _count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
@@ -346,6 +360,8 @@ class RunFlow:
                 node.method = "降级上下文"
             return
         self._finish(node, event)
+        scope = data.get("scope") if isinstance(data.get("scope"), dict) else None
+        short = scope is not None and scope.get("complete") is False
         files = _count(data.get("files"))
         if files is not None:
             parts = [f"{files} 文件"]
@@ -354,7 +370,12 @@ class RunFlow:
                 parts.append(f"compile-db {entries} 条")
             elif data.get("compile_db_path") is None:
                 parts.append("无 compile-db")
+            if short:
+                parts.append(_scope_gap(scope or {}))
             node.detail = " · ".join(parts)
+        if short:
+            # The tree was walked but not all of it seen: neither ✓ nor ✕.
+            node.state = node.status = "partial"
 
     def _on_tool(self, event: AnalysisEvent) -> None:
         node = self.nodes.get(str(event.tool or ""))

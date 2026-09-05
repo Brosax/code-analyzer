@@ -804,7 +804,7 @@ exports/<run-id>-shareable.zip
 
 - `index.html`：完整离线仪表盘（检测报告版式，中英文界面可一键切换），首屏
   为判定横幅（运行状态印章、发现总数与严重度构成条、报告完整性、质量门禁、
-  源码稳定性、分析上下文与降级原因），另含执行状态、覆盖率、分析单元完成/
+  源码稳定性、扫描范围、分析上下文与降级原因），另含执行状态、覆盖率、分析单元完成/
   失败/超时分解、findings、diagnostics、评分等级与规范化严重度按证据上下文
   的构成条、文件×严重度矩阵、top rules、CWE、nearby overlap、原生等级列、
   筛选、排序、分页和原始证据链接。评分参考文档的元数据不再在页面显式展示，
@@ -818,6 +818,11 @@ exports/<run-id>-shareable.zip
 - `tools/splint/*/report.csv`：Splint 原始报告。
 - `exports/*.zip`：机器路径、用户名和主机路径脱敏后的共享包。非核心坏报告会
   被安全省略并记录，导出状态为 `partial`。
+- `inputs/source-inventory.json`：本次扫描读到的文件清单，外加两次源码发现
+  各自的异常记录（`discovery` 是分析前那次，`recheck` 是分析后的稳定性复查；
+  运行被中断时 `recheck` 为 `null`）。每条异常有相对路径、操作类型（`read`、
+  `stat`、`walk`、`gitignore`）、错误码和原因。`manifest.json` 的
+  `source_inventory.scope` 只放汇总计数与 `complete` 判定。
 - `inputs/sanitizer-map.private.json`：只在私有目录保存，不进入 ZIP。
 
 共享 ZIP 仍可能包含源码片段和业务内容，分享前需要自行评估。
@@ -979,9 +984,9 @@ gate_includes_llm = true
 
 | 退出码 | 含义 |
 |---:|---|
-| `0` | 所有请求且适用的工具完成，源码稳定，脱敏导出成功或已禁用 |
+| `0` | 所有请求且适用的工具完成，扫描范围完整，源码稳定，脱敏导出成功或已禁用 |
 | `1` | 完整运行命中显式 `--fail-on` severity gate |
-| `10` | 至少有一个有效报告，但某些工具、子单元、源码稳定性或导出有问题 |
+| `10` | 至少有一个有效报告，但某些工具、子单元、扫描范围、源码稳定性或导出有问题 |
 | `20` | 没有请求且适用的工具产生有效报告 |
 | `2` | CLI、配置、输入、compile database 或输出路径错误 |
 | `130` | 用户中断：`Ctrl+C`，或监督进程发来的 `SIGTERM`（`systemctl stop`、`tmux kill-pane`）——两者走同一条路，manifest 记为 `interrupted`，各条通道都有交代 |
@@ -989,3 +994,11 @@ gate_includes_llm = true
 默认 `--fail-on none`，findings 不影响退出码。只有运行原本完整时才应用显式
 severity gate；错误优先级为 `130 > 2 > 20 > 10 > 1 > 0`。可用
 `--no-review` 禁用派生层，或用 `--fail-on medium|high|critical` 启用门禁。
+
+扫描范围也参与判定。源码发现期间读不到某个文件、进不去某个目录，或者读不出
+某个 `.gitignore`，这次扫描就覆盖了源码树中未知的一部分：还有有效报告时是
+`10`，一个有效报告都没有时是 `20`。导出成功不会把它改回 `0`。分析结束后的
+稳定性复查也一样：复查读不到的文件记为"无法验证"，不算作被删除，两次发现都
+漏掉同一个目录时源码稳定性记为未知而不是稳定。异常逐条记录在
+`inputs/source-inventory.json`，CLI、TUI、实时页面和离线报告都会说出同一句
+话；此时报告里的覆盖率分母是"已发现的文件"，不是整棵源码树。

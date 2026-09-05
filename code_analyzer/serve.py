@@ -45,7 +45,10 @@ def graph(manifest: dict[str, Any]) -> dict[str, Any]:
     """The DAG the page draws, derived from the manifest and nothing else."""
     tools = manifest.get("tools") or {}
     scanners = ((manifest.get("llm") or {}).get("scanners")) or {}
-    nodes: list[dict[str, Any]] = [{"id": "discovery", "kind": "phase", "state": _phase_state(manifest, "discovery")}]
+    nodes: list[dict[str, Any]] = [{
+        "id": "discovery", "kind": "phase", "state": _phase_state(manifest, "discovery"),
+        "note": _scope_note(manifest),
+    }]
     producers: list[str] = []
     for name, record in tools.items():
         producers.append(name)
@@ -74,10 +77,33 @@ def _state(status: Any) -> str:
     return NODE_STATES.get(str(status or ""), "pending")
 
 
+def _scope_note(manifest: dict[str, Any]) -> str | None:
+    """What the discovery node says when the walk could not see the whole tree."""
+    scope = (manifest.get("source_inventory") or {}).get("scope")
+    if not isinstance(scope, dict) or scope.get("complete") is not False:
+        return None
+    parts = [
+        f"{scope.get(key, 0)} {label}"
+        for key, label in (
+            ("unreadable_files", "个文件无法读取"),
+            ("unreadable_directories", "个目录无法遍历"),
+            ("unreadable_ignore_files", "个 .gitignore 无法读取"),
+        )
+        if scope.get(key)
+    ]
+    return ("范围不完整：" + "，".join(parts)) if parts else "范围不完整"
+
+
 def _phase_state(manifest: dict[str, Any], phase: str) -> str:
     status = str(manifest.get("status") or "")
     if phase == "discovery":
-        return "success" if manifest.get("source_inventory") else "pending"
+        inventory = manifest.get("source_inventory")
+        if not inventory:
+            return "pending"
+        scope = inventory.get("scope") if isinstance(inventory, dict) else None
+        # A walk that could not read part of the tree is neither a success nor
+        # a failure, and the live page has a word for exactly that.
+        return "partial" if isinstance(scope, dict) and scope.get("complete") is False else "success"
     if phase == "dashboard":
         paths = {item.get("path") for item in manifest.get("artifacts") or []}
         return "success" if "index.html" in paths else ("running" if status == "running" else "pending")
@@ -701,6 +727,7 @@ button[disabled]{opacity:.5;cursor:default}
       box.append(line("span", "", detail));
       if (n.units) box.append(line("span", "", " " + (n.units.completed || 0) + "/" + (n.units.planned || 0) + " units"));
       if (n.findings !== undefined && n.findings !== null) box.append(line("span", "", " · " + n.findings + " findings"));
+      if (n.note) box.append(line("span", "", " · " + n.note));
       root.append(box);
     });
     drawLanes(g.nodes);

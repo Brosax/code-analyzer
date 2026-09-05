@@ -77,7 +77,10 @@ def render(
     data = dict(review or {
         "review_schema_version": 3, "findings": [], "diagnostics": [],
         "tools": manifest.get("tools", {}),
-        "source_manifest": {"total_files": manifest.get("source_inventory", {}).get("total", 0), "files": []},
+        "source_manifest": {
+            "total_files": manifest.get("source_inventory", {}).get("total", 0), "files": [],
+            "scope": manifest.get("source_inventory", {}).get("scope"),
+        },
         "overlap_groups": [], "total_findings": 0, "total_diagnostics": 0,
         "finding_counts": {"total": 0, "build-aware": 0, "source-only": 0},
         "grading_reference": grading_reference(),
@@ -459,9 +462,18 @@ _JS_MAIN = r"""
       meta_analyzer: "分析器版本", meta_finished: "完成时间", meta_duration: "运行时长",
       duration_value: "{m} 分 {s} 秒",
       verdict_status: "运行状态", verdict_integrity: "报告完整性", verdict_gate: "质量门禁",
-      verdict_stable: "源码稳定性", verdict_context: "分析上下文",
+      verdict_stable: "源码稳定性", verdict_context: "分析上下文", verdict_scope: "扫描范围",
       gate_disabled: "未启用", gate_pass: "未触发", gate_fail: "已触发",
-      stable_yes: "扫描期间未变化", stable_no: "扫描期间发生变化",
+      stable_yes: "扫描期间未变化", stable_no: "扫描期间发生变化", stable_unknown: "无法验证",
+      scope_ok: "完整", scope_gap: "不完整", scope_unrecorded: "未记录",
+      scope_notice_head: "已发现 {n} 个源码文件。",
+      scope_gap_files: "{n} 个文件无法读取",
+      scope_gap_dirs: "{n} 个目录无法遍历",
+      scope_gap_rules: "{n} 个 .gitignore 无法读取",
+      scope_dirs_unknown: "这些目录里有多少源文件，本次运行不知道。",
+      scope_notice_tail: "扫描范围不完整；下方所有覆盖率的分母都是已发现的文件，不是整棵源码树。",
+      scope_unreadable_files: "无法读取的文件", scope_unreadable_dirs: "无法遍历的目录",
+      scope_basis: "（基于已发现文件）", scope_detail: "逐条记录见 inputs/source-inventory.json。",
       card_source_files: "源文件", card_context_split: "构建感知 / 仅源码",
       card_mapping_split: "已映射 / 未映射参考等级",
       card_diagnostics: "诊断", card_valid_reports: "有效报告",
@@ -546,9 +558,19 @@ _JS_MAIN = r"""
       meta_analyzer: "Analyzer", meta_finished: "Finished", meta_duration: "Duration",
       duration_value: "{m}m {s}s",
       verdict_status: "Run status", verdict_integrity: "Report integrity", verdict_gate: "Quality gate",
-      verdict_stable: "Source stability", verdict_context: "Analysis context",
+      verdict_stable: "Source stability", verdict_context: "Analysis context", verdict_scope: "Scan scope",
       gate_disabled: "not enabled", gate_pass: "not triggered", gate_fail: "triggered",
       stable_yes: "unchanged during scan", stable_no: "changed during scan",
+      stable_unknown: "could not be verified",
+      scope_ok: "complete", scope_gap: "incomplete", scope_unrecorded: "not recorded",
+      scope_notice_head: "{n} source file(s) discovered.",
+      scope_gap_files: "{n} file(s) could not be read",
+      scope_gap_dirs: "{n} directory/directories could not be traversed",
+      scope_gap_rules: "{n} .gitignore file(s) could not be read",
+      scope_dirs_unknown: "How many source files those directories hold is unknown to this run.",
+      scope_notice_tail: "The scan scope is incomplete; every coverage figure below is relative to the discovered files, not to the whole source tree.",
+      scope_unreadable_files: "Unreadable files", scope_unreadable_dirs: "Untraversable directories",
+      scope_basis: " (of discovered files)", scope_detail: "Per-path records are in inputs/source-inventory.json.",
       card_source_files: "Source files", card_context_split: "Build-aware / source-only",
       card_mapping_split: "Mapped / unmapped reference level",
       card_diagnostics: "Diagnostics", card_valid_reports: "Valid reports",
@@ -635,6 +657,11 @@ _JS_MAIN = r"""
   const fmt = (key, params) => t(key).replace(/\{(\w+)\}/g, (whole, name) =>
     params[name] !== undefined ? String(params[name]) : whole);
   const number = x => new Intl.NumberFormat(lang === "zh" ? "zh-CN" : "en-US").format(Number(x || 0));
+  /* One reading of scan scope for every section: the review's copy, else the
+     manifest's, else null for a report written before it was recorded. */
+  const scope = () => (review.source_manifest || {}).scope
+    || (manifest.source_inventory || {}).scope || null;
+  const scopeShort = () => { const s = scope(); return !!s && s.complete === false; };
 
   /* ---------- shared helpers ---------- */
   const safeHref = path => {
@@ -805,9 +832,15 @@ _JS_MAIN = r"""
     } else {
       item("verdict_gate", chip("tone-muted", t("gate_disabled")));
     }
+    const sc = scope();
+    item("verdict_scope", sc
+      ? chip(sc.complete === false ? "tone-warn" : "tone-ok", t(sc.complete === false ? "scope_gap" : "scope_ok"))
+      : make("span", "muted", t("scope_unrecorded")));
     const stable = (manifest.source_inventory || {}).stable;
     item("verdict_stable", stable === true ? chip("tone-ok", t("stable_yes"))
-      : (stable === false ? chip("tone-bad", t("stable_no")) : make("span", "muted", "—")));
+      : (stable === false ? chip("tone-bad", t("stable_no"))
+        : (sc && sc.recheck_complete === false ? chip("tone-warn", t("stable_unknown"))
+          : make("span", "muted", "—"))));
     item("verdict_context", chip(manifest.analysis_context === "full" ? "tone-ok"
       : (manifest.analysis_context === "degraded" ? "tone-warn" : "tone-muted"),
       manifest.analysis_context || "—"));
@@ -833,6 +866,18 @@ _JS_MAIN = r"""
     }
     if (review.findings_omitted) {
       root.append(make("p", "notice", fmt("omitted_notice", { n: number(review.findings_omitted) })));
+    }
+    if (scopeShort()) {
+      const sc = scope();
+      const gaps = [["scope_gap_files", sc.unreadable_files], ["scope_gap_dirs", sc.unreadable_directories],
+                    ["scope_gap_rules", sc.unreadable_ignore_files]]
+        .filter(([_, n]) => Number(n || 0) > 0)
+        .map(([key, n]) => fmt(key, { n: number(n) }));
+      const parts = [fmt("scope_notice_head", { n: number((review.source_manifest || {}).total_files) }),
+                     gaps.join(lang === "zh" ? "，" : ", ") + (lang === "zh" ? "。" : ".")];
+      if (Number(sc.unreadable_directories || 0) > 0) parts.push(t("scope_dirs_unknown"));
+      parts.push(t("scope_notice_tail"), t("scope_detail"));
+      root.append(make("p", "notice", parts.join(" ")));
     }
   };
 
@@ -1026,7 +1071,7 @@ _JS_MAIN = r"""
       pair(t("tool_source_findings"), number(fc["source-only"] !== undefined ? fc["source-only"] : data.total_findings));
       pair(t("tool_diagnostics"), number(data.total_diagnostics));
       pair(t("tool_version"), data.version);
-      pair(t("tool_coverage"),
+      pair(t("tool_coverage") + (scopeShort() ? t("scope_basis") : ""),
         (coverage.analyzed ?? coverage.covered ?? 0) + "/" + (coverage.effective_total ?? coverage.total ?? 0));
       pair(t("tool_attempted"), coverage.attempted ?? coverage.covered ?? 0);
       pair(t("tool_excluded"), coverage.excluded || 0);
@@ -1074,14 +1119,22 @@ _JS_MAIN = r"""
   /* ---------- scope ---------- */
   const renderScope = () => {
     const sm = review.source_manifest || {};
-    const scope = id("scope-values");
-    scope.replaceChildren();
-    const pair = (label, value) => scope.append(make("dt", "", label), make("dd", "", value));
-    pair(t("scope_inventory"), number(sm.total_files));
+    const values = id("scope-values");
+    values.replaceChildren();
+    const pair = (label, value) => values.append(make("dt", "", label), make("dd", "", value));
+    const sc = scope();
+    pair(t("scope_inventory"), number(sm.total_files) + (scopeShort() ? " " + t("scope_basis") : ""));
     pair(t("scope_compile_db"), number((manifest.compile_database || {}).filtered_entries));
     pair(t("scope_context"), manifest.analysis_context || "—");
     const stable = (manifest.source_inventory || {}).stable;
-    pair(t("scope_stable"), stable === true ? t("yes") : (stable === false ? t("no") : "—"));
+    pair(t("scope_stable"), stable === true ? t("yes")
+      : (stable === false ? t("no")
+        : (sc && sc.recheck_complete === false ? t("stable_unknown") : "—")));
+    pair(t("verdict_scope"), sc ? t(sc.complete === false ? "scope_gap" : "scope_ok") : t("scope_unrecorded"));
+    if (sc) {
+      pair(t("scope_unreadable_files"), number(sc.unreadable_files));
+      pair(t("scope_unreadable_dirs"), number(sc.unreadable_directories));
+    }
     id("source-summary").textContent = fmt("source_files_n", { n: number((sm.files || []).length) });
     const list = id("source-files");
     list.replaceChildren();

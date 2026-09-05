@@ -369,3 +369,173 @@ def test_a_cancelled_run_with_an_incomplete_scope_still_exits_130(
     # What the run did learn about its scope is kept, not overwritten.
     assert result.manifest["source_inventory"]["scope"]["unreadable_directories"] == 1
     assert result.manifest["source_inventory"]["scope"]["recheck_complete"] is None
+
+
+# --- what the four front ends say -------------------------------------------
+
+
+def _incomplete_manifest() -> dict[str, Any]:
+    return {
+        "run_id": "scope-run", "tools": {}, "status": "partial", "exit_code": 10,
+        "source_inventory": {
+            "total": 120, "stable": None, "changes": {},
+            "scope": {
+                "complete": False, "discovery_complete": False, "recheck_complete": False,
+                "unreadable_files": 2, "unreadable_directories": 1, "unreadable_ignore_files": 0,
+                "anomalies": 3,
+            },
+        },
+    }
+
+
+def _embedded(rendered: str) -> dict[str, Any]:
+    marker = '<script id="report-data" type="application/json">'
+    return json.loads(rendered.split(marker, 1)[1].split("</script>", 1)[0])
+
+
+def test_the_dashboard_carries_the_scope_and_labels_coverage_as_discovered_only() -> None:
+    from code_analyzer.html_report import render
+
+    rendered = render(_incomplete_manifest(), None)
+    embedded = _embedded(rendered)
+
+    assert embedded["source_manifest"]["scope"]["unreadable_directories"] == 1
+    assert embedded["execution_manifest"]["source_inventory"]["scope"]["complete"] is False
+    script = rendered.rsplit("<script>", 1)[1].rsplit("</script>", 1)[0]
+    for literal in ("scope_notice_tail", "scope_dirs_unknown", "scope_basis", "scope_unrecorded"):
+        assert literal in script
+    # The two sentences the operator has to be able to read.
+    assert "个目录无法遍历" in rendered and "这些目录里有多少源文件，本次运行不知道。" in rendered
+    assert "基于已发现文件" in rendered
+
+
+def test_a_report_written_before_scope_was_recorded_reads_as_unrecorded() -> None:
+    from code_analyzer.html_report import render
+
+    old = {"run_id": "old-run", "tools": {}, "status": "complete", "exit_code": 0,
+           "source_inventory": {"total": 5, "stable": True}}
+
+    embedded = _embedded(render(old, None))
+
+    assert embedded["source_manifest"]["scope"] is None
+    assert "未记录" in render(old, None)
+
+
+def test_the_markdown_report_states_the_scope(tmp_path: Path) -> None:
+    from code_analyzer.review import _scope_line, markdown_report
+
+    summary = {"source_manifest": {"total_files": 120, "scope": _incomplete_manifest()["source_inventory"]["scope"]}}
+    line = _scope_line(summary)
+
+    assert "`incomplete`" in line and "`2` unreadable file(s)" in line
+    assert "relative to the discovered files" in line
+    assert _scope_line({"source_manifest": {"total_files": 1}}) == "`not recorded`"
+    assert "Scan scope:" in markdown_report({**summary, "tools": {}, "findings": []})
+
+
+def test_the_live_graph_draws_discovery_as_partial() -> None:
+    from code_analyzer.serve import graph
+
+    nodes = {item["id"]: item for item in graph(_incomplete_manifest())["nodes"]}
+
+    assert nodes["discovery"]["state"] == "partial"
+    assert nodes["discovery"]["note"] == "范围不完整：2 个文件无法读取，1 个目录无法遍历"
+    complete = graph({"run_id": "x", "tools": {}, "source_inventory": {"total": 1, "scope": {"complete": True}}})
+    assert {item["id"]: item for item in complete["nodes"]}["discovery"]["state"] == "success"
+
+
+def test_the_tui_discovery_row_says_the_scope_is_incomplete() -> None:
+    import copy
+
+    from code_analyzer.config import DEFAULTS, validate_config
+    from code_analyzer.flow import RunFlow
+
+    flow = RunFlow(validate_config(copy.deepcopy(DEFAULTS)))
+    flow.apply(AnalysisEvent(
+        "discovery", "finished", "inventory ready: 120 files", timestamp=0.0, progress=0.1,
+        data={"files": 120, "compile_db_entries": 0, "compile_db_path": None,
+              "scope": _incomplete_manifest()["source_inventory"]["scope"]},
+    ))
+
+    node = flow.nodes["discovery"]
+    assert node.state == "partial"
+    assert node.detail == "120 文件 · 无 compile-db · 范围不完整（2 文件不可读，1 目录不可进）"
+
+
+def test_preflight_warns_before_the_scan_rather_than_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from code_analyzer.preflight import run_preflight
+
+    source = _tree(tmp_path)
+    deny_walk(monkeypatch, source / "vendor")
+    config = load_config(source, None, {"run": {"output_root": str(tmp_path / "reports")}})
+
+    result = run_preflight(source, config, probe_tools=False)
+
+    warnings = [item.message for item in result.issues if item.severity == "warning"]
+    assert any("源码发现不完整" in message and "1 个目录无法遍历" in message for message in warnings)
+    # A warning, not an error: the scan may still be worth running.
+    assert result.ok and result.inventory_files == 1
+
+
+def test_recovery_keeps_the_anomalies_and_does_not_rewrite_the_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zipfile
+
+    from code_analyzer.recovery import recover_report
+
+    source = _tree(tmp_path)
+    config = _config(tmp_path, source, export=True)
+    deny_walk(monkeypatch, source / "vendor")
+    exit_code, run_dir = analyze(source, config)
+    before = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert exit_code == 10
+
+    monkeypatch.undo()
+    recover_report(run_dir)
+    after = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    review = json.loads((run_dir / "review" / "summary.json").read_text(encoding="utf-8"))
+
+    # A rebuild explains the old run; it does not re-judge it.
+    assert (after["status"], after["exit_code"]) == (before["status"], before["exit_code"]) == ("partial", 10)
+    assert after["source_inventory"]["scope"] == before["source_inventory"]["scope"]
+    assert review["source_manifest"]["scope"]["unreadable_directories"] == 1
+    archives = sorted((run_dir / "exports").glob("*-shareable.zip"))
+    with zipfile.ZipFile(archives[-1]) as bundle:
+        inventory = json.loads(bundle.read("inputs/source-inventory.json").decode("utf-8"))
+    # The records survive redaction, and they never carried a host path.
+    assert inventory["discovery"]["anomalies"] == [{
+        "path": "vendor", "operation": "walk", "error": "EACCES", "reason": os.strerror(errno.EACCES),
+    }]
+    assert str(tmp_path) not in json.dumps(inventory)
+
+
+def test_a_run_recorded_before_scope_existed_still_rebuilds(tmp_path: Path) -> None:
+    """The upgrade must not strand the reports that were already on disk."""
+    from code_analyzer.persist import json_bytes
+    from code_analyzer.recovery import recover_report
+
+    source = _tree(tmp_path)
+    exit_code, run_dir = analyze(source, _config(tmp_path, source, export=True))
+    assert exit_code == 0
+    # Roll the artifacts back to the shape a pre-upgrade run left behind.
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_inventory"].pop("scope")
+    manifest["source_inventory"]["changes"].pop("unverified")
+    manifest_path.write_bytes(json_bytes(manifest))
+    inventory_path = run_dir / "inputs" / "source-inventory.json"
+    old = json.loads(inventory_path.read_text(encoding="utf-8"))
+    inventory_path.write_bytes(json_bytes({"source": old["source"], "files": old["files"]}))
+
+    recover_report(run_dir)
+    rebuilt = json.loads(manifest_path.read_text(encoding="utf-8"))
+    review = json.loads((run_dir / "review" / "summary.json").read_text(encoding="utf-8"))
+
+    # Readable, unchanged verdict, and honest about not knowing.
+    assert (rebuilt["status"], rebuilt["exit_code"]) == ("complete", 0)
+    assert "scope" not in rebuilt["source_inventory"]
+    assert review["source_manifest"]["scope"] is None
+    assert "未记录" in (run_dir / "index.html").read_text(encoding="utf-8")

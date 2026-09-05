@@ -10,7 +10,7 @@ from .config import validate_config
 from .doctor import probe_tool
 from .errors import UserError
 from .includes import scan_includes
-from .inventory import discover
+from .inventory import Discovery, discover, scope_summary
 from .llm.doctor import endpoint_reachable
 from .tools import TOOL_NAMES
 
@@ -77,7 +77,11 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
         output_root = Path(checked["run"]["output_root"])
         if output_root.resolve() == source:
             raise UserError("output root must not be identical to source")
-        inventory_files = len(discover(source, checked, output_root).files)
+        found = discover(source, checked, output_root)
+        inventory_files = len(found.files)
+        if not found.complete:
+            # Better heard before the scan than read off the verdict after it.
+            issues.append(PreflightIssue("warning", "SOURCE", _scope_warning(found)))
     except (OSError, UserError) as exc:
         issues.append(PreflightIssue("error", "run.output_root", str(exc)))
 
@@ -120,6 +124,24 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
     return PreflightResult(
         not any(item.severity == "error" for item in issues), tuple(issues), compile_info, inventory_files,
         tool_results, llm_info, build_info,
+    )
+
+
+def _scope_warning(found: Discovery) -> str:
+    scope = scope_summary(found)
+    parts = [
+        f"{scope[key]} {label}"
+        for key, label in (
+            ("unreadable_files", "个文件无法读取"),
+            ("unreadable_directories", "个目录无法遍历"),
+            ("unreadable_ignore_files", "个 .gitignore 无法读取"),
+        )
+        if scope[key]
+    ]
+    unknown = "；无法遍历的目录里有多少源文件本次无从知道" if scope["unreadable_directories"] else ""
+    return (
+        f"源码发现不完整：{'，'.join(parts)}{unknown}；"
+        f"这次扫描的范围与覆盖率都只覆盖已发现的 {len(found.files)} 个文件，运行状态最好也只到 partial"
     )
 
 

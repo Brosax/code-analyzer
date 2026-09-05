@@ -190,6 +190,10 @@ def build_review(
     }
     source_manifest = {
         "total_files": len(inventory),
+        # What discovery could and could not see.  ``None`` on a run recorded
+        # before completeness was tracked -- unknown, which is not the same
+        # claim as complete, and every reader here draws it as unrecorded.
+        "scope": (manifest.get("source_inventory") or {}).get("scope"),
         "files": [item["path"] for item in inventory],
         "suffix_counts": dict(sorted(Counter(Path(item["path"]).suffix.lower() for item in inventory).items())),
         "include_patterns": manifest.get("source_options", {}).get("include", ["**/*"]),
@@ -296,6 +300,37 @@ def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
         raise InterruptedError("run interrupted")
 
 
+def _scope_line(summary: dict[str, Any]) -> str:
+    """One line naming what discovery missed, for the Markdown report.
+
+    A summary written before completeness was tracked says so rather than
+    claiming a clean scope it never measured.
+    """
+    scope = (summary.get("source_manifest") or {}).get("scope")
+    if not isinstance(scope, dict):
+        return "`not recorded`"
+    total = (summary.get("source_manifest") or {}).get("total_files", 0)
+    if scope.get("complete"):
+        return f"`complete`; discovered `{total}` files"
+    gaps = [
+        f"`{scope.get(key, 0)}` {label}"
+        for key, label in (
+            ("unreadable_files", "unreadable file(s)"),
+            ("unreadable_directories", "untraversable directory/directories"),
+            ("unreadable_ignore_files", "unreadable .gitignore file(s)"),
+        )
+        if scope.get(key)
+    ]
+    unknown = (
+        "; the number of source files inside the untraversable directories is unknown"
+        if scope.get("unreadable_directories") else ""
+    )
+    return (
+        f"`incomplete`; discovered `{total}` files, {', '.join(gaps)}{unknown}. "
+        "Every coverage figure below is relative to the discovered files."
+    )
+
+
 def markdown_report(summary: dict[str, Any], max_findings: int = 200) -> str:
     contexts = summary.get("finding_counts", {})
     lines = [
@@ -304,6 +339,7 @@ def markdown_report(summary: dict[str, Any], max_findings: int = 200) -> str:
         f"Build-aware findings: `{contexts.get('build-aware', 0)}`",
         f"Source-only findings: `{contexts.get('source-only', 0)}`",
         f"Tool diagnostics: `{summary.get('total_diagnostics', 0)}`",
+        f"Scan scope: {_scope_line(summary)}",
     ]
     reference = summary.get("grading_reference", {})
     document = reference.get("document", {})
