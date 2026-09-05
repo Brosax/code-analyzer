@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     if command_tail is not None:
         args.command_argv = list(args.command_argv) + command_tail
     try:
+        if args.command != "tui":
+            _interrupt_on_terminate()
         if args.command == "tui":
             if not _has_tty():
                 root_parser.print_help(file=sys.stderr)
@@ -293,6 +297,25 @@ def main(argv: list[str] | None = None) -> int:
 # a slash command with the very parser this file builds.  Kept as a name here
 # because it is what the CLI's own tests reach for.
 _overrides = analyze_overrides
+
+
+def _terminate(signum: int, _frame: Any) -> None:
+    """SIGTERM ends a headless run the way Ctrl+C ends an attended one.
+
+    A run launched under a supervisor (``systemd-run``, a tmux pane) is
+    stopped with TERM, not INT.  Without this the process died mid-run and
+    the manifest said ``running`` forever -- the TF-M review of 2026-09-04
+    and the first Juliet run of 2026-09-05 both ended that way, evidence on
+    disk and the status a lie.  Raising KeyboardInterrupt takes the very path
+    Ctrl+C takes: exit 130, status ``interrupted``, every lane accounted for.
+    """
+    raise KeyboardInterrupt
+
+
+def _interrupt_on_terminate() -> None:
+    """Route SIGTERM to the Ctrl+C path; only the main thread may set a handler."""
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
 
 
 def _subcommands(root_parser: argparse.ArgumentParser) -> list[str]:

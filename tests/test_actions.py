@@ -8,6 +8,7 @@ program stops to ask a question go through one seam.
 from __future__ import annotations
 
 import io
+import signal
 from pathlib import Path
 
 import pytest
@@ -379,3 +380,18 @@ def test_the_terminal_applies_the_items_it_was_told_to_apply() -> None:
     # `y` still means exactly what it always meant.
     assert decide("y").selected == (0,)
     assert decide("n").answer == "reject" and decide("").answer == "reject"
+
+
+
+def test_sigterm_ends_a_headless_run_the_way_ctrl_c_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A supervisor stops a run with TERM.  It must land on the interrupt path
+    (exit 130, status ``interrupted``), not die mid-write with the manifest
+    saying ``running`` -- which is how the TF-M review ended."""
+    from code_analyzer import cli
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._terminate(signal.SIGTERM, None)
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(cli.signal, "signal", lambda signum, handler: installed.setdefault(signum, handler))
+    cli._interrupt_on_terminate()
+    assert installed == {signal.SIGTERM: cli._terminate}
