@@ -569,12 +569,24 @@ def _analyze(
     # while a scanner runs, tools/*/report.* has not been written yet, so there
     # is nothing for it to peek at.  The output_root guard above stays exactly
     # as it was -- blindness must not come to depend on a race.
-    if llm_enabled and CONCURRENT_PHASES:
-        _run_together(run_static, run_llm, cancellation.cancel)
-    else:
-        run_static()
-        if llm_enabled:
-            run_llm()
+    try:
+        if llm_enabled and CONCURRENT_PHASES:
+            _run_together(run_static, run_llm, cancellation.cancel)
+        else:
+            run_static()
+            if llm_enabled:
+                run_llm()
+    except KeyboardInterrupt:
+        # A stop signal -- Ctrl+C, or a supervisor's SIGTERM routed to the same
+        # path -- can reach here raised rather than cooperative: _run_together
+        # re-raises it from the static thread once both sides are down.  The
+        # run is over, but its evidence is on disk, so finalise the manifest
+        # the cooperative path would have.  Without this the process returned
+        # 130 with tools/ and llm/ written while manifest.json still said
+        # `running` -- how the TF-M review of 2026-09-04 and the first Juliet
+        # run of 2026-09-05 both ended, the status a lie about live work.
+        cancellation.cancel()
+        return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
 
     if interrupted or cancellation.cancelled or manifest["llm"].get("status") == "interrupted":
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)

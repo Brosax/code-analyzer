@@ -354,6 +354,31 @@ def test_a_crashing_static_side_still_lands_the_llm_results(
 # --- cancellation -----------------------------------------------------------
 
 
+def test_a_raised_interrupt_still_finalises_the_manifest(
+    tmp_path: Path, fake: FakeHarness, closed_endpoint: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    """A SIGTERM from a supervisor reaches the CLI as a raised KeyboardInterrupt,
+    not a flipped token.  _run_together re-raises it from the static thread, so
+    the cooperative `if interrupted or cancelled` check never runs.  The manifest
+    must still be finalised: status interrupted, exit 130, no stale `running` --
+    the TF-M review and the first Juliet run both ended with the status a lie
+    because this raised path skipped the finalise."""
+    source = _tree(tmp_path)
+    fake.script_default(response(_report(_finding()), delay=0.2))
+    config = _config(tmp_path, closed_endpoint)
+
+    def stop(*_args: Any, **_kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner.llm_scan, "run", stop)
+    exit_code, _run_dir, manifest = _analyze(source, config)
+
+    assert exit_code == 130
+    assert manifest["status"] == "interrupted" and manifest["exit_code"] == 130
+    assert manifest["llm"]["status"] == "interrupted"
+    assert "running" not in json.dumps(manifest)
+
+
 def test_cancellation_stops_both_sides(
     tmp_path: Path, fake: FakeHarness, closed_endpoint: str  # noqa: F811  (pytest fixtures by name)
 ) -> None:
