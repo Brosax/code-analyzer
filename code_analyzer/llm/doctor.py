@@ -330,7 +330,7 @@ def _estimate(config: dict[str, Any], source: Path | None, benchmark: dict[str, 
         # ``output_root`` only tells discovery which directory to keep out of
         # the inventory; this probe writes nothing, so a temporary one is right.
         with tempfile.TemporaryDirectory(prefix="code-analyzer-llm-doctor-") as temporary:
-            inventory = discover(source, config, Path(temporary))
+            inventory = discover(source, config, Path(temporary)).files
         plan = build_plan(source, inventory, config=config)
     except (OSError, UserError, ValueError) as exc:
         return {"known": False, "reason": f"the source tree could not be planned: {exc}"}

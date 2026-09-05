@@ -35,7 +35,14 @@ from .doctor import verify_canary
 from .errors import UserError
 from .events import fan_out
 from .html_report import render
-from .inventory import discover, git_state, source_slug
+from .inventory import (
+    Discovery,
+    discover,
+    git_state,
+    scope_sentence,
+    scope_summary,
+    source_slug,
+)
 from .llm import scan as llm_scan
 from .persist import json_bytes
 from .persist import write_json as _write_json
@@ -278,16 +285,20 @@ def _analyze(
     except OSError as exc:
         raise UserError(f"cannot create output root {output_root}: {exc}") from exc
     try:
-        inventory = discover(source, config, output_root, cancelled=cancellation.is_cancelled)
+        discovered = discover(source, config, output_root, cancelled=cancellation.is_cancelled)
     except InterruptedError as exc:
         raise AnalysisCancelled() from exc
     if cancellation.cancelled:
         raise AnalysisCancelled()
+    inventory = discovered.files
+    scope = scope_summary(discovered)
     filtered_db, db_covered = filter_database(source, inventory, compile_entries)
     progress(
         f"inventory ready: {len(inventory)} files; "
         f"compile database entries: {len(filtered_db)}"
     )
+    if not discovered.complete:
+        progress(scope_sentence(len(inventory), scope))
     run_id = uuid.uuid4().hex[:12]
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     run_dir = output_root / source_slug(source) / f"{timestamp}-{run_id}"
@@ -303,7 +314,7 @@ def _analyze(
 
     config_path_values: list[Path] = [Path(value) for value in config.get("_config_paths", [])]
     config_path_values.extend(Path(item["path"]) for item in compile_discovery["candidates"])
-    _write_inputs(run_dir, inventory, config, filtered_db, source, output_root, config_path_values)
+    _write_inputs(run_dir, discovered, config, filtered_db, source, output_root, config_path_values)
     requested = {name: bool(config["tools"][name]["enabled"]) for name in TOOL_NAMES}
     manifest: dict[str, Any] = {
         "manifest_schema_version": 2,
@@ -325,7 +336,14 @@ def _analyze(
             "discovery": compile_discovery,
         },
         "source_options": {"include": config["source"]["include"], "exclude": config["source"]["exclude"]},
-        "source_inventory": {"total": len(inventory), "sha256": _inventory_digest(inventory), "git": git_state(source), "stable": None, "changes": {}},
+        "source_inventory": {
+            "total": len(inventory), "sha256": _inventory_digest(inventory), "git": git_state(source),
+            "stable": None, "changes": {},
+            # The completeness summary; the anomaly records themselves stay in
+            # inputs/source-inventory.json, which is where a reader who wants
+            # the paths already goes.
+            "scope": scope,
+        },
         "tools": {name: _not_requested(inventory, name) for name in requested},
         # A new top-level key, never inside manifest["tools"]: status.overall()
         # walks the tools, so a model timeout must not be able to turn a
@@ -345,11 +363,11 @@ def _analyze(
         "artifacts": [],
     }
     _save_manifest(run_dir, manifest)
-    event("discovery", "finished", f"inventory ready: {len(inventory)} files", value=WINDOW_START, data={
+    event("discovery", "finished", scope_sentence(len(inventory), scope), value=WINDOW_START, data={
         "run_id": run_id, "files": len(inventory),
         "c_files": sum(1 for item in inventory if Path(item["path"]).suffix.lower() == ".c"),
         "compile_db_entries": len(filtered_db), "compile_db_path": str(compile_path) if compile_path else None,
-        "degraded": degraded,
+        "degraded": degraded, "scope": scope,
     })
 
     # From here to the join below, two threads publish into one manifest: the
@@ -602,23 +620,42 @@ def _analyze(
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     before_by_path = {item["path"]: item["sha256"] for item in inventory}
-    after_by_path = {item["path"]: item["sha256"] for item in after}
+    after_by_path = {item["path"]: item["sha256"] for item in after.files}
+    # A file the recheck could not read is missing from `after` for a reason
+    # that is not deletion, and calling it deleted would invent a source change
+    # out of a permission error.  It is unverified: we no longer know.
+    unverified = _unverified(before_by_path.keys() - after_by_path.keys(), after.anomalies)
     changes = {
         "added": sorted(after_by_path.keys() - before_by_path.keys()),
-        "deleted": sorted(before_by_path.keys() - after_by_path.keys()),
+        "deleted": sorted(before_by_path.keys() - after_by_path.keys() - set(unverified)),
         "changed": sorted(path for path in before_by_path.keys() & after_by_path.keys() if before_by_path[path] != after_by_path[path]),
+        "unverified": unverified,
     }
-    stable = not any(changes.values())
+    moved = any(changes[key] for key in ("added", "deleted", "changed"))
+    # Tri-state on purpose.  A recheck that missed the same directory both
+    # times saw no difference, and "no difference observed" is not "the tree
+    # held still" when part of the tree was never looked at.
+    stable = False if moved else (True if after.complete else None)
+    scope = scope_summary(discovered, after)
+    manifest["source_inventory"]["scope"] = scope
+    _write_json(run_dir / "inputs" / "source-inventory.json", _inventory_document(source, discovered, after))
     event(
-        "stability", "finished", "source is stable" if stable else "source changed during analysis", value=0.85,
-        data={"stable": stable, "changes": {key: len(value) for key, value in changes.items()}},
+        "stability", "finished",
+        "source is stable" if stable else (
+            "source changed during analysis" if stable is False else "source stability could not be verified"
+        ),
+        value=0.85,
+        data={"stable": stable, "changes": {key: len(value) for key, value in changes.items()}, "scope": scope},
     )
     manifest["source_inventory"]["stable"] = stable
     manifest["source_inventory"]["changes"] = changes
+    if not scope["complete"]:
+        progress(scope_sentence(len(inventory), scope))
+    scope_complete = bool(scope["complete"])
     # Compute the intended final state before deriving and exporting reports,
     # without persisting export success ahead of the export actually running.
     intended_export = "completed" if config["run"]["shareable_export"] else manifest["export"]["status"]
-    status, exit_code = overall(manifest["tools"], stable, intended_export)
+    status, exit_code = overall(manifest["tools"], stable, intended_export, scope_complete=scope_complete)
     manifest["status"], manifest["exit_code"] = status, exit_code
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     review_summary: dict[str, Any] | None = None
@@ -698,14 +735,17 @@ def _analyze(
             )
         except (ExportError, OSError, ValueError, json.JSONDecodeError) as exc:
             manifest["export"].update({"status": "failed", "archive": None, "error": str(exc)})
-            status, exit_code = overall(manifest["tools"], stable, "failed", manifest["review"]["status"])
+            status, exit_code = overall(
+                manifest["tools"], stable, "failed", manifest["review"]["status"], scope_complete=scope_complete
+            )
             manifest["status"], manifest["exit_code"] = status, exit_code
             manifest["gate"]["triggered"] = False
             progress("shareable export failed; private evidence was retained")
             event("export", "failed", str(exc), value=0.98, data={"error": str(exc)})
         else:
             status, exit_code = overall(
-                manifest["tools"], stable, manifest["export"]["status"], manifest["review"]["status"]
+                manifest["tools"], stable, manifest["export"]["status"], manifest["review"]["status"],
+                scope_complete=scope_complete,
             )
             if manifest["gate"].get("triggered") and status == "complete":
                 exit_code = 1
@@ -815,11 +855,12 @@ def _running_state(inventory: list[dict[str, Any]], name: str, executable: str, 
     return value
 
 
-def _write_inputs(run_dir: Path, inventory: list[dict[str, Any]], config: dict[str, Any], filtered_db: list[dict[str, Any]], source: Path, output_root: Path, extra: list[Path]) -> None:
+def _write_inputs(run_dir: Path, discovered: Discovery, config: dict[str, Any], filtered_db: list[dict[str, Any]], source: Path, output_root: Path, extra: list[Path]) -> None:
     inputs = run_dir / "inputs"
+    inventory = discovered.files
     (inputs / "effective-config.toml").write_text(effective_toml(config), encoding="utf-8")
     (inputs / "source-files.txt").write_text("".join(item["path"] + "\n" for item in inventory), encoding="utf-8")
-    _write_json(inputs / "source-inventory.json", {"source": str(source), "files": inventory})
+    _write_json(inputs / "source-inventory.json", _inventory_document(source, discovered, None))
     if filtered_db:
         _write_json(inputs / "compile_commands.filtered.json", filtered_db)
     mapping = {
@@ -828,6 +869,41 @@ def _write_inputs(run_dir: Path, inventory: list[dict[str, Any]], config: dict[s
         "additional_paths": [str(path.resolve()) for path in extra],
     }
     _write_json(inputs / "sanitizer-map.private.json", mapping)
+
+
+def _inventory_document(source: Path, initial: Discovery, recheck: Discovery | None) -> dict[str, Any]:
+    """What inputs/source-inventory.json holds: the files, and every gap in them.
+
+    The two walks are kept apart because they answer different questions: the
+    first says what was analysed, the second says what could still be seen
+    afterwards.  ``recheck`` is null on a run that never reached the stability
+    walk -- an interrupted one -- rather than an empty record, which would read
+    as "checked, nothing wrong".
+    """
+    return {
+        "source": str(source),
+        "files": initial.files,
+        "discovery": _discovery_record(initial),
+        "recheck": None if recheck is None else _discovery_record(recheck),
+    }
+
+
+def _discovery_record(discovered: Discovery) -> dict[str, Any]:
+    return {
+        "complete": discovered.complete,
+        "anomalies": [item.as_dict() for item in discovered.anomalies],
+    }
+
+
+def _unverified(missing: Any, anomalies: Any) -> list[str]:
+    """Which of ``missing`` are explained by a failure rather than a deletion."""
+    unreadable = {item.path for item in anomalies if item.operation in {"read", "stat"}}
+    unwalked = {item.path for item in anomalies if item.operation == "walk"}
+    return sorted(
+        path for path in missing
+        if path in unreadable
+        or any(directory == "." or path.startswith(directory + "/") for directory in unwalked)
+    )
 
 
 def _save_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:

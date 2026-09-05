@@ -28,12 +28,12 @@ def _tree(root: Path, files: dict[str, str]) -> Path:
 
 def _index(root: Path) -> dict[str, Any]:
     config = validate_config(json.loads(json.dumps(DEFAULTS)))
-    return build_index(root, discover(root, config, root.parent / "out"))
+    return build_index(root, discover(root, config, root.parent / "out").files)
 
 
 def _plan(root: Path) -> dict[str, Any]:
     config = validate_config(json.loads(json.dumps(DEFAULTS)))
-    return build_plan(root, discover(root, config, root.parent / "out"), config=config)
+    return build_plan(root, discover(root, config, root.parent / "out").files, config=config)
 
 
 def _prompt(root: Path, plan: dict[str, Any], name: str, tier: str = "high") -> str:

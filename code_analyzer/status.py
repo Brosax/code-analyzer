@@ -71,7 +71,16 @@ def overall(
     source_stable: bool | None,
     export_status: str,
     review_status: str = "disabled",
+    scope_complete: bool = True,
 ) -> tuple[str, int]:
+    """The run's word and exit code, from every condition that can lower them.
+
+    ``scope_complete`` is discovery's own verdict: a walk that could not read
+    a file or enter a directory analysed an unknown fraction of the tree, so
+    the run is at best partial no matter how well the analyzers themselves
+    did.  It cannot turn a cancelled run into anything but 130, and it cannot
+    rescue a run that produced no valid report from 20.
+    """
     requested = [item for item in tools.values() if item["requested"]]
     if any(item["status"] == "interrupted" for item in requested):
         return "interrupted", EXIT_INTERRUPTED
@@ -81,6 +90,7 @@ def overall(
     complete &= all(item["status"] in {"completed", "not_applicable"} for item in requested)
     complete &= source_stable is True and export_status in {"completed", "disabled"}
     complete &= review_status in {"completed", "disabled"}
+    complete &= bool(scope_complete)
     if complete:
         return "complete", EXIT_COMPLETE
     if valid:

@@ -77,7 +77,7 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
         output_root = Path(checked["run"]["output_root"])
         if output_root.resolve() == source:
             raise UserError("output root must not be identical to source")
-        inventory_files = len(discover(source, checked, output_root))
+        inventory_files = len(discover(source, checked, output_root).files)
     except (OSError, UserError) as exc:
         issues.append(PreflightIssue("error", "run.output_root", str(exc)))
 
@@ -91,7 +91,7 @@ def run_preflight(source: Path, config: dict[str, Any], *, probe_tools: bool = T
     build_info: dict[str, Any] | None = None
     if probe_tools and checked["tools"]["splint"]["enabled"] and inventory_files:
         try:
-            inventory = discover(source, checked, Path(checked["run"]["output_root"]))
+            inventory = discover(source, checked, Path(checked["run"]["output_root"])).files
             build_info = scan_includes(source, inventory, checked["build"])
         except (OSError, UserError):
             build_info = None

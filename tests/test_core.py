@@ -86,7 +86,7 @@ def test_inventory_exclusions_hashes_and_slug_collisions(tmp_path: Path) -> None
     output.mkdir()
     (output / "old.c").write_text("bad")
     config = load_config(source, None)
-    records = discover(source, config, output)
+    records = discover(source, config, output).files
     assert [item["path"] for item in records] == ["good.c", "vendor/kept.cpp"]
     assert all(len(item["sha256"]) == 64 for item in records)
     other = tmp_path / "a?b"
@@ -100,9 +100,9 @@ def test_gitignore_is_opt_in(tmp_path: Path) -> None:
     (source / "ignored.c").write_text("int ignored;")
     (source / ".gitignore").write_text("ignored.c\n")
     config = load_config(source, None)
-    assert {item["path"] for item in discover(source, config, tmp_path / "out")} == {"kept.c", "ignored.c"}
+    assert {item["path"] for item in discover(source, config, tmp_path / "out").files} == {"kept.c", "ignored.c"}
     config["source"]["respect_gitignore"] = True
-    assert {item["path"] for item in discover(source, config, tmp_path / "out")} == {"kept.c"}
+    assert {item["path"] for item in discover(source, config, tmp_path / "out").files} == {"kept.c"}
 
 
 def test_status_semantics() -> None:

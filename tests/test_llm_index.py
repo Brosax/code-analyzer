@@ -166,7 +166,7 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest.fixture(scope="module")
 def plan(tree: Path) -> dict[str, Any]:
     config = load_config(tree, None)
-    return build_plan(tree, discover(tree, config, tree / "out"), config=config)
+    return build_plan(tree, discover(tree, config, tree / "out").files, config=config)
 
 
 def _units(plan: dict[str, Any], path: str) -> list[dict[str, Any]]:
@@ -233,7 +233,7 @@ def test_unit_identity_is_stable_and_content_addressed(tree: Path, plan: dict[st
         assert unit_source(tree, unit) == body
     # The identity must not move when bytes above the unit shift.
     config = load_config(tree, None)
-    again = plan_units(build_index(tree, discover(tree, config, tree / "out")), tree)
+    again = plan_units(build_index(tree, discover(tree, config, tree / "out").files), tree)
     assert [unit["unit_id"] for unit in again] == identifiers
 
 
@@ -286,7 +286,7 @@ def test_call_graph_resolves_and_inverts(plan: dict[str, Any]) -> None:
 
 def test_plan_is_byte_stable(tree: Path) -> None:
     config = load_config(tree, None)
-    inventory = discover(tree, config, tree / "out")
+    inventory = discover(tree, config, tree / "out").files
     first = build_plan(tree, inventory, config=config)
     second = build_plan(tree, inventory, config=config)
     assert json_bytes(first) == json_bytes(second)
