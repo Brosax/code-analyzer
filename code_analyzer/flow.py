@@ -559,6 +559,26 @@ class RunFlow:
 
     def _on_stability(self, event: AnalysisEvent) -> None:
         self._phase_event("stability", event)
+        if event.status != "finished":
+            return
+        data = event.data or {}
+        node = self.nodes.get("stability")
+        if node is not None and "stable" in data and data["stable"] is not True:
+            # Changed, or never verified: neither is the ✓ the phase helper
+            # would otherwise leave on a row whose text says otherwise.
+            node.state = node.status = "partial"
+        scope = data.get("scope")
+        if not isinstance(scope, dict) or scope.get("complete") is not False:
+            return
+        discovery = self.nodes.get("discovery")
+        if discovery is None:
+            return
+        # The recheck can be the walk that went blind, and then the discovery
+        # row has been saying "complete" since before the tools ran.
+        discovery.state = discovery.status = "partial"
+        parts = [part for part in discovery.detail.split(" · ") if part and not part.startswith("范围不完整")]
+        parts.append(_scope_gap(scope))
+        discovery.detail = " · ".join(parts)
 
     def _on_review(self, event: AnalysisEvent) -> None:
         self._phase_event("review", event)

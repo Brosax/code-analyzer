@@ -78,9 +78,16 @@ def _state(status: Any) -> str:
 
 
 def _scope_note(manifest: dict[str, Any]) -> str | None:
-    """What the discovery node says when the walk could not see the whole tree."""
-    scope = (manifest.get("source_inventory") or {}).get("scope")
-    if not isinstance(scope, dict) or scope.get("complete") is not False:
+    """What the discovery node says about how much of the tree it saw."""
+    inventory = manifest.get("source_inventory")
+    if not isinstance(inventory, dict) or not inventory:
+        return None
+    scope = inventory.get("scope")
+    if not isinstance(scope, dict):
+        # A run recorded before completeness was tracked: unknown, which the
+        # offline report already says and this page must not silently improve.
+        return "范围完整性未记录"
+    if scope.get("complete") is not False:
         return None
     parts = [
         f"{scope.get(key, 0)} {label}"

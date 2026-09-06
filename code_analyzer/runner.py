@@ -621,21 +621,24 @@ def _analyze(
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     before_by_path = {item["path"]: item["sha256"] for item in inventory}
     after_by_path = {item["path"]: item["sha256"] for item in after.files}
-    # A file the recheck could not read is missing from `after` for a reason
-    # that is not deletion, and calling it deleted would invent a source change
-    # out of a permission error.  It is unverified: we no longer know.
-    unverified = _unverified(before_by_path.keys() - after_by_path.keys(), after.anomalies)
+    # A path one walk could not read is missing from that walk for a reason
+    # that is not a source change, and it cuts both ways: unreadable-then-gone
+    # is not a deletion, and unreadable-then-readable is not a new file.  Both
+    # directions land in `unverified`, which reports our knowledge, not the tree.
+    vanished = _unverified(before_by_path.keys() - after_by_path.keys(), after.anomalies)
+    appeared = _unverified(after_by_path.keys() - before_by_path.keys(), discovered.anomalies)
+    unverified = sorted({*vanished, *appeared})
     changes = {
-        "added": sorted(after_by_path.keys() - before_by_path.keys()),
-        "deleted": sorted(before_by_path.keys() - after_by_path.keys() - set(unverified)),
+        "added": sorted(after_by_path.keys() - before_by_path.keys() - set(appeared)),
+        "deleted": sorted(before_by_path.keys() - after_by_path.keys() - set(vanished)),
         "changed": sorted(path for path in before_by_path.keys() & after_by_path.keys() if before_by_path[path] != after_by_path[path]),
         "unverified": unverified,
     }
     moved = any(changes[key] for key in ("added", "deleted", "changed"))
-    # Tri-state on purpose.  A recheck that missed the same directory both
-    # times saw no difference, and "no difference observed" is not "the tree
-    # held still" when part of the tree was never looked at.
-    stable = False if moved else (True if after.complete else None)
+    # Tri-state on purpose.  Two walks blind in the same directory saw no
+    # difference, and "no difference observed" is not "the tree held still"
+    # when part of the tree was never looked at by either walk.
+    stable = False if moved else (True if after.complete and not unverified else None)
     scope = scope_summary(discovered, after)
     manifest["source_inventory"]["scope"] = scope
     _write_json(run_dir / "inputs" / "source-inventory.json", _inventory_document(source, discovered, after))

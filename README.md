@@ -273,7 +273,9 @@ not be parsed makes the scan scope incomplete, which lowers the run the same
 way -- to `10` while valid reports survive, `20` when none do -- and a
 successful export never lifts it back. Every such gap is recorded per path in
 `inputs/source-inventory.json`, counted in the manifest, and named by the CLI,
-the TUI, the live page and the offline report. Findings do not affect the
+the TUI, the live page and the offline report. A path only one of the two
+walks could read is reported as unverified rather than as an addition or a
+deletion, and source stability is then unknown rather than true. Findings do not affect the
 exit code unless an explicit `--fail-on medium|high|critical` gate is used; a
 completed run that hits the gate exits `1`. A missing compile database is
 degraded analysis context, not a failure by itself. Auto mode searches common

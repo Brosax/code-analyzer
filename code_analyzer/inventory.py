@@ -65,19 +65,27 @@ def scope_summary(initial: Discovery, recheck: Discovery | None = None) -> dict[
     manifest carries is what a reader needs in order to decide whether the run
     covered the tree.  ``recheck`` is the post-analysis stability walk, absent
     on a run that never reached it.
+
+    The three ``unreadable_*`` figures count distinct paths, so one file that
+    failed at ``read`` in the first walk and at ``stat`` in the second is one
+    unreadable file rather than two; ``anomalies`` counts the records, which
+    is the number of rows a reader will find in the inventory document.
     """
     unique = {
         (item.path, item.operation): item
         for item in (*initial.anomalies, *(recheck.anomalies if recheck is not None else ()))
     }
-    operations = [item.operation for item in unique.values()]
+
+    def paths(*operations: str) -> set[str]:
+        return {item.path for item in unique.values() if item.operation in operations}
+
     return {
         "complete": initial.complete and (recheck is None or recheck.complete),
         "discovery_complete": initial.complete,
         "recheck_complete": None if recheck is None else recheck.complete,
-        "unreadable_files": sum(1 for name in operations if name in {READ, STAT}),
-        "unreadable_directories": operations.count(WALK),
-        "unreadable_ignore_files": operations.count(IGNORE_RULES),
+        "unreadable_files": len(paths(READ, STAT)),
+        "unreadable_directories": len(paths(WALK)),
+        "unreadable_ignore_files": len(paths(IGNORE_RULES)),
         "anomalies": len(unique),
     }
 
@@ -378,6 +386,24 @@ def _ignore_regex(pattern: str) -> str:
     return "".join(parts)
 
 
+# The POSIX bracket expressions Git accepts inside ``[...]``.  Python's re has
+# no equivalent, so each is expanded into the characters it names.
+_POSIX_CLASSES = {
+    "alnum": "a-zA-Z0-9",
+    "alpha": "a-zA-Z",
+    "blank": r" \t",
+    "cntrl": r"\x00-\x1f\x7f",
+    "digit": "0-9",
+    "graph": r"\x21-\x7e",
+    "lower": "a-z",
+    "print": r"\x20-\x7e",
+    "punct": r"!-/:-@\[-`{-~",
+    "space": r" \t\n\r\f\v",
+    "upper": "A-Z",
+    "xdigit": "0-9A-Fa-f",
+}
+
+
 def _segment_regex(segment: str) -> str:
     """One path segment's glob; nothing here may match a separator."""
     out: list[str] = []
@@ -396,16 +422,50 @@ def _segment_regex(segment: str) -> str:
             out.append("[^/]")
         elif char == "[":
             end = _class_end(segment, index)
-            if end is None:
+            body = None if end is None else _class_body(segment[index + 1:end])
+            if body is None:
                 out.append(re.escape(char))
             else:
-                body = segment[index + 1:end]
-                out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
+                out.append("[" + body + "]")
                 index = end
         else:
             out.append(re.escape(char))
         index += 1
     return "".join(out)
+
+
+def _class_body(body: str) -> str | None:
+    """A bracket expression's contents as a Python class, or None if unusable.
+
+    ``[[:digit:]]`` and its eleven siblings are Git's, not Python's, so they
+    are expanded here rather than passed through -- an unexpanded one used to
+    read as the literal characters of its own name.  A name Git does not
+    define either leaves the whole pattern to the literal fallback.
+    """
+    if not body:
+        return None
+    negated = body[0] in {"!", "^"}
+    out: list[str] = ["^"] if negated else []
+    index = 1 if negated else 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            out.append(re.escape(body[index + 1]))
+            index += 2
+            continue
+        if body.startswith("[:", index):
+            closing = body.find(":]", index + 2)
+            if closing == -1:
+                return None
+            expansion = _POSIX_CLASSES.get(body[index + 2:closing])
+            if expansion is None:
+                return None
+            out.append(expansion)
+            index = closing + 2
+            continue
+        out.append("\\" + char if char in {"]", "\\"} else char)
+        index += 1
+    return "".join(out) or None
 
 
 def _class_end(segment: str, start: int) -> int | None:
@@ -416,7 +476,18 @@ def _class_end(segment: str, start: int) -> int | None:
     if index < len(segment) and segment[index] == "]":
         index += 1
     while index < len(segment) and segment[index] != "]":
-        index += 2 if segment[index] == "\\" else 1
+        if segment[index] == "\\":
+            index += 2
+            continue
+        # A POSIX class carries a ``]`` of its own; it does not close the
+        # bracket expression that holds it.
+        if segment.startswith("[:", index):
+            closing = segment.find(":]", index + 2)
+            if closing == -1:
+                return None
+            index = closing + 2
+            continue
+        index += 1
     return index if index < len(segment) else None
 
 

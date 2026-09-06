@@ -245,6 +245,17 @@ def test_scope_summary_folds_both_walks_without_double_counting() -> None:
     assert scope_summary(Discovery([]))["complete"] is True
 
 
+def test_one_file_that_failed_differently_in_each_walk_counts_once() -> None:
+    """Two records, one unreadable file: the counts are of paths, not rows."""
+    initial = Discovery([], (ScopeAnomaly("a/lost.c", "read", "EACCES", "Permission denied"),))
+    recheck = Discovery([], (ScopeAnomaly("a/lost.c", "stat", "EACCES", "Permission denied"),))
+
+    summary = scope_summary(initial, recheck)
+
+    assert summary["unreadable_files"] == 1
+    assert summary["anomalies"] == 2
+
+
 # --- the stability recheck --------------------------------------------------
 
 
@@ -283,6 +294,40 @@ def test_a_file_the_recheck_cannot_read_is_unverified_not_deleted(
     assert inventory["recheck"]["anomalies"] == [{
         "path": "vendor/helper.c", "operation": "read", "error": "EACCES", "reason": "Permission denied",
     }]
+
+
+def test_a_file_only_the_first_walk_could_not_read_is_unverified_not_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file was there the whole time; the first walk just could not read
+    it.  Calling that an addition invents a source change out of an errno."""
+    source = _tree(tmp_path)
+    config = _config(tmp_path, source)
+    import code_analyzer.runner as runner_module
+
+    real = runner_module.discover
+    calls: list[int] = []
+
+    def blind_first(*args: Any, **kwargs: Any) -> Discovery:
+        calls.append(1)
+        found = real(*args, **kwargs)
+        if len(calls) > 1:
+            return found
+        return Discovery(
+            [item for item in found.files if item["path"] != "vendor/helper.c"],
+            (*found.anomalies, ScopeAnomaly("vendor/helper.c", "read", "EACCES", "Permission denied")),
+        )
+
+    monkeypatch.setattr(runner_module, "discover", blind_first)
+    exit_code, run_dir = analyze(source, config)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    changes = manifest["source_inventory"]["changes"]
+    assert changes["added"] == [] and changes["unverified"] == ["vendor/helper.c"]
+    assert manifest["source_inventory"]["stable"] is None
+    assert manifest["source_inventory"]["scope"]["discovery_complete"] is False
+    assert manifest["source_inventory"]["scope"]["recheck_complete"] is True
+    assert exit_code == 10
 
 
 def test_the_same_missed_directory_in_both_walks_is_not_a_stable_source(
@@ -441,7 +486,20 @@ def test_the_live_graph_draws_discovery_as_partial() -> None:
     assert nodes["discovery"]["state"] == "partial"
     assert nodes["discovery"]["note"] == "范围不完整：2 个文件无法读取，1 个目录无法遍历"
     complete = graph({"run_id": "x", "tools": {}, "source_inventory": {"total": 1, "scope": {"complete": True}}})
-    assert {item["id"]: item for item in complete["nodes"]}["discovery"]["state"] == "success"
+    node = {item["id"]: item for item in complete["nodes"]}["discovery"]
+    assert (node["state"], node["note"]) == ("success", None)
+
+
+def test_the_live_graph_says_scope_is_unrecorded_for_an_older_run() -> None:
+    from code_analyzer.serve import graph
+
+    old = {"run_id": "old", "tools": {}, "source_inventory": {"total": 5, "stable": True}}
+
+    node = {item["id"]: item for item in graph(old)["nodes"]}["discovery"]
+
+    # The offline report says 未记录; the live page must not say ✓ instead.
+    assert (node["state"], node["note"]) == ("success", "范围完整性未记录")
+    assert {item["id"]: item for item in graph({"run_id": "x", "tools": {}})["nodes"]}["discovery"]["note"] is None
 
 
 def test_the_tui_discovery_row_says_the_scope_is_incomplete() -> None:
@@ -460,6 +518,37 @@ def test_the_tui_discovery_row_says_the_scope_is_incomplete() -> None:
     node = flow.nodes["discovery"]
     assert node.state == "partial"
     assert node.detail == "120 文件 · 无 compile-db · 范围不完整（2 文件不可读，1 目录不可进）"
+
+
+def test_the_tui_follows_a_recheck_that_went_blind(tmp_path: Path) -> None:
+    """Discovery was complete and said so; the stability walk was not."""
+    import copy
+
+    from code_analyzer.config import DEFAULTS, validate_config
+    from code_analyzer.flow import RunFlow
+
+    flow = RunFlow(validate_config(copy.deepcopy(DEFAULTS)))
+    flow.apply(AnalysisEvent(
+        "discovery", "finished", "inventory ready: 3 files", timestamp=0.0,
+        data={"files": 3, "compile_db_entries": 0, "compile_db_path": None,
+              "scope": {"complete": True, "unreadable_files": 0, "unreadable_directories": 0,
+                        "unreadable_ignore_files": 0}},
+    ))
+    assert flow.nodes["discovery"].state == "success"
+
+    flow.apply(AnalysisEvent(
+        "stability", "finished", "source stability could not be verified", timestamp=1.0,
+        data={"stable": None, "changes": {}, "scope": {
+            "complete": False, "recheck_complete": False, "unreadable_files": 1,
+            "unreadable_directories": 0, "unreadable_ignore_files": 0,
+        }},
+    ))
+
+    assert flow.nodes["stability"].state == "partial"
+    assert flow.nodes["discovery"].state == "partial"
+    assert flow.nodes["discovery"].detail.endswith("范围不完整（1 文件不可读）")
+    # And the clause is replaced, not stacked, when discovery already had one.
+    assert flow.nodes["discovery"].detail.count("范围不完整") == 1
 
 
 def test_preflight_warns_before_the_scan_rather_than_after(

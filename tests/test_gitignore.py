@@ -41,6 +41,8 @@ TREE: dict[str, str] = {
         "num[0-9].c\n"
         "blocked/\n"
         "/sub/anchored.c\n"
+        "file[[:digit:]].c\n"     # POSIX bracket expression
+        "[[:upper:]]init.c\n"
     ),
     "a.c": "", "rooted.c": "", "x.tmp.c": "",
     "plain/.gitignore": "/local.c\n",
@@ -59,12 +61,15 @@ TREE: dict[str, str] = {
     "mid/target.c": "", "mid/x/y/target.c": "", "mid/x/keep.c": "",
     "!bang.c": "", "num7.c": "", "numX.c": "",
     "blocked/.gitignore": "!inside.c\n", "blocked/inside.c": "",
+    "file7.c": "", "fileX.c": "", "Ainit.c": "", "binit.c": "",
 }
 KEPT = {
     "a.c",
+    "binit.c",
     "cchoice.c",
     "deepdir/elsewhere.c",
     "docs/api/manual.c",
+    "fileX.c",
     "mid/x/keep.c",
     "numX.c",
     "plain/deeper/local.c",
@@ -112,6 +117,16 @@ def test_the_fixed_sample_agrees_with_git(tmp_path: Path) -> None:
     )
 
     assert {name for name in listed.stdout.split("\0") if name.endswith(".c")} == KEPT
+
+
+def test_posix_bracket_expressions_match_the_way_git_matches_them(tmp_path: Path) -> None:
+    """``[[:digit:]]`` is Git's syntax, not Python's; unexpanded it used to
+    read as the literal characters of its own name and match nothing."""
+    source = _build(tmp_path)
+    found = _found(source, _config(source, tmp_path), tmp_path)
+
+    assert "file7.c" not in found and "fileX.c" in found
+    assert "Ainit.c" not in found and "binit.c" in found
 
 
 def test_the_ignore_file_of_a_directory_governs_only_that_subtree(tmp_path: Path) -> None:
