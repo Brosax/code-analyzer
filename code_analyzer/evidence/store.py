@@ -54,6 +54,14 @@ CREATE TABLE clusters(
   top_rank INTEGER NOT NULL) WITHOUT ROWID;
 CREATE INDEX clusters_rank ON clusters(top_rank DESC, members DESC, path, line_start);
 CREATE INDEX clusters_path ON clusters(path, line_start);
+CREATE TABLE pvs(
+  pv_id TEXT PRIMARY KEY, partition TEXT NOT NULL, level TEXT, level_rank INTEGER NOT NULL, level_basis TEXT,
+  proposed_level TEXT, module TEXT, sfr TEXT, sfr_ids TEXT, anchor TEXT, cluster_id TEXT, path TEXT,
+  function TEXT, family TEXT, line_start INTEGER, line_end INTEGER, members INTEGER, tools TEXT,
+  priority INTEGER NOT NULL, priority_why TEXT, multi_engine INTEGER, match TEXT, status TEXT NOT NULL,
+  row TEXT NOT NULL) WITHOUT ROWID;
+CREATE INDEX pvs_rank ON pvs(partition, priority DESC, path, line_start);
+CREATE TABLE triage(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
 
 
@@ -70,7 +78,8 @@ class Store:
         self.db.execute("PRAGMA mmap_size = 268435456")
 
     @classmethod
-    def build(cls, path: Path, parsed: ParsedRun, clusters: Iterable[Cluster]) -> Store:
+    def build(cls, path: Path, parsed: ParsedRun, clusters: Iterable[Cluster], *,
+              pvs: Iterable[Any] = (), triage: dict[str, int] | None = None) -> Store:
         """Write a fresh index atomically: a half-built index never replaces a good one."""
         temporary = path.with_name(path.name + ".building")
         if temporary.exists():
@@ -78,6 +87,7 @@ class Store:
         store = cls(temporary)
         store.db.executescript(_SCHEMA)
         store._load(parsed, list(clusters))
+        store._load_pvs(list(pvs), triage or {})
         store.db.commit()
         store.db.close()
         os.replace(temporary, path)
@@ -107,6 +117,16 @@ class Store:
               ",".join(sorted(c.tools)), top.get(c.id, "unmapped"), _rank(top.get(c.id))) for c in clusters))
         for name, value in (("schema_version", SCHEMA_VERSION), ("run_id", parsed.run_id), ("source", str(parsed.source))):
             self.db.execute("INSERT INTO meta VALUES (?, ?)", (name, str(value)))
+
+    def _load_pvs(self, entries: list[Any], triage: dict[str, int]) -> None:
+        self.db.executemany(
+            "INSERT INTO pvs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ((e.pv_id, e.partition, e.level, _rank(e.level), e.level_basis, e.proposed_level, e.module, _json(e.sfr),
+              "," + ",".join(s["id"] for s in e.sfr) + ",", e.anchor, e.cluster_id, e.path, e.function, e.family,
+              e.line_start, e.line_end, len(e.members), ",".join(e.tools), e.priority, _json(e.priority_why),
+              int(e.multi_engine), e.match, "open", _json(e.as_row()))
+             for e in entries if e.pv_id))
+        self.db.executemany("INSERT INTO triage VALUES (?, ?)", sorted(triage.items()))
 
     # -- queries -----------------------------------------------------------------------
     def counts(self) -> dict[str, Any]:
@@ -144,6 +164,33 @@ class Store:
                                [*args, PAGE_SIZE, (page - 1) * PAGE_SIZE])
         return {"total": total, "page": page, "rows": [dict(r) for r in rows]}
 
+    def list_pvs(self, where: dict[str, Any] | None = None, *, sort: str = "priority", page: int = 1) -> dict[str, Any]:
+        """One page of the vulnerability list, with totals by partition and level."""
+        clause, args = _where(where or {}, _PV_FILTERS)
+        order = {"priority": "priority DESC, path, line_start", "level": "level_rank DESC, priority DESC, path",
+                 "path": "path, line_start"}.get(sort, "priority DESC, path, line_start")
+        total = self.db.execute(f"SELECT COUNT(*) FROM pvs{clause}", args).fetchone()[0]
+        rows = self.db.execute(
+            f"SELECT pv_id, partition, level, level_basis, proposed_level, module, sfr, path, function, family, "
+            f"line_start, line_end, members, tools, priority, status FROM pvs{clause} ORDER BY {order} "
+            f"LIMIT ? OFFSET ?", [*args, PAGE_SIZE, (page - 1) * PAGE_SIZE])
+        partitions = dict(self.db.execute(f"SELECT partition, COUNT(*) FROM pvs{clause} GROUP BY partition", args)
+                          .fetchall())
+        levels = dict(self.db.execute(f"SELECT level, COUNT(*) FROM pvs{clause} GROUP BY level", args).fetchall())
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["sfr"] = json.loads(item["sfr"] or "[]")
+            out.append(item)
+        return {"total": total, "page": page, "rows": out, "by_partition": partitions, "by_level": levels}
+
+    def pv(self, pv_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT row FROM pvs WHERE pv_id = ?", (pv_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def triage_counts(self) -> dict[str, int]:
+        return dict(self.db.execute("SELECT key, value FROM triage ORDER BY key").fetchall())
+
     def cluster_members(self, cluster_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT row FROM findings WHERE cluster_id = ? ORDER BY line, fingerprint", (cluster_id,))
         return [json.loads(r[0]) for r in rows]
@@ -159,6 +206,10 @@ class Store:
             out += jsonl_bytes({"diagnostics": dict(row)})
         for row in self.db.execute("SELECT * FROM clusters ORDER BY cluster_id"):
             out += jsonl_bytes({"clusters": dict(row)})
+        for row in self.db.execute("SELECT pv_id, row FROM pvs ORDER BY pv_id"):
+            out += jsonl_bytes({"pvs": dict(row)})
+        for row in self.db.execute("SELECT * FROM triage ORDER BY key"):
+            out += jsonl_bytes({"triage": dict(row)})
         for row in self.db.execute("SELECT * FROM meta ORDER BY key"):
             out += jsonl_bytes({"meta": dict(row)})
         return bytes(out)
@@ -170,6 +221,8 @@ class Store:
 _FINDING_FILTERS = {"tool": "tool = ?", "rule": "rule_id = ?", "level": "review_level = ?",
                     "view_class": "view_class = ?", "family": "family = ?", "cluster": "cluster_id = ?",
                     "path": "path GLOB ?", "function": "function = ?"}
+_PV_FILTERS = {"partition": "partition = ?", "level": "level = ?", "module": "module = ?", "family": "family = ?",
+               "path": "path GLOB ?", "sfr": "sfr_ids LIKE '%,' || ? || ',%'", "status": "status = ?"}
 _CLUSTER_FILTERS = {"path": "path GLOB ?", "family": "family = ?", "level": "top_level = ?",
                     "function": "function = ?", "tool": "(',' || tools || ',') LIKE '%,' || ? || ',%'"}
 

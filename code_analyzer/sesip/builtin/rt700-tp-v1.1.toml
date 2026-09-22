@@ -1,0 +1,195 @@
+# Built-in, read-only.  Copy it to start a profile of your own; an evaluation
+# confirms a profile before its rules and TOE are used for the list.
+[evaluation]
+id = "rt700-tp-v1.1"
+name = "NXP i.MX RT700 SESIP Level 3 - AVA Test Plan"
+status = "builtin"
+version = 1
+base = "builtin"
+
+[test_plan]
+reference = "NXP i.MX RT700 SESIP Level 3 - AVA Test Plan v1.1 (2026-07-07), NXP_iMXRT700-AVA_TP_v1.1 (1).pdf, sha256 54c9cff44e72b489ab95f5f309ee9043508cc7657fb662092c6fc57b19540f35"
+levels_section = "7.4.1"
+categories_section = "7.4.2"
+category_kind = "defect_type"
+
+[advanced]
+pv_min_level = "warning"
+
+[[documents]]
+role = "test_plan"
+file = "NXP_iMXRT700-AVA_TP_v1.1 (1).pdf"
+sha256 = "54c9cff44e72b489ab95f5f309ee9043508cc7657fb662092c6fc57b19540f35"
+title = "NXP i.MX RT700 SESIP Level 3 - AVA Test Plan"
+
+[[sfr]]
+id = "SESIP-VPI"
+catalogue = "Verification of Platform Identity"
+title = "Verification of Platform Identity"
+
+[[sfr]]
+id = "SESIP-VPII"
+catalogue = "Verification of Platform Instance Identity"
+title = "Verification of Platform Instance Identity"
+
+[[sfr]]
+id = "SESIP-APG"
+catalogue = "Attestation of Platform Genuineness"
+title = "Attestation of Platform Genuineness"
+
+[[sfr]]
+id = "SESIP-APS"
+catalogue = "Attestation of Platform State"
+title = "Attestation of Platform State"
+
+[[sfr]]
+id = "SESIP-SIP"
+catalogue = "Secure Initialization of Platform"
+title = "Secure Initialization of Platform"
+
+[[sfr]]
+id = "SESIP-SUP"
+catalogue = "Secure Update of Platform"
+title = "Secure Update of Platform"
+
+[[sfr]]
+id = "SESIP-SCS"
+catalogue = "Secure Communication Support"
+title = "Secure Communication Support"
+
+[[sfr]]
+id = "SESIP-SCE"
+catalogue = "Secure Communication Enforcement"
+title = "Secure Communication Enforcement"
+
+[[sfr]]
+id = "SESIP-SS"
+catalogue = "Secure Storage"
+title = "Secure Storage"
+
+[[sfr]]
+id = "SESIP-SES"
+catalogue = "Secure Encrypted Storage"
+title = "Secure Encrypted Storage"
+
+[[sfr]]
+id = "SESIP-SESX"
+catalogue = "Secure External Storage"
+title = "Secure External Storage"
+
+[[sfr]]
+id = "SESIP-SD"
+catalogue = "Secure Debugging"
+title = "Secure Debugging"
+
+[[sfr]]
+id = "SESIP-CO"
+catalogue = "Cryptographic Operation"
+title = "Cryptographic Operation"
+
+[[sfr]]
+id = "SESIP-CRNG"
+catalogue = "Cryptographic Random Number Generation"
+title = "Cryptographic Random Number Generation"
+
+[[sfr]]
+id = "SESIP-CK"
+catalogue = "Cryptographic KeyStore"
+title = "Cryptographic KeyStore"
+
+[[sfr]]
+id = "SESIP-RIP"
+catalogue = "Residual Information Purging"
+title = "Residual Information Purging"
+
+[[sfr]]
+id = "SESIP-ALGAS"
+catalogue = "Audit Log Generation and Storage"
+title = "Audit Log Generation and Storage"
+
+[[sfr]]
+id = "SESIP-SARIP"
+catalogue = "Software Attacker Resistance: Isolation of Platform"
+title = "Software Attacker Resistance: Isolation of Platform"
+
+[[sfr]]
+id = "SESIP-SARIPP"
+catalogue = "Software Attacker Resistance: Isolation of Platform Parts"
+title = "Software Attacker Resistance: Isolation of Platform Parts"
+
+[[sfr]]
+id = "SESIP-PAR"
+catalogue = "Physical Attacker Resistance"
+title = "Physical Attacker Resistance"
+
+[[sfr]]
+id = "SESIP-LPAR"
+catalogue = "Limited Physical Attacker Resistance"
+title = "Limited Physical Attacker Resistance"
+
+[[sfr]]
+id = "SESIP-FR"
+catalogue = "Factory Reset"
+title = "Factory Reset"
+
+[[sfr]]
+id = "SESIP-FRP"
+catalogue = "Field Return of Platform"
+title = "Field Return of Platform"
+
+[[sfr]]
+id = "SESIP-DP"
+catalogue = "Decommission of Platform"
+title = "Decommission of Platform"
+
+[[toe_module]]
+id = "all"
+paths = ["**"]
+
+[[level]]
+id = "error"
+label = "Error"
+rank = 4
+description = "Requires immediate review because the issue may cause serious runtime failures; missing build context can still make individual cases false positives."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "warning"
+label = "Warning"
+rank = 3
+description = "Potentially compromises code during execution and should be reviewed with attention to its actual use."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "style"
+label = "Style"
+rank = 2
+description = "Coding-practice or optimization concern without a direct security impact, but capable of contributing to unwanted behavior."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "information"
+label = "Information"
+rank = 1
+description = "Often caused by incomplete external dependencies or analysis context; it still requires verification before being dismissed."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[grading_rule]]
+match = {native = "error"}
+level = "error"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "warning"}
+level = "warning"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "style"}
+level = "style"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "information"}
+level = "information"
+basis = "native-exact"

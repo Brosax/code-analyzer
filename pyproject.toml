@@ -27,6 +27,7 @@ include = ["code_analyzer*"]
 # they are missing from every non-editable install and the LLM phase fails.
 [tool.setuptools.package-data]
 "code_analyzer.skills" = ["*/SKILL.md"]
+"code_analyzer.sesip" = ["builtin/*.toml"]
 
 [tool.ruff]
 target-version = "py311"

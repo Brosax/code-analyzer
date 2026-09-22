@@ -97,6 +97,22 @@ def parser() -> argparse.ArgumentParser:
     assess.add_argument("--config", type=Path)
     assess.add_argument("--max-candidates", type=positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
     add_llm_arguments(assess)
+    evaluate = commands.add_parser(
+        "evaluate", help="v3 headless evaluation: run the analyzers, index the evidence, number the vulnerability "
+                         "list (no model); becomes `analyze` when the old runner is retired")
+    evaluate.add_argument("source", type=Path)
+    evaluate.add_argument("--profile", default="rt700-tp-v1.1",
+                          help="a built-in profile (rt700-tp-v1.1, generic-sesip) or a profile TOML")
+    evaluate.add_argument("--eval-dir", type=Path, help="evaluation directory (created if new, reused if it exists)")
+    evaluate.add_argument("--buildctx", type=Path, help="a build context TOML ([build] and [tools] only)")
+    evaluate.add_argument("--tool", action="append", choices=("cppcheck", "flawfinder", "splint"),
+                          help="run only this analyzer (repeatable)")
+    evaluate_db = evaluate.add_mutually_exclusive_group()
+    evaluate_db.add_argument("--compile-db", type=Path, help="an explicit compile_commands.json")
+    evaluate_db.add_argument("--no-compile-db", action="store_true", help="do not look for a compilation database")
+    evaluate.add_argument("--exclude", action="append", default=[], metavar="GLOB", help="exclude a path glob")
+    evaluate.add_argument("--fail-on", choices=("none", "low", "medium", "high", "critical"), default="none",
+                          help="exit 1 when a native finding reaches this severity (AI output never gates)")
     probe = commands.add_parser("probe", help="measure what the configured model can do (maintainers; needs an idle GPU)")
     probe.add_argument("--endpoint", help="model endpoint (default: settings.toml [local_model] endpoint)")
     probe.add_argument("--model", help="model name (default: settings.toml [local_model] name)")
@@ -189,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
             return outcome.exit_code
         if args.command == "probe":
             return _probe(args)
+        if args.command == "evaluate":
+            return _evaluate(args)
         if args.command == "compile-db":
             return _invoke("compile-db", ActionRequest(
                 "compile-db", source=args.source, args=args),
@@ -398,6 +416,20 @@ def _warn_third_party(config: dict[str, Any]) -> None:
     warning = third_party_warning(config["llm"])
     if warning:
         print(f"code-analyzer: warning: {warning}", file=sys.stderr)
+
+
+def _evaluate(args: argparse.Namespace) -> int:
+    from .evidence.analyze import evaluate
+    from .evidence.buildctx_schema import load_buildctx
+
+    outcome = evaluate(
+        args.source, eval_dir=args.eval_dir, profile=args.profile,
+        buildctx=load_buildctx(args.buildctx) if args.buildctx else None, tools=args.tool,
+        compile_db=False if args.no_compile_db else args.compile_db, exclude=args.exclude,
+        fail_on=args.fail_on, progress=lambda line: print(f"[code-analyzer] {line}", file=sys.stderr))
+    print(outcome.workspace.root)
+    print(f"[code-analyzer] evaluation finished: exit code {outcome.exit_code}", file=sys.stderr)
+    return outcome.exit_code
 
 
 def _probe(args: argparse.Namespace) -> int:

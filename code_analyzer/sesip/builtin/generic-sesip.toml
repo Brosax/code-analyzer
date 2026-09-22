@@ -1,0 +1,209 @@
+# Built-in, read-only.  Copy it to start a profile of your own; an evaluation
+# confirms a profile before its rules and TOE are used for the list.
+[evaluation]
+id = "generic-sesip"
+name = "Generic SESIP (no Security Target)"
+status = "builtin"
+version = 1
+base = "builtin"
+
+[test_plan]
+reference = "levels as in the DEKRA SESIP L3 AVA test plan (RT700 v1.1, §7.4.1); no issue categories"
+levels_section = "7.4.1"
+categories_section = ""
+category_kind = "defect_type"
+
+[advanced]
+pv_min_level = "warning"
+
+[[sfr]]
+id = "SESIP-VPI"
+catalogue = "Verification of Platform Identity"
+title = "Verification of Platform Identity"
+
+[[sfr]]
+id = "SESIP-VPII"
+catalogue = "Verification of Platform Instance Identity"
+title = "Verification of Platform Instance Identity"
+
+[[sfr]]
+id = "SESIP-APG"
+catalogue = "Attestation of Platform Genuineness"
+title = "Attestation of Platform Genuineness"
+
+[[sfr]]
+id = "SESIP-APS"
+catalogue = "Attestation of Platform State"
+title = "Attestation of Platform State"
+
+[[sfr]]
+id = "SESIP-SIP"
+catalogue = "Secure Initialization of Platform"
+title = "Secure Initialization of Platform"
+
+[[sfr]]
+id = "SESIP-SUP"
+catalogue = "Secure Update of Platform"
+title = "Secure Update of Platform"
+
+[[sfr]]
+id = "SESIP-SCS"
+catalogue = "Secure Communication Support"
+title = "Secure Communication Support"
+
+[[sfr]]
+id = "SESIP-SCE"
+catalogue = "Secure Communication Enforcement"
+title = "Secure Communication Enforcement"
+
+[[sfr]]
+id = "SESIP-SS"
+catalogue = "Secure Storage"
+title = "Secure Storage"
+
+[[sfr]]
+id = "SESIP-SES"
+catalogue = "Secure Encrypted Storage"
+title = "Secure Encrypted Storage"
+
+[[sfr]]
+id = "SESIP-SESX"
+catalogue = "Secure External Storage"
+title = "Secure External Storage"
+
+[[sfr]]
+id = "SESIP-SD"
+catalogue = "Secure Debugging"
+title = "Secure Debugging"
+
+[[sfr]]
+id = "SESIP-CO"
+catalogue = "Cryptographic Operation"
+title = "Cryptographic Operation"
+
+[[sfr]]
+id = "SESIP-CRNG"
+catalogue = "Cryptographic Random Number Generation"
+title = "Cryptographic Random Number Generation"
+
+[[sfr]]
+id = "SESIP-CK"
+catalogue = "Cryptographic KeyStore"
+title = "Cryptographic KeyStore"
+
+[[sfr]]
+id = "SESIP-RIP"
+catalogue = "Residual Information Purging"
+title = "Residual Information Purging"
+
+[[sfr]]
+id = "SESIP-ALGAS"
+catalogue = "Audit Log Generation and Storage"
+title = "Audit Log Generation and Storage"
+
+[[sfr]]
+id = "SESIP-SARIP"
+catalogue = "Software Attacker Resistance: Isolation of Platform"
+title = "Software Attacker Resistance: Isolation of Platform"
+
+[[sfr]]
+id = "SESIP-SARIPP"
+catalogue = "Software Attacker Resistance: Isolation of Platform Parts"
+title = "Software Attacker Resistance: Isolation of Platform Parts"
+
+[[sfr]]
+id = "SESIP-PAR"
+catalogue = "Physical Attacker Resistance"
+title = "Physical Attacker Resistance"
+
+[[sfr]]
+id = "SESIP-LPAR"
+catalogue = "Limited Physical Attacker Resistance"
+title = "Limited Physical Attacker Resistance"
+
+[[sfr]]
+id = "SESIP-FR"
+catalogue = "Factory Reset"
+title = "Factory Reset"
+
+[[sfr]]
+id = "SESIP-FRP"
+catalogue = "Field Return of Platform"
+title = "Field Return of Platform"
+
+[[sfr]]
+id = "SESIP-DP"
+catalogue = "Decommission of Platform"
+title = "Decommission of Platform"
+
+[[toe_module]]
+id = "all"
+paths = ["**"]
+
+[[level]]
+id = "error"
+label = "Error"
+rank = 4
+description = "Requires immediate review because the issue may cause serious runtime failures; missing build context can still make individual cases false positives."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "warning"
+label = "Warning"
+rank = 3
+description = "Potentially compromises code during execution and should be reviewed with attention to its actual use."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "style"
+label = "Style"
+rank = 2
+description = "Coding-practice or optimization concern without a direct security impact, but capable of contributing to unwanted behavior."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[level]]
+id = "information"
+label = "Information"
+rank = 1
+description = "Often caused by incomplete external dependencies or analysis context; it still requires verification before being dismissed."
+source = {doc = "tp", page = "26-27", quote = ""}
+
+[[grading_rule]]
+match = {native = "error"}
+level = "error"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "warning"}
+level = "warning"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "style"}
+level = "style"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {native = "information"}
+level = "information"
+basis = "native-exact"
+
+[[grading_rule]]
+match = {tool = "flawfinder", native = "note"}
+level = "information"
+basis = "proposed"
+
+[[grading_rule]]
+match = {tool = "cppcheck", native = ["portability", "performance"]}
+level = "style"
+basis = "proposed"
+
+[[grading_rule]]
+match = {tool = "splint", family = ["buffer", "null-dereference", "resource-leak", "format", "uninitialized"]}
+level = "warning"
+basis = "proposed"
+
+[[grading_rule]]
+match = {tool = "splint"}
+level = "information"
+basis = "proposed"
