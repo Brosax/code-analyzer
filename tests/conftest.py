@@ -51,6 +51,22 @@ def no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(propose_module, "propose", refused)
 
 
+@pytest.fixture(autouse=True)
+def private_home(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Nothing a test does lands in the operator's ~/.code-analyzer.
+
+    Before this, the TUI tests wrote 612 session journals into the real
+    sessions directory, where they were indistinguishable from real use.
+    """
+    home = tmp_path_factory.mktemp("code-analyzer-home")
+    monkeypatch.setenv("CODE_ANALYZER_HOME", str(home))
+    monkeypatch.setenv("CODE_ANALYZER_ASK_ROOT", str(home / "ask"))
+    from code_analyzer import journal
+
+    monkeypatch.setattr(journal, "SESSIONS_DIRECTORY", home / "sessions")
+    return home
+
+
 @pytest.fixture
 def provider_lane_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Opt back in: for the tests that exercise the gate's own refusals.

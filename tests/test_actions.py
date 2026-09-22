@@ -55,10 +55,11 @@ def test_every_cli_subcommand_is_backed_by_exactly_one_registry_action() -> None
     commands = {
         name for name, item in parser()._subparsers._group_actions[0].choices.items()  # noqa: SLF001
     }
-    # `tui` opens a front end rather than performing an action; everything else
-    # a subcommand can do, the conversation can ask for by name.
+    # `tui` opens a front end rather than performing an action; `probe` is a v3
+    # maintainer command outside this legacy registry (docs/v3-design.md §1).
+    # Everything else a subcommand can do, the conversation can ask for by name.
     backed = set(BY_CLI_COMMAND)
-    assert commands - backed == {"tui"}
+    assert commands - backed == {"tui", "probe"}
     assert backed <= commands
     assert len({action.name for action in REGISTRY}) == len(REGISTRY)
 

@@ -97,6 +97,15 @@ def parser() -> argparse.ArgumentParser:
     assess.add_argument("--config", type=Path)
     assess.add_argument("--max-candidates", type=positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
     add_llm_arguments(assess)
+    probe = commands.add_parser("probe", help="measure what the configured model can do (maintainers; needs an idle GPU)")
+    probe.add_argument("--endpoint", help="model endpoint (default: settings.toml [local_model] endpoint)")
+    probe.add_argument("--model", help="model name (default: settings.toml [local_model] name)")
+    probe.add_argument("--transport", choices=("v1", "api_chat"), default="v1")
+    probe.add_argument("--only", help="comma-separated items, e.g. P1,P3,P9 (default: all but the heavy P12)")
+    probe.add_argument("--repeat", type=positive_int, default=10, help="repetitions per repeated item (default 10)")
+    probe.add_argument("--heavy", action="store_true", help="also run P12: minutes of background load")
+    probe.add_argument("--minutes", type=positive_float, default=10.0, help="P12 load duration per concurrency")
+    probe.add_argument("--json", action="store_true", dest="as_json")
     summarize = commands.add_parser("summarize", help="ask the model for one overall account of a finished run")
     summarize.add_argument("report_directory", type=Path, metavar="REPORT_DIR")
     summarize.add_argument("--config", type=Path)
@@ -178,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                 for line in outcome.lines:
                     print(line)
             return outcome.exit_code
+        if args.command == "probe":
+            return _probe(args)
         if args.command == "compile-db":
             return _invoke("compile-db", ActionRequest(
                 "compile-db", source=args.source, args=args),
@@ -387,6 +398,34 @@ def _warn_third_party(config: dict[str, Any]) -> None:
     warning = third_party_warning(config["llm"])
     if warning:
         print(f"code-analyzer: warning: {warning}", file=sys.stderr)
+
+
+def _probe(args: argparse.Namespace) -> int:
+    from .model.client import Endpoint
+    from .model.probe import ITEMS, run_probe
+    from .settings import load_settings
+
+    settings = load_settings()
+    endpoint = Endpoint(args.endpoint or settings.local_endpoint, args.model or settings.local_model,
+                        transport=args.transport)
+    items = tuple(item.strip().upper() for item in args.only.split(",")) if args.only else ITEMS
+
+    def log(line: str) -> None:
+        print(line, file=sys.stderr)
+
+    print(f"code-analyzer: probing {endpoint.model} at {endpoint.base_url}; the GPU should be idle", file=sys.stderr)
+    path, document = run_probe(endpoint, items=items, repeat=args.repeat, heavy=args.heavy,
+                               minutes=args.minutes, log=log)
+    verdict = document["verdict"]
+    if args.as_json:
+        print(json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"codec: {verdict['codec']}  batch concurrency: {verdict['batch_concurrency']}  "
+              f"window: {document.get('window')}  HTTP 500s: {verdict['http_500']}")
+        for failed in verdict["failed_checks"]:
+            print(f"  failed: {failed}")
+        print(path)
+    return 0
 
 
 def _has_tty() -> bool:
