@@ -184,9 +184,10 @@ class Probe:
         trials, detail = [], []
         for _ in range(min(self.repeat, 5)):
             reply, _ = self.ask([UserSaid("你好")], tool_choice="none", max_tokens=200)
-            completion = reply.usage.get("completion_tokens")
-            short = completion < 50 if isinstance(completion, int) else len(reply.text) < 100
-            ok = not reply.reasoning and "<think>" not in reply.text and short
+            # What is being checked is that thinking is off: no reasoning text and
+            # no <think> block.  The token count is recorded, not judged -- a
+            # greeting that introduces the agent is legitimately 60-120 tokens.
+            ok = not reply.reasoning and "<think>" not in reply.text
             trials.append(ok)
             detail.append({"completion_tokens": reply.usage.get("completion_tokens"), "reasoning_chars": len(reply.reasoning)})
         return self.tally("P2 thinking off", trials, detail)

@@ -74,26 +74,7 @@ def build_review(
 
     for item in findings:
         _check_cancelled(cancelled)
-        item["canonical_path"] = cached_canonical(item.get("file", ""))
-        engine = "llm" if item.get("engine") == "llm" else "static"
-        item["engine"] = engine
-        item["producer"] = str(item.get("producer") or item["tool"])
-        item["evidence_class"] = "generated" if engine == "llm" else "native"
-        # A hallucinated critical must never be able to fail somebody's build.
-        item["gate_eligible"] = engine == "static"
-        item["severity"] = _normalize_severity(
-            item["tool"], item.get("original_severity", ""), item.get("severity_scale"), engine=engine
-        )
-        # Splint deliberately remains unknown: its native output has no stable
-        # severity scale that can support an authoritative gate.
-        if item["tool"] == "splint":
-            item["severity"] = "unknown"
-        item["severity_mapping_version"] = SEVERITY_MAPPING_VERSION
-        item["rank"] = SEVERITY_RANK[item["severity"]]
-        item["review_level"] = reference_review_level(item.get("original_severity", ""))
-        item["review_level_mapping_version"] = GRADING_MAPPING_VERSION
-        item["review_level_rank"] = REVIEW_LEVEL_RANK[item["review_level"]]
-        item["fingerprint"] = _fingerprint(item)
+        enrich_row(item, cached_canonical)
     for item in diagnostics:
         _check_cancelled(cancelled)
         item["canonical_path"] = cached_canonical(item.get("file", ""))
@@ -293,6 +274,35 @@ def write_review(
     )
     _check_cancelled(cancelled)
     (directory / "summary.md").write_text(markdown_report(summary, max_findings), encoding="utf-8")
+
+
+def enrich_row(item: dict[str, Any], cached_canonical: Callable[[Any], str]) -> dict[str, Any]:
+    """The derived fields every parsed finding row carries, in place.
+
+    Shared by the review (this module) and the v3 evidence store
+    (evidence/findings.py), so a row means the same thing in both.
+    """
+    item["canonical_path"] = cached_canonical(item.get("file", ""))
+    engine = "llm" if item.get("engine") == "llm" else "static"
+    item["engine"] = engine
+    item["producer"] = str(item.get("producer") or item["tool"])
+    item["evidence_class"] = "generated" if engine == "llm" else "native"
+    # A hallucinated critical must never be able to fail somebody's build.
+    item["gate_eligible"] = engine == "static"
+    item["severity"] = _normalize_severity(
+        item["tool"], item.get("original_severity", ""), item.get("severity_scale"), engine=engine
+    )
+    # Splint deliberately remains unknown: its native output has no stable
+    # severity scale that can support an authoritative gate.
+    if item["tool"] == "splint":
+        item["severity"] = "unknown"
+    item["severity_mapping_version"] = SEVERITY_MAPPING_VERSION
+    item["rank"] = SEVERITY_RANK[item["severity"]]
+    item["review_level"] = reference_review_level(item.get("original_severity", ""))
+    item["review_level_mapping_version"] = GRADING_MAPPING_VERSION
+    item["review_level_rank"] = REVIEW_LEVEL_RANK[item["review_level"]]
+    item["fingerprint"] = _fingerprint(item)
+    return item
 
 
 def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
