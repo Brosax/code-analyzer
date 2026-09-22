@@ -27,7 +27,7 @@ from .audit import (
     load_assessment,
     write_assessment,
 )
-from .dashboard import rebuild_dashboard
+from .dashboard import refresh_reports
 from .errors import UserError
 from .harness.cordis import cordis_document, tool_allowlist, write_cordis_config
 from .harness.runtime import harness_available, redact_credential
@@ -188,7 +188,7 @@ def run_assess(
     manifest["audit"] = block
     manifest["artifacts"] = artifact_index(run_dir)
     _save_manifest(run_dir, manifest)
-    rebuild_dashboard(run_dir)
+    refresh_reports(run_dir)
     progress(
         f"assess: {status}; {len(verdicts)} verdict(s), {failed} failed, {unscheduled} unscheduled"
     )

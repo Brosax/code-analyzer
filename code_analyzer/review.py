@@ -331,74 +331,16 @@ def _scope_line(summary: dict[str, Any]) -> str:
     )
 
 
-def markdown_report(summary: dict[str, Any], max_findings: int = 200) -> str:
-    contexts = summary.get("finding_counts", {})
-    lines = [
-        "# Code Analyzer Review", "", f"Project: `{summary.get('project', '')}`",
-        f"Run: `{summary.get('run', {}).get('id', '')}`", f"Total findings: `{summary.get('total_findings', 0)}`",
-        f"Build-aware findings: `{contexts.get('build-aware', 0)}`",
-        f"Source-only findings: `{contexts.get('source-only', 0)}`",
-        f"Tool diagnostics: `{summary.get('total_diagnostics', 0)}`",
-        f"Scan scope: {_scope_line(summary)}",
-    ]
-    reference = summary.get("grading_reference", {})
-    document = reference.get("document", {})
-    section = reference.get("section", {})
-    lines.extend([
-        "", "## Code Review Grading Reference", "",
-        f"- Document: `{document.get('file_name', 'not declared')}`",
-        f"- Document SHA-256: `{document.get('sha256', 'not declared')}`",
-        f"- Section: `{section.get('number', '')} {section.get('title', '')}`",
-    ])
-    for level in reference.get("levels", []):
-        lines.append(f"- `{level.get('label', level.get('id', ''))}`: {level.get('description', '')}")
-    application = reference.get("application", {})
-    if application:
-        lines.append(f"- Mapping: {application.get('note', '')}")
-        lines.append("- Manual verification is required; a tool level is not an automatic vulnerability verdict.")
-    lines.extend(["", "## Tool Status", ""])
-    for tool, data in summary.get("tools", {}).items():
-        reason = f" — {data['reason']}" if data.get("reason") else ""
-        lines.append(f"- `{tool}`: `{data.get('status', 'unknown')}`; findings: `{data.get('total_findings', 0)}`{reason}")
-    for scanner, data in summary.get("scanners", {}).items():
-        reason = f" — {data['reason']}" if data.get("reason") else ""
-        lines.append(
-            f"- `{scanner}` (llm, `{data.get('version') or 'unknown model'}`): "
-            f"`{data.get('status', 'unknown')}`; findings: `{data.get('total_findings', 0)}`{reason}"
-        )
-    lines.extend(["", "## Severity Counts", ""])
-    counts = summary.get("severity_counts", {})
-    lines.extend([f"- `{key}`: {value}" for key, value in counts.items()] or ["- No findings."])
-    lines.extend(["", "## Code Review Level Counts", ""])
-    level_counts = summary.get("review_level_counts", {})
-    lines.extend([f"- `{key}`: {value}" for key, value in level_counts.items()] or ["- No findings."])
-    lines.extend(["", "## Tool Diagnostics", ""])
-    for item in summary.get("diagnostics", []):
-        lines.append(
-            f"- `{item.get('severity', 'warning')}` `{item.get('tool', '')}` `{item.get('category', '')}` "
-            f"{item.get('canonical_path') or '<unknown>'}:{item.get('line', '')} — {item.get('message', '')}"
-        )
-    if not summary.get("diagnostics"):
-        lines.append("- No tool diagnostics.")
-    lines.extend(["", "## Cross-tool Nearby Overlap", ""])
-    for group in summary.get("overlap_groups", []):
-        lines.append(f"- `{group['canonical_path']}:{group['line']}`: {', '.join(group['tools'])}")
-    if not summary.get("overlap_groups"):
-        lines.append("- No cross-tool overlap groups.")
-    lines.extend(["", f"## Findings (first {max_findings})", ""])
-    for finding in summary.get("findings", [])[:max_findings]:
-        lines.append(
-            f"- review level `{finding.get('review_level', 'unmapped')}`; normalized severity `{finding['severity']}`; "
-            f"`{finding['tool']}` `{finding.get('evidence_context', 'source-only')}` `{finding['rule_id']}` "
-            f"{finding.get('canonical_path') or '<unknown>'}:{finding.get('line', '')} — {finding.get('message', '')}"
-        )
-    if not summary.get("findings"):
-        lines.append("- No findings to list.")
-    lines.extend([
-        "", "## Notes", "", "- This review is derived and non-authoritative; confirm findings against native artifacts.",
-        "- Nearby overlap preserves every finding and does not merge or deduplicate tool evidence.", "",
-    ])
-    return "\n".join(lines)
+def markdown_report(
+    summary: dict[str, Any], max_findings: int = 200, *,
+    manifest: dict[str, Any] | None = None,
+    assessment: dict[str, Any] | None = None,
+    run_summary: dict[str, Any] | None = None,
+) -> str:
+    from .report_presentation import review_markdown
+
+    return review_markdown(summary, _scope_line(summary), max_findings,
+                           manifest=manifest, assessment=assessment, run_summary=run_summary)
 
 
 def should_fail(summary: dict[str, Any], policy: str, *, include_generated: bool = False) -> bool:

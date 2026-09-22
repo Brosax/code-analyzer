@@ -251,6 +251,17 @@ point the dedicated command at an unpacked report directory:
 code-analyzer rebuild-dashboard /path/to/report-directory
 ```
 
+The offline report follows an audit reading order: scope and coverage gaps,
+candidate validation, existing AI opinion, then original findings and supporting
+statistics. Compact rows expand into full evidence and validation details;
+candidate links temporarily clear conflicting filters and can restore them.
+Counts distinguish the complete dataset from the 2,000 embedded findings and
+the current filter. Both candidate and finding tables expand for printing.
+Markdown headings and key statuses are bilingual. Existing AI summaries are
+labelled as opinion and checked against their recorded input digest; opening or
+rebuilding a report never calls a model. See the [report guide](docs/usage.md#11-查看结果)
+for the artifact layout and offline recovery workflow.
+
 If native reports already exist but an earlier review or export failed, rebuild
 all derived artifacts without running analyzers or changing native evidence:
 

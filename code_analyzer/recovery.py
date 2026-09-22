@@ -15,6 +15,7 @@ from .errors import UserError
 from .html_report import render
 from .llm.recover import recover_phase, unfinished
 from .persist import json_bytes, manifest_structure_problem
+from .report_presentation import load_run_summary, standalone_summary_markdown
 from .review import REVIEW_SCHEMA_VERSION, build_review, markdown_report
 from .sanitize import ExportError, export_shareable
 from .sarif import build_sarif
@@ -57,7 +58,6 @@ def recover_report(report_directory: Path) -> Path:
     config = _recovery_config(report_directory, source)
     max_findings = int(config["review"]["max_markdown_findings"])
     review_json = json_bytes(review)
-    review_markdown = markdown_report(review, max_findings).encode("utf-8")
     # Correlation is re-derived; verdicts were bought with model time and survive.
     assessment = carry_verdicts(build_assessment(review), load_assessment(report_directory))
     assessment_json = json_bytes(assessment)
@@ -93,40 +93,57 @@ def recover_report(report_directory: Path) -> Path:
             config,
             [inventory_path, report_directory / "inputs" / "effective-config.toml"],
             review_override=review,
+            assessment_override=assessment,
             archive_name=archive_name,
         )
         # Export metadata describes the recovered archive, while scan outcome
         # and tool execution records remain byte-for-byte equivalent values.
         for key, value in original_state.items():
             recovered[key] = value
+        run_summary = load_run_summary(report_directory, recovered, review, assessment)
+        # Generated files are known to be part of this transaction, even when
+        # the old manifest did not index them yet.
+        reading_manifest = {**recovered, "artifacts": artifact_index(report_directory)}
+        reading_manifest["artifacts"].extend({"path": path} for path in
+                                             ("review/summary.json", "audit/assessment.json"))
+        review_markdown = markdown_report(review, max_findings, manifest=reading_manifest,
+                                         assessment=assessment, run_summary=run_summary).encode("utf-8")
+        summary_markdown = None
+        if run_summary.get("status") == "available" or (report_directory / "audit" / "summary.md").exists():
+            summary_markdown = standalone_summary_markdown(run_summary, reading_manifest).encode("utf-8")
         artifacts = artifact_index(report_directory)
         artifacts = _replace_artifact(artifacts, "review/summary.json", review_json)
         artifacts = _replace_artifact(artifacts, "review/summary.md", review_markdown)
         artifacts = _replace_artifact(artifacts, "audit/assessment.json", assessment_json)
         artifacts = _replace_artifact(artifacts, "review/summary.sarif", sarif_json)
+        if summary_markdown is not None:
+            artifacts = _replace_artifact(artifacts, "audit/summary.md", summary_markdown)
         # An earlier assess left validator fields here; the counts come fresh.
         recovered["audit"] = {**(manifest.get("audit") or {}), **assessment_summary(assessment), "error": None}
         render_manifest = copy.deepcopy(recovered)
         render_manifest["artifacts"] = [item for item in artifacts if item.get("path") != "index.html"]
-        index_bytes = render(render_manifest, review, assessment).encode("utf-8")
+        index_bytes = render(render_manifest, review, assessment, run_summary=run_summary).encode("utf-8")
         artifacts = _replace_artifact(artifacts, "index.html", index_bytes)
         recovered["artifacts"] = artifacts
         recovered["recovery"]["derived_artifacts"] = [
             item for item in artifacts
             if item.get("path") in {
-                "review/summary.json", "review/summary.md", "review/summary.sarif", "audit/assessment.json", "index.html",
+                "review/summary.json", "review/summary.md", "review/summary.sarif", "audit/assessment.json", "audit/summary.md", "index.html",
                 archive.relative_to(report_directory).as_posix(),
             }
         ]
         manifest_bytes = json_bytes(recovered)
-        _replace_transaction(report_directory, {
+        replacements = {
             report_directory / "review" / "summary.json": review_json,
             report_directory / "review" / "summary.md": review_markdown,
             report_directory / "audit" / "assessment.json": assessment_json,
             report_directory / "review" / "summary.sarif": sarif_json,
             report_directory / "index.html": index_bytes,
             manifest_path: manifest_bytes,
-        })
+        }
+        if summary_markdown is not None:
+            replacements[report_directory / "audit" / "summary.md"] = summary_markdown
+        _replace_transaction(report_directory, replacements)
     except (ExportError, OSError, ValueError, TypeError) as exc:
         if archive is not None:
             archive.unlink(missing_ok=True)

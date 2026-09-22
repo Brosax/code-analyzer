@@ -803,16 +803,20 @@ tools/splint/
 exports/<run-id>-shareable.zip
 ```
 
-- `index.html`：完整离线仪表盘（检测报告版式，中英文界面可一键切换），首屏
-  为判定横幅（运行状态印章、发现总数与严重度构成条、报告完整性、质量门禁、
-  源码稳定性、扫描范围、分析上下文与降级原因），另含执行状态、覆盖率、分析单元完成/
-  失败/超时分解、findings、diagnostics、评分等级与规范化严重度按证据上下文
-  的构成条、文件×严重度矩阵、top rules、CWE、nearby overlap、原生等级列、
-  筛选、排序、分页和原始证据链接。评分参考文档的元数据不再在页面显式展示，
-  仅保留在内嵌数据与 `review/summary.json` 中。
-- `review/summary.json`：review schema v2 的完整派生数据；schema v1 仍可由
-  Dashboard 读取。
-- `review/summary.md`：适合文本审阅的摘要。
+- `index.html`：单文件离线审计报告，支持中英文切换。阅读顺序为审计概览、
+  扫描范围与缺口、候选核验、AI 辅助总结、原始发现，最后是统计、执行和诊断附录。
+  运行状态、证据收集完整性、扫描范围完整性和质量门禁分别展示；完成不表示代码安全。
+  候选与发现采用五列列表和行内展开，完整理由、原生等级、规则、CWE、指纹及
+  证据链接保留在展开区。候选与成员支持双向定位，查看成员会清除冲突筛选，
+  并可返回原筛选。默认显示全部证据上下文。
+- `review/summary.json`：review schema v3 的完整派生数据；Dashboard 仍兼容 v1、v2。
+- `review/summary.md`：与 HTML 阅读重点一致的摘要；章节、字段及关键状态为中英双语，
+  原始证据保留原语言。发现和候选分别受 `review.max_markdown_findings` 限制，
+  截断数量及完整数据入口会明确列出。
+- `audit/summary.json`、`audit/summary.md`：可选的 AI 总结及双语结构文本。
+  报告只读取已有总结，不自动调用模型。摘要输入指纹一致、输入变化或脱敏、
+  无法核验、总结缺失或损坏、最近生成失败均明确区分；生成失败不会把上次成功
+  总结作为本次结果展示。模型意见不改变证据、门禁或退出码。
 - `manifest.json`：正式、机器可读的执行契约。
 - `tools/cppcheck/*/report.xml`：Cppcheck 原始报告。
 - `tools/flawfinder/*/report.sarif`：Flawfinder 原始报告。
@@ -825,6 +829,17 @@ exports/<run-id>-shareable.zip
   `stat`、`walk`、`gitignore`）、错误码和原因。`manifest.json` 的
   `source_inventory.scope` 只放汇总计数与 `complete` 判定。
 - `inputs/sanitizer-map.private.json`：只在私有目录保存，不进入 ZIP。
+
+HTML 最多内嵌 2,000 条发现，按引擎保留配额；关联候选和诊断也各有 2,000 条上限。
+列表区分全量、已内嵌和筛选命中的数量。未内嵌的成员以缺项数量和指纹提示，
+完整数据仍在对应 JSON 文件中；基于内嵌数据的图表会注明统计范围。
+候选和发现分别分页。浏览器打印会展开当前筛选下的全部已内嵌结果及详情，
+保留筛选范围和截断说明，结束后恢复原分页和展开状态。
+
+`analyze`、`assess`、`summarize` 和续跑结束后会同步刷新阅读产物。
+`rebuild-dashboard` 仍只重建 HTML；历史报告需要同步更新文本时使用 `recover-report`，
+该命令从已有证据离线重建，不调用模型或扫描器。共享导出的 HTML 和 Markdown
+使用同一份脱敏数据重新生成，未随包提供的证据会标注为省略或不可用。
 
 共享 ZIP 仍可能包含源码片段和业务内容，分享前需要自行评估。
 
@@ -869,7 +884,7 @@ code-analyzer recover-report /path/to/report-directory
 ```
 
 恢复只读取 manifest、source inventory 和有效原生 artifacts，不运行分析器、
-不修改源码或原生证据。它重建 schema v2 review、Markdown、Dashboard，并创建
+不修改源码或原生证据。它重建 schema v3 review、Markdown、Dashboard，并创建
 带 recovery 时间戳的新共享 ZIP；旧 ZIP 不会覆盖。原扫描的工具状态、整体状态、
 退出码及开始/结束时间保持不变，manifest 另记恢复审计和派生文件 SHA-256。
 成功时退出 `0`，stdout 只输出恢复后的 `index.html` 绝对路径；无效目录退出 `2`。

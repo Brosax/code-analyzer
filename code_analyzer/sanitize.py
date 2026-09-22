@@ -19,7 +19,9 @@ from .config import effective_toml
 from .events import EVENTS_FILE
 from .html_report import render
 from .persist import manifest_structure_problem, write_json
+from .report_presentation import load_run_summary, standalone_summary_markdown
 from .review import markdown_report
+from .tools.common import artifact_index
 from .tools.splint_csv import splint_rows
 
 # Rendered scan units and session logs quote the analyzed source verbatim, so
@@ -142,6 +144,7 @@ def export_shareable(
     *,
     cancelled: Callable[[], bool] | None = None,
     review_override: dict[str, Any] | None = None,
+    assessment_override: dict[str, Any] | None = None,
     archive_name: str | None = None,
 ) -> Path:
     _check_cancelled(cancelled)
@@ -189,9 +192,11 @@ def export_shareable(
             relative = source.relative_to(run_dir)
             if relative.as_posix() in {
                 "manifest.json", "index.html", "inputs/effective-config.toml",
-                "review/summary.json", "review/summary.md",
+                "review/summary.json", "review/summary.md", "audit/summary.md",
             }:
                 continue
+            if relative.as_posix() == "audit/assessment.json" and assessment_override is not None:
+                continue  # Replaced by recovery's new, validated snapshot below.
             safe_name = redactor.text(relative.as_posix())
             if omission is not None:
                 omitted_entries.append(_excluded_entry(source, safe_name, omission))
@@ -229,17 +234,42 @@ def export_shareable(
             "omitted_artifacts": omitted_entries,
         })
         safe_manifest = redactor.json_value(manifest)
+        assessment = assessment_override if assessment_override is not None else load_assessment(run_dir)
+        safe_assessment = redactor.json_value(assessment) if assessment is not None else None
+        # The recovery path has not committed its new review/assessment yet.
+        # Use that same snapshot here instead of loading the old on-disk assessment.
+        original_review = review_override
+        if original_review is None:
+            try:
+                original_review = json.loads((run_dir / "review" / "summary.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                original_review = None
+        run_summary = load_run_summary(run_dir, manifest, original_review, assessment)
+        safe_summary = redactor.json_value(run_summary)
+        if safe_assessment is not None:
+            _write_json(staging / "audit" / "assessment.json", safe_assessment)
+        # Only artifacts that will actually ship may be linked by the report.
+        safe_manifest["artifacts"] = artifact_index(staging)
+        generated = ["index.html"]
+        if safe_review is not None:
+            generated += ["review/summary.json", "review/summary.md"]
+        if safe_summary.get("status") == "available" or (run_dir / "audit" / "summary.md").exists():
+            generated.append("audit/summary.md")
+        safe_manifest["artifacts"].extend({"path": path} for path in generated)
         _write_json(staging / "manifest.json", safe_manifest)
         if safe_review is not None:
             _write_json(staging / "review" / "summary.json", safe_review)
             (staging / "review" / "summary.md").write_text(
-                markdown_report(safe_review, int(config["review"]["max_markdown_findings"])), encoding="utf-8"
+                markdown_report(safe_review, int(config["review"]["max_markdown_findings"]),
+                                manifest=safe_manifest, assessment=safe_assessment, run_summary=safe_summary), encoding="utf-8"
             )
         # Core HTML is regenerated exclusively from validated structured data.
-        safe_assessment = load_assessment(run_dir)
-        if safe_assessment is not None:
-            safe_assessment = redactor.json_value(safe_assessment)
-        (staging / "index.html").write_text(render(safe_manifest, safe_review, safe_assessment), encoding="utf-8")
+        if "audit/summary.md" in generated:
+            (staging / "audit").mkdir(parents=True, exist_ok=True)
+            (staging / "audit" / "summary.md").write_text(
+                standalone_summary_markdown(safe_summary, safe_manifest), encoding="utf-8")
+        (staging / "index.html").write_text(
+            render(safe_manifest, safe_review, safe_assessment, run_summary=safe_summary), encoding="utf-8")
         safe_config = redactor.json_value(config)
         target_config = staging / "inputs" / "effective-config.toml"
         target_config.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +279,8 @@ def export_shareable(
             "artifacts": report_entries, "omitted_artifacts": omitted_entries,
         }
         _write_json(staging / "redaction-report.json", redaction_report)
+        safe_manifest["artifacts"] = artifact_index(staging)
+        _write_json(staging / "manifest.json", safe_manifest)
         _check_cancelled(cancelled)
         _validate_tree(staging, redactor)
         try:

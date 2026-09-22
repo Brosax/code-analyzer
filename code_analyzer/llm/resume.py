@@ -34,7 +34,7 @@ from ..audit import (
     load_assessment,
     write_assessment,
 )
-from ..dashboard import rebuild_dashboard
+from ..dashboard import refresh_reports
 from ..errors import UserError
 from ..harness.cordis import cordis_document, tool_allowlist, write_cordis_config
 from ..harness.runtime import harness_available, redact_credential
@@ -233,7 +233,7 @@ def _rederive(run_dir: Path, manifest: dict[str, Any], config: dict[str, Any], p
     manifest["audit"] = {**(manifest.get("audit") or {}), **assessment_summary(assessment), "error": None}
     manifest["artifacts"] = artifact_index(run_dir)
     (run_dir / "manifest.json").write_bytes(json_bytes(manifest))
-    rebuild_dashboard(run_dir)
+    refresh_reports(run_dir)
     progress(f"resume: review re-derived; {review['total_findings']} findings")
 
 

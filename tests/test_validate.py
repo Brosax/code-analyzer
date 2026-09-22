@@ -484,7 +484,8 @@ def test_the_dashboard_renders_verdicts_in_both_languages() -> None:
     assert 'id="verdict-filter"' in html and 'data-i18n="th_verdict"' in html
     assert '<option value="FALSE_POSITIVE"' in html and '<option value="unvalidated"' in html
     # Badge tones per verdict, and the headline tile with its caveat beside it.
-    assert 'CONFIRMED: "ok", LIKELY: "warn", UNCERTAIN: "muted", FALSE_POSITIVE: "bad"' in html
+    # A confirmed defect must not look like a green success signal.
+    assert 'CONFIRMED: "warn", LIKELY: "warn", UNCERTAIN: "muted", FALSE_POSITIVE: "muted"' in html
     assert 'stat("card_llm_only_confirmed", headline)' in html and 't("caveat_corroborated")' in html
     assert 'stat("card_llm_only", headline)' in html, "the unvalidated tile survives for runs without a validator"
     for key in ("card_llm_only_confirmed", "caveat_corroborated", "caveat_validator_ran", "filter_verdict",

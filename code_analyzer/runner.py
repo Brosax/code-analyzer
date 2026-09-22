@@ -31,6 +31,7 @@ from .build_context import manifest_block
 from .compile_db import filter_database, resolve_compile_db
 from .config import effective_toml
 from .control import CANCELLED, SKIP_PRODUCER, Decision, DecisionRequest, RunControl
+from .dashboard import write_report_markdown
 from .doctor import verify_canary
 from .errors import UserError
 from .events import fan_out
@@ -48,6 +49,7 @@ from .persist import json_bytes
 from .persist import write_json as _write_json
 from .progress import ProgressDisplay
 from .reconfigure import LoopContext, run_loop
+from .report_presentation import load_run_summary
 from .review import REVIEW_SCHEMA_VERSION, build_review, should_fail, write_review
 from .runlog import RunLogger
 from .sanitize import ExportError, export_shareable
@@ -766,7 +768,11 @@ def _analyze(
     if cancellation.cancelled:
         return _finish_interrupted(run_dir, manifest, inventory, requested_names, progress, event)
     event("report", "started", "rendering the offline dashboard")
-    (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
+    assessment = load_assessment(run_dir)
+    run_summary = load_run_summary(run_dir, manifest, review_summary, assessment)
+    write_report_markdown(run_dir, manifest, review_summary, assessment, run_summary,
+                          int(config["review"]["max_markdown_findings"]))
+    (run_dir / "index.html").write_text(render(manifest, review_summary, assessment, run_summary=run_summary), encoding="utf-8")
     manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
     save_manifest()
     event("report", "finished", "index.html written", data={
@@ -779,7 +785,9 @@ def _analyze(
             manifest["status"], manifest["exit_code"] = "partial", 10
             manifest["gate"]["triggered"] = False
         manifest["publication_error"] = str(exc)
-        (run_dir / "index.html").write_text(render(manifest, review_summary, load_assessment(run_dir)), encoding="utf-8")
+        write_report_markdown(run_dir, manifest, review_summary, assessment, run_summary,
+                              int(config["review"]["max_markdown_findings"]))
+        (run_dir / "index.html").write_text(render(manifest, review_summary, assessment, run_summary=run_summary), encoding="utf-8")
         manifest["artifacts"] = artifact_index(run_dir, artifact_cache)
         save_manifest()
         progress("latest.json publication failed; unique run evidence was retained")

@@ -11,6 +11,11 @@ from .audit import load_assessment
 from .errors import UserError
 from .html_report import render
 from .persist import json_bytes, manifest_structure_problem
+from .report_presentation import (
+    load_run_summary,
+    safe_relative_path,
+    standalone_summary_markdown,
+)
 
 
 def rebuild_dashboard(report_directory: Path) -> Path:
@@ -46,8 +51,12 @@ def rebuild_dashboard(report_directory: Path) -> Path:
         render_manifest = dict(manifest)
         render_manifest["artifacts"] = [
             item for item in artifacts if item.get("path") != "index.html"
+            and safe_relative_path(item.get("path"))
+            and (report_directory / item["path"]).is_file()
         ]
-        index_bytes = render(render_manifest, review, load_assessment(report_directory)).encode("utf-8")
+        assessment = load_assessment(report_directory)
+        run_summary = load_run_summary(report_directory, manifest, review, assessment)
+        index_bytes = render(render_manifest, review, assessment, run_summary=run_summary).encode("utf-8")
         updated_manifest = dict(manifest)
         updated_manifest["artifacts"] = _updated_artifacts(artifacts, index_bytes)
         manifest_bytes = json_bytes(updated_manifest)
@@ -82,6 +91,50 @@ def rebuild_dashboard(report_directory: Path) -> Path:
         manifest_temporary.unlink(missing_ok=True)
         rollback_temporary.unlink(missing_ok=True)
     return index_path
+
+
+def write_report_markdown(
+    run_dir: Path, manifest: dict[str, Any], review: dict[str, Any] | None,
+    assessment: dict[str, Any] | None, run_summary: dict[str, Any], max_findings: int = 200,
+) -> None:
+    """Refresh reading artifacts only; the review JSON remains untouched."""
+    from .review import markdown_report
+
+    if review is not None:
+        path = run_dir / "review" / "summary.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(markdown_report(review, max_findings, manifest=manifest,
+                                       assessment=assessment, run_summary=run_summary), encoding="utf-8")
+    path = run_dir / "audit" / "summary.md"
+    if path.exists() or run_summary.get("status") == "available":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(standalone_summary_markdown(run_summary, manifest), encoding="utf-8")
+
+
+def refresh_reports(run_dir: Path, max_findings: int | None = None) -> Path:
+    """Post-assess/summary/resume refresh; rebuild-dashboard itself remains HTML-only."""
+    import tomllib
+
+    from .tools.common import artifact_index
+
+    manifest = _read_object(run_dir / "manifest.json", "manifest")
+    # Optional summaries may have just been written and are not in the old
+    # manifest yet. Link against the files present for this refresh.
+    manifest["artifacts"] = artifact_index(run_dir)
+    path = run_dir / "review" / "summary.json"
+    review = _read_object(path, "review summary") if path.exists() else None
+    assessment = load_assessment(run_dir)
+    run_summary = load_run_summary(run_dir, manifest, review, assessment)
+    if max_findings is None:
+        try:
+            config = tomllib.loads((run_dir / "inputs" / "effective-config.toml").read_text(encoding="utf-8"))
+            max_findings = max(0, int(config.get("review", {}).get("max_markdown_findings", 200)))
+        except (OSError, ValueError):
+            max_findings = 200
+    write_report_markdown(run_dir, manifest, review, assessment, run_summary, max_findings)
+    manifest["artifacts"] = artifact_index(run_dir)
+    (run_dir / "manifest.json").write_bytes(json_bytes(manifest))
+    return rebuild_dashboard(run_dir)
 
 
 def _read_object(path: Path, label: str) -> dict[str, Any]:

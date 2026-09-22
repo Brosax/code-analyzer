@@ -41,6 +41,9 @@ from ..harness.runtime import (
 from ..harness.session import run_summary
 from ..persist import json_bytes, write_json
 from ..progress import single_line
+from ..summary_digest import MAX_CANDIDATES as MAX_CANDIDATES
+from ..summary_digest import MAX_SAMPLE_FINDINGS as MAX_SAMPLE_FINDINGS
+from ..summary_digest import build_digest
 from .context import render_blocks
 from .profiles import third_party_warning
 from .skills import load_skill, skills_directory
@@ -51,9 +54,6 @@ MARKDOWN_PATH = ("audit", "summary.md")
 
 # What the model is shown.  Every bound here is a bound on the prompt, and the
 # digest is the only thing between a 111 482-finding run and a context window.
-MAX_SAMPLE_FINDINGS = 60
-MAX_CANDIDATES = 40
-MAX_MESSAGE_CHARS = 240
 MAX_LIST = 5
 MAX_TEXT = 600
 # A summary is prose, not a JSON record of a defect: it needs more room than a
@@ -65,7 +65,6 @@ MIN_COMPLETION_TOKENS = 8000
 REQUEST_TIMEOUT = 900.0
 
 POSTURES: tuple[str, ...] = ("clean", "minor", "serious", "blocked", "inconclusive")
-_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 NOTICE = (
     "This summary is model-assisted opinion over the run's own account of itself. "
@@ -103,61 +102,6 @@ def _optional(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _rank(finding: Mapping[str, Any]) -> tuple[int, str]:
-    severity = str(finding.get("normalized_severity") or finding.get("severity") or "").lower()
-    return _SEVERITY_RANK.get(severity, len(_SEVERITY_RANK)), str(finding.get("canonical_path") or "")
-
-
-def _sample(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The rows worth showing: worst first, one per (file, rule), bounded.
-
-    Deduplicated on the pair because a single rule firing 76 times in one file
-    is one fact, and spending the whole sample on it would hide the other 30
-    rules the run found.  The counts the model is also given say how often each
-    one fired, so nothing is lost by showing it once.
-    """
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, Any]] = []
-    for finding in sorted(findings, key=_rank):
-        key = (str(finding.get("canonical_path") or ""), str(finding.get("rule_id") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "path": finding.get("canonical_path") or finding.get("file"),
-            "line": finding.get("line"),
-            "severity": finding.get("normalized_severity") or finding.get("severity"),
-            "producer": finding.get("producer") or finding.get("tool") or finding.get("engine"),
-            "rule": finding.get("rule_id"),
-            "cwe": finding.get("cwe"),
-            "message": single_line(str(finding.get("message") or ""))[:MAX_MESSAGE_CHARS],
-        })
-        if len(out) >= MAX_SAMPLE_FINDINGS:
-            break
-    return out
-
-
-def _producers(review: Mapping[str, Any]) -> dict[str, Any]:
-    """What each producer reached, from its own coverage block."""
-    out: dict[str, Any] = {}
-    for group in ("tools", "scanners"):
-        for name, block in sorted((review.get(group) or {}).items()):
-            if not isinstance(block, dict):
-                continue
-            coverage = block.get("coverage") if isinstance(block.get("coverage"), dict) else {}
-            out[name] = {
-                "status": block.get("status"),
-                "requested": block.get("requested"),
-                "findings": (block.get("finding_counts") or {}).get("total"),
-                "reason": block.get("reason"),
-                "coverage_ratio": coverage.get("ratio"),
-                "analysed": coverage.get("analyzed"),
-                "of": coverage.get("total"),
-                "unit_counts": block.get("unit_counts"),
-            }
-    return out
-
-
 def digest(run_dir: Path) -> dict[str, Any]:
     """Everything the model is shown, and nothing else.
 
@@ -170,75 +114,7 @@ def digest(run_dir: Path) -> dict[str, Any]:
     review = _read(run_dir / "review" / "summary.json", "review summary", hint="run analyze first")
     assessment = _optional(run_dir.joinpath(*ASSESSMENT_PATH))
 
-    findings = [item for item in review.get("findings") or [] if isinstance(item, dict)]
-    candidates = [item for item in assessment.get("candidates") or [] if isinstance(item, dict)]
-    return {
-        "run": {
-            "project": review.get("project"),
-            "status": manifest.get("status"),
-            "exit_code": manifest.get("exit_code"),
-            "analysis_context": manifest.get("analysis_context"),
-            "analysis_context_reasons": manifest.get("analysis_context_reasons"),
-            "started_at": manifest.get("started_at"),
-            "finished_at": manifest.get("finished_at"),
-            "files_in_inventory": (manifest.get("source_inventory") or {}).get("total"),
-            "report_integrity": review.get("report_integrity"),
-            "build_context": {
-                key: (manifest.get("build_context") or {}).get(key)
-                for key in ("status", "assist", "reason")
-            },
-        },
-        "coverage": {
-            "producers": _producers(review),
-            "llm": review.get("llm_coverage"),
-            "llm_units": (manifest.get("llm") or {}).get("unit_counts"),
-            "llm_budget": (manifest.get("llm") or {}).get("budget"),
-        },
-        "findings": {
-            "total": review.get("total_findings"),
-            "by_severity": review.get("severity_counts"),
-            "by_engine": review.get("severity_counts_by_engine"),
-            "by_context": review.get("finding_counts"),
-            "top_files": (review.get("top_files") or [])[:20],
-            "top_rules": (review.get("top_rules") or [])[:20],
-            "top_cwes": (review.get("top_cwes") or [])[:20],
-            "total_diagnostics": review.get("total_diagnostics"),
-            "sample": _sample(findings),
-            "sample_note": (
-                f"{len(findings)} finding(s) in the evidence layer; the {MAX_SAMPLE_FINDINGS} "
-                "shown are the most severe, one per (file, rule). The counts above are complete."
-            ),
-        },
-        "candidates": {
-            "total": len(candidates),
-            "verdicts": _verdict_counts(candidates),
-            "sample": [
-                {
-                    "id": item.get("id"),
-                    "path": item.get("canonical_path"),
-                    "line": item.get("line"),
-                    "severity": item.get("severity"),
-                    "origin": item.get("origin"),
-                    "producers": item.get("producers"),
-                    "verdict": (item.get("verdict") or {}).get("label") if isinstance(item.get("verdict"), dict) else None,
-                    "rationale": single_line(str(
-                        (item.get("verdict") or {}).get("rationale") or ""
-                        if isinstance(item.get("verdict"), dict) else ""
-                    ))[:MAX_MESSAGE_CHARS],
-                }
-                for item in candidates[:MAX_CANDIDATES]
-            ],
-        },
-    }
-
-
-def _verdict_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for item in candidates:
-        verdict = item.get("verdict")
-        label = str(verdict.get("label")) if isinstance(verdict, dict) and verdict.get("label") else "PENDING"
-        counts[label] = counts.get(label, 0) + 1
-    return counts
+    return build_digest(manifest, review, assessment)
 
 
 def directive(skill: Any) -> dict[str, Any]:
@@ -553,4 +429,16 @@ def _block(
         # every consumer that reads the manifest instead of the directory.
         manifest["artifacts"] = artifact_index(run_dir)
         write_json(manifest_path, manifest)
+        from ..dashboard import refresh_reports
+
+        try:
+            refresh_reports(run_dir)
+        except (OSError, UserError, ValueError) as exc:
+            # Summarization also accepts older, minimal run accounts that the
+            # strict dashboard loader cannot render. Retain the opinion and
+            # make a presentation failure explicit without changing the scan.
+            block["presentation_error"] = redact_credential(str(exc), settings)
+            manifest["summary"] = block
+            manifest["artifacts"] = artifact_index(run_dir)
+            write_json(manifest_path, manifest)
     return block

@@ -12,6 +12,7 @@ import json
 from typing import Any
 
 from .grading import grading_reference
+from .report_presentation import artifact_availability
 
 
 def _json_for_html(value: dict[str, Any]) -> str:
@@ -73,6 +74,8 @@ def render(
     manifest: dict[str, Any],
     review: dict[str, Any] | None = None,
     assessment: dict[str, Any] | None = None,
+    *,
+    run_summary: dict[str, Any] | None = None,
 ) -> str:
     data = dict(review or {
         "review_schema_version": 3, "findings": [], "diagnostics": [],
@@ -85,7 +88,7 @@ def render(
         "finding_counts": {"total": 0, "build-aware": 0, "source-only": 0},
         "grading_reference": grading_reference(),
         "review_level_counts": {}, "review_level_counts_by_context": {"build-aware": {}, "source-only": {}},
-        "report_integrity": {"status": "complete", "omitted_units": []}, "coverage_gaps": [],
+        "report_integrity": {"status": "unknown", "omitted_units": []}, "coverage_gaps": [],
     })
     findings = data.get("findings")
     if isinstance(findings, list) and len(findings) > MAX_EMBED_FINDINGS:
@@ -102,6 +105,17 @@ def render(
             embedded["candidates"] = embedded_candidates(candidates, MAX_EMBED_FINDINGS)
             embedded["candidates_omitted"] = len(candidates) - len(embedded["candidates"])
         data["assessment"] = embedded
+
+    data["run_summary"] = run_summary or {"status": "missing"}
+    available = artifact_availability(manifest)
+    # Only referenced paths are needed, not the potentially enormous artifact index.
+    referenced = {"manifest.json", "review/summary.json", "review/summary.md",
+                  "audit/assessment.json", "audit/summary.json", "audit/summary.md",
+                  "inputs/source-inventory.json"}
+    for item in [*(data.get("findings") or []), *(data.get("diagnostics") or [])]:
+        if isinstance(item, dict):
+            referenced.update(str(item.get(key) or "") for key in ("source_artifact", "rationale_artifact"))
+    data["artifact_availability"] = {path: available.get(path, "unrecorded") for path in sorted(referenced) if path}
 
     data_tools = data.get("tools")
     if isinstance(data_tools, dict):
@@ -192,7 +206,7 @@ a:hover{color:var(--muted)}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .mono{font-family:var(--mono);font-size:.92em}
 .muted{color:var(--muted)}
-td details{max-width:28rem;font-size:.85em}td details summary{cursor:pointer;list-style:none}td details summary::before{content:"▸ "}td details[open] summary::before{content:"▾ "}td details[open] summary{display:none}td details>div{margin-top:.25rem}
+td details{max-width:none;font-size:.85em}td details summary{cursor:pointer;list-style:none}td details summary::before{content:"▸ "}td details[open] summary::before{content:"▾ "}td details[open] summary{font-weight:600}td details>div{margin-top:.25rem}
 button,input,select{font:inherit;border:1px solid var(--line);border-radius:3px;
   background:var(--surface);color:var(--ink);padding:.45rem .6rem}
 button{cursor:pointer}
@@ -342,25 +356,49 @@ table{border-collapse:collapse;width:100%}
 th,td{padding:.55rem .65rem;border-bottom:1px solid var(--hairline);text-align:left;vertical-align:top}
 th{background:var(--soft);position:sticky;top:0;font-weight:600;font-size:.85rem;white-space:nowrap}
 tbody tr:hover td{background:var(--soft)}
-.loc{white-space:nowrap;font-family:var(--mono);font-size:.88em}
+.loc{overflow-wrap:anywhere;font-family:var(--mono);font-size:.88em}
 .file-list{max-height:18rem;overflow:auto;font-family:var(--mono);font-size:.88rem}
 .empty{text-align:center;color:var(--muted);padding:1rem}
 
-.controls{display:grid;grid-template-columns:2fr repeat(6,1fr) auto;gap:.55rem;margin-bottom:.7rem}
-.control{display:grid;gap:.2rem;font-size:.85rem;color:var(--muted)}
+.controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.55rem;margin-bottom:.7rem}
+.control{display:grid;min-width:0;gap:.2rem;font-size:.85rem;color:var(--muted)}
+.control input,.control select{min-width:0;width:100%}
+#heatmap{overflow-x:auto}
 .pagination{display:flex;justify-content:space-between;align-items:center;margin-top:.7rem;gap:.7rem;flex-wrap:wrap}
 
 @media(max-width:900px){
   .tools{grid-template-columns:1fr}
   .charts .panel{grid-column:1/-1}
-  .controls{grid-template-columns:1fr 1fr}
+  .controls{grid-template-columns:repeat(2,minmax(0,1fr))}
   .verdict{flex-direction:column;align-items:stretch}
   .mast-right{align-items:flex-start}
 }
 @media(max-width:560px){
-  .stats,.controls{grid-template-columns:1fr 1fr}
+  .stats,.controls{grid-template-columns:repeat(2,minmax(0,1fr))}
   .section-head{display:block}
   .sheet{margin:0;border:none}
+}
+.reading-table{table-layout:fixed}
+.reading-table th:first-child{width:15%}
+.reading-table th:nth-child(2){width:23%}
+.reading-table th:nth-child(3){width:32%}
+.reading-table th:nth-child(4){width:20%}
+.reading-table th:nth-child(5){width:10%}
+.reading-table td{overflow-wrap:anywhere}
+.evidence-detail td{background:var(--soft);padding:1rem}
+.evidence-detail dl{display:grid;grid-template-columns:minmax(8rem,1fr) 3fr;gap:.35rem 1rem;margin:.6rem 0}
+.evidence-detail dt{color:var(--muted)}
+.evidence-detail dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}
+.evidence-detail p{white-space:pre-wrap;overflow-wrap:anywhere}
+.evidence-detail summary{cursor:pointer}
+.evidence-detail summary:focus-visible{outline:2px solid var(--ink)}
+.record-heading{margin:0 0 .4rem}
+#relation-notice,#filter-caption{overflow-wrap:anywhere}
+.scope-gaps{max-height:24rem;overflow:auto}
+@media(max-width:560px){
+  .reading-table{table-layout:auto}
+  .reading-table th,.reading-table td{padding:.4rem;font-size:.82rem}
+  .evidence-detail dl{grid-template-columns:1fr}
 }
 /* Print is this project's PDF: one dependency-free path to a fixed artifact a
    reviewer can carry, sign or attach to a ticket.  What it must not do is
@@ -389,6 +427,11 @@ tbody tr:hover td{background:var(--soft)}
   h2{break-after:avoid}
   thead{display:table-header-group}
   tr{break-inside:avoid}
+  .evidence-detail{break-inside:auto}
+  .scope-gaps,.file-list{max-height:none;overflow:visible}
+  .reading-table{table-layout:auto}
+  .evidence-detail dl{display:block}
+  .evidence-detail dd{margin-bottom:.35rem}
   @page{margin:14mm}
 }
 """
@@ -453,15 +496,58 @@ _JS_MAIN = r"""
   /* ---------- i18n ---------- */
   const I18N = {
     zh: {
-      report_title: "静态分析证据报告",
+      sec_summary: "AI 总结（辅助意见）",
+      audit_meaning: "运行完成、证据收集完整和扫描范围完整是不同状态；完成不表示代码安全。",
+      detail_open: "展开证据与完整字段",
+      candidate_open: "展开核验记录",
+      evidence_unavailable: "不可用或未记录",
+      evidence_omitted: "共享包已省略",
+      full_findings: "完整发现 JSON",
+      full_assessment: "完整核验 JSON",
+      count_scope: "全量 {total} · 已内嵌 {embedded} · 筛选命中 {matched}",
+      missing_members: "本页缺少 {n} 条成员证据（未内嵌或未记录）。请按下列指纹查阅完整 JSON。",
+      return_filters: "返回原筛选",
+      related_evidence: "正在查看关联证据：{name}",
+      related_candidates: "关联候选",
+      members_total: "成员总数",
+      input_fingerprint: "摘要输入指纹",
+      fingerprint: "证据指纹",
+      model: "模型",
+      confidence: "置信度",
+      unit_id: "分析单元",
+      symbol: "符号",
+      reasoning_artifact: "模型记录",
+      summary_missing: "尚未生成 AI 总结。阅读报告不会触发模型调用。",
+      summary_failed: "最近一次总结生成失败，历史成功总结不作为本次结果展示。",
+      summary_invalid: "已有总结无法读取或格式不支持，原始证据仍可核验。",
+      summary_matched: "摘要输入一致（仅验证摘要所使用的输入）",
+      summary_changed: "输入已变化或脱敏，请重新核对当前证据。",
+      summary_unverified: "无法核验摘要输入，请对照原始证据阅读。",
+      summary_notice: "以下内容是生成时的 AI 辅助意见，不改变证据、质量门禁或退出码。事实计数以报告结构化数据为准。",
+      summary_themes: "主要模式",
+      summary_priorities: "建议的下一步",
+      summary_caveats: "覆盖保留意见",
+      summary_disagreements: "分歧",
+      summary_unknowns: "尚未解决",
+      summary_source: "AI 总结原始 JSON",
+      sample_chart: "此图仅统计本页内嵌数据。",
+      scope_gaps: "覆盖缺口与省略单元",
+      no_scope_gaps: "结构化报告未列出额外缺口；仍需结合上方扫描范围与分析器状态阅读。",
+      print_scope: "当前筛选（打印范围）",
+      all_evidence: "全部已内嵌证据",
+      summary_posture: "模型意见",
+      coverage_functions: "函数", coverage_files: "文件", coverage_bytes: "字节",
+      coverage_inputs: "输入文件", coverage_tu_reports: "有报告的编译单元", coverage_units: "LLM 扫描单元", coverage_analysis_reached: "实际进入分析",
+      recorded_count: "未记录",
+      report_title: "代码分析证据报告",
       open_json: "查看原始 JSON",
       disclaimer: "派生的 findings 不具权威性。请对照其链接的原生工具报告与实际的构建配置逐条确认。",
-      sec_overview: "总体判定", sec_distribution: "发现分布",
+      sec_overview: "审计概览", sec_distribution: "发现分布",
       sec_tools: "执行与原生证据", sec_scope: "扫描范围", sec_overlap: "跨工具邻近重叠",
       sec_diagnostics: "工具诊断", sec_findings: "发现明细",
       meta_analyzer: "分析器版本", meta_finished: "完成时间", meta_duration: "运行时长",
       duration_value: "{m} 分 {s} 秒",
-      verdict_status: "运行状态", verdict_integrity: "报告完整性", verdict_gate: "质量门禁",
+      verdict_status: "运行状态", verdict_integrity: "证据收集完整性", verdict_gate: "质量门禁",
       verdict_stable: "源码稳定性", verdict_context: "分析上下文", verdict_scope: "扫描范围",
       gate_disabled: "未启用", gate_pass: "未触发", gate_fail: "已触发",
       stable_yes: "扫描期间未变化", stable_no: "扫描期间发生变化", stable_unknown: "无法验证",
@@ -486,7 +572,7 @@ _JS_MAIN = r"""
       chart_heatmap: "文件 × 严重度", chart_tools: "各分析器",
       chart_top_rules: "规则 · 前列", chart_top_cwes: "CWE · 前列",
       heat_total: "合计",
-      heat_partial: "矩阵基于内嵌的前 {n} 条发现;完整数据见 review/summary.json。",
+      heat_partial: "矩阵基于内嵌的 {n} 条发现;完整数据见 review/summary.json。",
       legend_build: "构建感知", legend_source: "仅源码",
       legend_static: "静态工具", legend_llm: "LLM 扫描",
       no_data: "暂无数据",
@@ -519,7 +605,7 @@ _JS_MAIN = r"""
       opt_sort_tool: "分析器", opt_sort_rule: "规则",
       reset: "重置", prev: "上一页", next: "下一页",
       page_status: "{results} 条结果 · 第 {page}/{pages} 页",
-      context_notice: "默认展示构建感知证据。另有 {n} 条仅源码发现可通过上下文筛选查看。",
+      context_notice: "包含 {n} 条仅源码发现；默认显示全部上下文，可使用筛选区分证据。",
       unknown_source: "未知源",
       sec_assessment: "跨引擎关联（非权威）",
       assessment_authority: "本节为模型辅助的派生意见：候选只按指纹引用证据行，不改变也不删除任何发现，不影响退出码。",
@@ -548,16 +634,59 @@ _JS_MAIN = r"""
       verdict_confirmed: "CONFIRMED", verdict_likely: "LIKELY", verdict_uncertain: "UNCERTAIN", verdict_false_positive: "FALSE_POSITIVE",
     },
     en: {
-      report_title: "Static Analysis Evidence Report",
+      sec_summary: "AI summary (opinion)",
+      audit_meaning: "Run completion, collected evidence integrity and scan coverage are distinct; completion does not establish code safety.",
+      detail_open: "Expand evidence and full fields",
+      candidate_open: "Expand validation record",
+      evidence_unavailable: "Unavailable or unrecorded",
+      evidence_omitted: "Omitted from shareable archive",
+      full_findings: "Full findings JSON",
+      full_assessment: "Full assessment JSON",
+      count_scope: "Total {total} · Embedded {embedded} · Matching {matched}",
+      missing_members: "{n} member evidence row(s) are not embedded or recorded here. Look up these fingerprints in the full JSON.",
+      return_filters: "Return to previous filters",
+      related_evidence: "Related evidence: {name}",
+      related_candidates: "Related candidates",
+      members_total: "Total members",
+      input_fingerprint: "Input digest",
+      fingerprint: "Evidence fingerprint",
+      model: "Model",
+      confidence: "Confidence",
+      unit_id: "Analysis unit",
+      symbol: "Symbol",
+      reasoning_artifact: "Model record",
+      summary_missing: "No AI summary has been generated. Reading this report never calls a model.",
+      summary_failed: "The latest summary attempt failed. An earlier success is not shown as the latest result.",
+      summary_invalid: "The stored summary is unreadable or unsupported; evidence remains available for review.",
+      summary_matched: "Digest inputs match (only the inputs used by the summary)",
+      summary_changed: "Inputs changed or were redacted; check the current evidence.",
+      summary_unverified: "Digest inputs cannot be verified; consult the original evidence.",
+      summary_notice: "The following is AI-assisted opinion at generation time. It does not change evidence, the quality gate or exit codes. Factual counts come from structured report data.",
+      summary_themes: "Themes",
+      summary_priorities: "Suggested next steps",
+      summary_caveats: "Coverage caveats",
+      summary_disagreements: "Disagreements",
+      summary_unknowns: "Unknowns",
+      summary_source: "AI summary JSON",
+      sample_chart: "This chart counts only data embedded in this page.",
+      scope_gaps: "Coverage gaps and omitted units",
+      no_scope_gaps: "No additional gaps are listed; interpret this alongside scope and analyzer status above.",
+      print_scope: "Active filters (print scope)",
+      all_evidence: "All embedded evidence",
+      summary_posture: "Model posture",
+      coverage_functions: "Functions", coverage_files: "Files", coverage_bytes: "Bytes",
+      coverage_inputs: "Input files", coverage_tu_reports: "Translation units with reports", coverage_units: "LLM scan units", coverage_analysis_reached: "Analysis reached",
+      recorded_count: "Not recorded",
+      report_title: "Code Analysis Evidence Report",
       open_json: "Open review JSON",
       disclaimer: "Derived findings are non-authoritative. Confirm every item against its linked native artifact and the analyzed build configuration.",
-      sec_overview: "Overall verdict",
+      sec_overview: "Audit overview",
       sec_distribution: "Finding distribution", sec_tools: "Execution and native evidence",
       sec_scope: "Scan scope", sec_overlap: "Cross-tool nearby overlap",
       sec_diagnostics: "Tool diagnostics", sec_findings: "Findings",
       meta_analyzer: "Analyzer", meta_finished: "Finished", meta_duration: "Duration",
       duration_value: "{m}m {s}s",
-      verdict_status: "Run status", verdict_integrity: "Report integrity", verdict_gate: "Quality gate",
+      verdict_status: "Run status", verdict_integrity: "Collected evidence integrity", verdict_gate: "Quality gate",
       verdict_stable: "Source stability", verdict_context: "Analysis context", verdict_scope: "Scan scope",
       gate_disabled: "not enabled", gate_pass: "not triggered", gate_fail: "triggered",
       stable_yes: "unchanged during scan", stable_no: "changed during scan",
@@ -616,7 +745,7 @@ _JS_MAIN = r"""
       opt_sort_tool: "Analyzer", opt_sort_rule: "Rule",
       reset: "Reset", prev: "Previous", next: "Next",
       page_status: "{results} results · page {page}/{pages}",
-      context_notice: "Showing build-aware evidence by default. {n} source-only finding(s) remain available in the Context filter.",
+      context_notice: "Includes {n} source-only finding(s). All contexts are shown by default; use the context filter to distinguish evidence.",
       unknown_source: "Unknown source",
       sec_assessment: "Cross-engine correlation (non-authoritative)",
       assessment_authority: "Model-assisted derived opinion: candidates reference evidence rows by fingerprint and never alter, remove, or gate any finding.",
@@ -666,17 +795,24 @@ _JS_MAIN = r"""
   /* ---------- shared helpers ---------- */
   const safeHref = path => {
     if (typeof path !== "string" || !path || path.startsWith("/") || path.includes("\\") || path.includes(":")) return null;
-    const parts = path.split("/");
-    if (parts.some(p => !p || p === "." || p === ".." || !/^[A-Za-z0-9._-]+$/.test(p))) return null;
-    return parts.map(encodeURIComponent).join("/");
+    let decoded;
+    try { decoded = decodeURIComponent(path); } catch (_) { return null; }
+    if (decoded.includes(":") || decoded.includes("\\") || /[\x00-\x1f]/.test(decoded)) return null;
+    if (decoded.split("/").some(p => !p || p === "." || p === "..")) return null;
+    return path.split("/").map(encodeURIComponent).join("/");
   };
   const link = (label, path) => {
     const href = safeHref(path);
-    if (!href) return make("span", "muted", "—");
+    const availability = (review.artifact_availability || {})[path];
+    if (!href || availability !== "available") return make("span", "muted",
+      label + " · " + (availability === "omitted" ? t("evidence_omitted") : t("evidence_unavailable")) + (path ? " · " + path : ""));
     const a = make("a", "", label);
     a.href = href;
     return a;
   };
+  const coverageBasis = metric => ({
+    input_coverage: t("coverage_inputs"), tu_report_coverage: t("coverage_tu_reports"), llm_unit_coverage: t("coverage_units"),
+  }[metric] || metric || t("recorded_count"));
   const locText = x => (x.canonical_path || x.file || "?") + (x.line ? ":" + x.line : "") + (x.column ? ":" + x.column : "");
   const chip = (tone, text) => {
     const span = make("span", "chip");
@@ -774,7 +910,9 @@ _JS_MAIN = r"""
     const meta = id("run-meta");
     meta.replaceChildren();
     const pair = (label, value) => {
-      meta.append(make("dt", "", label), make("dd", "", value === undefined || value === null || value === "" ? "—" : value));
+      const field = make("div");
+      field.append(make("dt", "", label), make("dd", "", value === undefined || value === null || value === "" ? "—" : value));
+      meta.append(field);
     };
     pair(t("meta_analyzer"), manifest.analyzer_version);
     pair(t("meta_finished"), finishedAt);
@@ -908,6 +1046,11 @@ _JS_MAIN = r"""
       }
       return wrap;
     };
+    const metrics = (assessment || {}).metrics || {};
+    stat("card_candidates", assessment ? single(metrics.candidates_total) : make("strong", "", t("recorded_count")));
+    stat("card_validated", assessment
+      ? make("strong", "", number(metrics.validated) + " / " + number(metrics.unvalidated ?? metrics.candidates_total))
+      : make("strong", "", t("recorded_count")));
     stat("card_source_files", single((review.source_manifest || {}).total_files));
     const sourceOnly = counts["source-only"] !== undefined ? counts["source-only"] : review.total_findings;
     stat("card_context_split", splitTile(counts["build-aware"] || 0, sourceOnly || 0, "tone-build", "tone-source"));
@@ -923,6 +1066,7 @@ _JS_MAIN = r"""
     const pending = Math.max(0, Number(unit.total || 0) - scanned);
     if (scanned + pending > 0) {
       stat("card_llm_coverage", splitTile(scanned, pending, "tone-eng-llm", "tone-neutral"));
+      root.lastElementChild.querySelector(".lbl").textContent += " · " + (Number((coverage.functions || {}).total) > 0 ? t("coverage_functions") : t("coverage_files"));
     }
   };
 
@@ -1071,7 +1215,7 @@ _JS_MAIN = r"""
       pair(t("tool_source_findings"), number(fc["source-only"] !== undefined ? fc["source-only"] : data.total_findings));
       pair(t("tool_diagnostics"), number(data.total_diagnostics));
       pair(t("tool_version"), data.version);
-      pair(t("tool_coverage") + (scopeShort() ? t("scope_basis") : ""),
+      pair(t("tool_coverage") + " · " + coverageBasis(coverage.metric) + (scopeShort() ? t("scope_basis") : ""),
         (coverage.analyzed ?? coverage.covered ?? 0) + "/" + (coverage.effective_total ?? coverage.total ?? 0));
       pair(t("tool_attempted"), coverage.attempted ?? coverage.covered ?? 0);
       pair(t("tool_excluded"), coverage.excluded || 0);
@@ -1143,6 +1287,69 @@ _JS_MAIN = r"""
 
   /* ---------- overlap ---------- */
   const state = { page: 1, fingerprints: null };
+  let candidatePage = 1;
+  const filterIds = ["search", "context", "engine", "review-level", "severity", "tool", "cwe", "sort", "page-size"];
+  let previousFilters = null;
+  let relationName = "";
+  const detailFields = (pairs) => {
+    const dl = make("dl");
+    pairs.forEach(([label, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      dl.append(make("dt", "", label), make("dd", "", typeof value === "object" ? JSON.stringify(value) : value));
+    });
+    return dl;
+  };
+  const detailsRow = (body, label, content, detailId) => {
+    const row = make("tr", "evidence-detail");
+    const td = make("td", "evidence"); td.colSpan = 5;
+    const details = make("details");
+    if (detailId) details.id = detailId;
+    details.append(make("summary", "", label), content);
+    td.append(details); row.append(td); body.append(row);
+    return details;
+  };
+  const showMembers = (fingerprints, name) => {
+    if (!previousFilters) previousFilters = { values: filterIds.map(key => id(key).value), page: state.page };
+    filterIds.filter(key => !["sort", "page-size"].includes(key)).forEach(key => { id(key).value = ""; });
+    state.fingerprints = new Set(fingerprints || []);
+    relationName = name;
+    state.page = 1;
+    renderFindings();
+    window.location.hash = "findings";
+    id("relation-notice").focus();
+  };
+  const restoreFilters = () => {
+    if (previousFilters) {
+      filterIds.forEach((key, index) => { id(key).value = previousFilters.values[index]; });
+      state.page = previousFilters.page;
+    }
+    state.fingerprints = null; previousFilters = null; relationName = "";
+    renderFindings();
+  };
+  const candidateMembers = c => {
+    const fingerprints = c.member_fingerprints || [];
+    const embedded = new Set(findings.map(f => f.fingerprint));
+    const missing = fingerprints.filter(fp => !embedded.has(fp));
+    const root = make("div", "evidence");
+    if (missing.length) {
+      root.append(make("p", "notice", fmt("missing_members", { n: number(missing.length) })),
+        make("p", "mono", missing.join(" · ")), link(t("full_findings"), "review/summary.json"));
+    }
+    const list = make("ul");
+    fingerprints.forEach(fp => {
+      const finding = findings.find(f => f.fingerprint === fp);
+      const li = make("li");
+      if (finding) {
+        const button = make("button", "", locText(finding) + " · " + finding.tool);
+        button.onclick = () => showMembers([fp], c.id);
+        li.append(button, make("p", "mono", fp), link(t("th_evidence"), finding.source_artifact));
+      } else li.append(make("span", "mono", fp));
+      list.append(li);
+    });
+    root.append(list);
+    return root;
+  };
+
   const renderOverlap = () => {
     id("overlap-count").textContent = fmt("overlap_groups_n", { n: number((review.overlap_groups || []).length) });
     const body = id("overlap-body");
@@ -1152,10 +1359,7 @@ _JS_MAIN = r"""
       const action = make("td");
       const button = make("button", "", t("overlap_view"));
       button.onclick = () => {
-        state.fingerprints = new Set(group.fingerprints || []);
-        state.page = 1;
-        renderFindings();
-        window.location.hash = "findings";
+        showMembers(group.fingerprints, group.canonical_path + ":" + group.line);
       };
       action.append(button);
       tr.append(
@@ -1172,7 +1376,7 @@ _JS_MAIN = r"""
   /* ---------- cross-engine correlation (audit layer) ---------- */
   const originTone = o => ({ "static-only": "origin-static", "llm-only": "origin-llm", "both": "origin-both" }[o] || "");
   const verdictOrder = ["CONFIRMED", "LIKELY", "UNCERTAIN", "FALSE_POSITIVE"];
-  const verdictTone = v => ({ CONFIRMED: "ok", LIKELY: "warn", UNCERTAIN: "muted", FALSE_POSITIVE: "bad" }[v] || "");
+  const verdictTone = v => ({ CONFIRMED: "warn", LIKELY: "warn", UNCERTAIN: "muted", FALSE_POSITIVE: "muted" }[v] || "");
   // Literal keys only: the label test scans this file for every t("...") call.
   const verdictKey = v => ({
     CONFIRMED: t("verdict_confirmed"), LIKELY: t("verdict_likely"),
@@ -1195,8 +1399,9 @@ _JS_MAIN = r"""
     const notice = id("assessment-notice");
     cards.replaceChildren(); body.replaceChildren(); notice.replaceChildren();
     count.textContent = "";
+    id("candidate-pagination").hidden = !assessment;
     if (!assessment) {
-      tableEmpty(body, 9, t("no_assessment"));
+      tableEmpty(body, 5, t("no_assessment"));
       id("origin-comp").replaceChildren(make("p", "empty", t("no_data")));
       return;
     }
@@ -1250,59 +1455,54 @@ _JS_MAIN = r"""
       bucket[sev] = (bucket[sev] || 0) + 1;
     });
     compPanel("origin-comp", sevByOrigin, sevOrder, sevTone, originSeries);
+    id("origin-comp").append(make("p", "muted", t("sample_chart")));
 
     const wanted = id("origin").value;
     const wantedVerdict = id("verdict-filter").value;
     const shown = candidates.filter(c => (!wanted || c.origin === wanted)
       && (!wantedVerdict || (wantedVerdict === "unvalidated" ? !verdictLabel(c) : verdictLabel(c) === wantedVerdict)));
-    count.textContent = fmt("candidates_n", { n: number(shown.length) });
-    shown.forEach(c => {
+    count.textContent = fmt("count_scope", { total: number(metrics.candidates_total ?? candidates.length), embedded: number(candidates.length), matched: number(shown.length) });
+    const size = id("candidate-page-size").value === "all" ? Math.max(shown.length, 1) : Number(id("candidate-page-size").value);
+    const pages = Math.max(1, Math.ceil(shown.length / size));
+    candidatePage = Math.min(candidatePage, pages);
+    id("candidate-page-status").textContent = fmt("page_status", { results: number(shown.length), page: candidatePage, pages });
+    id("candidate-previous").disabled = candidatePage <= 1;
+    id("candidate-next").disabled = candidatePage >= pages;
+    shown.slice((candidatePage - 1) * size, candidatePage * size).forEach(c => {
       const tr = make("tr");
+      const title = make("td");
+      title.append(make("strong", "mono", c.id), make("div", "muted", c.category));
+      const origin = make("td");
+      origin.append(make("span", "badge " + originTone(c.origin), c.origin),
+        make("div", "muted", (c.sources || []).join(", ")));
+      const verdict = make("td"); verdict.append(verdictBadge(c));
       const action = make("td");
       const button = make("button", "", t("candidate_view"));
-      button.onclick = () => {
-        state.fingerprints = new Set(c.member_fingerprints || []);
-        state.page = 1;
-        renderFindings();
-        window.location.hash = "findings";
-      };
+      button.onclick = () => showMembers(c.member_fingerprints, c.id);
       action.append(button);
-      const origin = make("td");
-      origin.append(make("span", "badge " + originTone(c.origin), c.origin));
-      const sev = make("td");
-      sev.append(make("span", "badge sev-" + (sevOrder.includes(c.severity) ? c.severity : "unknown"), c.severity || "unknown"));
-      const verdict = make("td");
-      verdict.append(verdictBadge(c));
-      if (c.verdict && typeof c.verdict === "object" && c.verdict.rationale) {
-        const rationale = String(c.verdict.rationale);
-        const decisive = c.verdict.decisive_line && typeof c.verdict.decisive_line === "object"
-          ? String(c.verdict.decisive_line.file || "") + ":" + String(c.verdict.decisive_line.line || "") : "";
-        const details = make("details", "muted");
-        const summary = make("summary", "", rationale.length > 140 ? rationale.slice(0, 140) + "…" : rationale);
-        details.append(summary);
-        if (rationale.length > 140) details.append(make("div", "", rationale));
-        if (decisive) details.append(make("div", "mono", t("verdict_decisive_line") + " " + decisive));
-        if (c.verdict.remediation) details.append(make("div", "", t("verdict_remediation") + " " + String(c.verdict.remediation)));
-        verdict.append(details);
-      }
-      tr.append(
-        make("td", "mono", c.id),
-        origin,
-        verdict,
-        make("td", "loc", c.canonical_path + ":" + (c.line_start === c.line_end ? c.line_start : c.line_start + "-" + c.line_end)),
-        make("td", "", c.category),
-        sev,
-        make("td", "", (c.sources || []).join(", ")),
-        make("td", "", number((c.member_fingerprints || []).length)),
-        action);
+      tr.append(title, make("td", "loc", c.canonical_path + ":" + c.line_start + (c.line_end !== c.line_start ? "–" + c.line_end : "")),
+        origin, verdict, action);
       body.append(tr);
+      const v = c.verdict || {};
+      const content = make("div");
+      content.append(make("p", "", t("summary_notice")), detailFields([
+        [t("th_severity"), c.severity], [t("members_total"), (c.member_fingerprints || []).length],
+        [t("confidence"), v.confidence], [t("verdict_decisive_line"), v.decisive_line],
+        [t("verdict_remediation"), v.remediation], [t("model"), v.model],
+      ]));
+      // Always retain the full rationale, including short rationales.
+      if (v.rationale) content.append(make("p", "", v.rationale));
+      content.append(candidateMembers(c), link(t("full_assessment"), "audit/assessment.json"));
+      detailsRow(body, t("candidate_open") + " · " + c.id, content, "candidate-" + c.id);
     });
-    if (!body.childNodes.length) tableEmpty(body, 9, t("no_candidates"));
+    if (!body.childNodes.length) tableEmpty(body, 5, t("no_candidates"));
+
   };
 
   /* ---------- diagnostics ---------- */
   const renderDiagnostics = () => {
-    id("diagnostic-count").textContent = fmt("diag_n", { n: number(review.total_diagnostics != null ? review.total_diagnostics : (review.diagnostics || []).length) });
+    const embeddedCount = (review.diagnostics || []).length;
+    id("diagnostic-count").textContent = fmt("count_scope", { total: number(review.total_diagnostics ?? embeddedCount), embedded: number(embeddedCount), matched: number(embeddedCount) });
     const body = id("diagnostic-body");
     body.replaceChildren();
     (review.diagnostics || []).forEach(x => {
@@ -1338,7 +1538,6 @@ _JS_MAIN = r"""
   addOptions(id("cwe"), findings.map(x => x.cwe));
   const buildCount = findings.filter(x => x.evidence_context === "build-aware").length;
   const sourceCount = findings.filter(x => x.evidence_context === "source-only").length;
-  if (buildCount) id("context").value = "build-aware";
 
   const renderContextNotice = () => {
     const notice = id("context-notice");
@@ -1384,35 +1583,102 @@ _JS_MAIN = r"""
     body.replaceChildren();
     rows.slice((state.page - 1) * size, state.page * size).forEach(x => {
       const tr = make("tr");
-      const evidence = make("td");
-      evidence.append(link("native", x.source_artifact));
-      const levelCell = make("td");
-      levelCell.append(chip(rlTone(x.review_level), x.review_level));
-      const sevCell = make("td");
-      sevCell.append(chip(sevTone(x.severity), x.severity || "unknown"));
+      const levels = make("td");
+      levels.append(chip(rlTone(x.review_level), x.review_level), make("br"), chip(sevTone(x.severity), x.severity));
       const provenance = make("td");
-      provenance.append(
-        chip(engineTone(x.engine), engineLabel(x.engine)),
-        make("span", "muted", " · " + x.evidence_class));
-      tr.append(
-        levelCell,
-        sevCell,
-        make("td", "mono", x.original_severity === undefined || x.original_severity === null ? "—" : x.original_severity),
-        make("td", "", x.evidence_context),
-        make("td", "mono", x.tool),
-        provenance,
-        make("td", "mono", x.rule_id),
-        make("td", "mono", x.cwe || "—"),
-        make("td", "loc", locText(x)),
-        make("td", "", x.message),
-        evidence);
+      provenance.append(make("div", "mono", x.tool), chip(engineTone(x.engine), engineLabel(x.engine)));
+      const evidence = make("td", "evidence"); evidence.append(link(t("th_evidence"), x.source_artifact));
+      tr.append(levels, make("td", "loc", locText(x)), make("td", "", x.message), provenance, evidence);
       body.append(tr);
+      const content = make("div");
+      content.append(detailFields([
+        [t("th_native"), x.original_severity], [t("th_context"), x.evidence_context],
+        [t("th_rule"), x.rule_id], [t("th_cwe"), x.cwe], [t("fingerprint"), x.fingerprint],
+        [t("th_provenance"), x.evidence_class], [t("model"), x.model], [t("confidence"), x.confidence],
+        [t("unit_id"), x.unit_id], [t("symbol"), x.symbol], [t("th_location"), x.line_range],
+        [t("th_evidence"), x.evidence],
+      ]));
+      content.append(link(t("th_evidence"), x.source_artifact));
+      if (x.rationale_artifact) content.append(make("p"), link(t("reasoning_artifact"), x.rationale_artifact));
+      const related = ((assessment || {}).candidates || []).filter(c => (c.member_fingerprints || []).includes(x.fingerprint));
+      related.forEach(c => {
+        const button = make("button", "", t("related_candidates") + " · " + c.id);
+        button.onclick = () => {
+          id("origin").value = ""; id("verdict-filter").value = "";
+          const candidates = (assessment || {}).candidates || [];
+          const size = id("candidate-page-size").value === "all" ? Math.max(candidates.length, 1) : Number(id("candidate-page-size").value);
+          candidatePage = Math.floor(candidates.indexOf(c) / size) + 1;
+          renderAssessment();
+          const detail = id("candidate-" + c.id); if (detail) { detail.open = true; detail.scrollIntoView(); detail.querySelector("summary").focus(); }
+        };
+        content.append(make("p"), button);
+      });
+      detailsRow(body, t("detail_open") + " · " + x.rule_id, content, "finding-" + x.fingerprint);
     });
-    if (!body.childNodes.length) tableEmpty(body, 11, t("no_findings"));
+    if (!body.childNodes.length) tableEmpty(body, 5, t("no_findings"));
+    id("finding-total").textContent = fmt("count_scope", { total: number(review.total_findings ?? findings.length), embedded: number(findings.length), matched: number(rows.length) });
+    const caption = filterIds.filter(key => !["sort", "page-size"].includes(key) && id(key).value).map(key => key + "=" + id(key).value);
+    if (state.fingerprints) caption.push(fmt("related_evidence", { name: relationName }));
+    id("filter-caption").textContent = t("print_scope") + ": " + (caption.join(" · ") || t("all_evidence"));
+    const notice = id("relation-notice"); notice.replaceChildren(); notice.hidden = !state.fingerprints;
+    if (state.fingerprints) {
+      notice.append(make("p", "", fmt("related_evidence", { name: relationName })));
+      const missing = [...state.fingerprints].filter(fp => !findings.some(f => f.fingerprint === fp));
+      if (missing.length) notice.append(make("p", "", fmt("missing_members", { n: number(missing.length) })), make("p", "mono", missing.join(" · ")), link(t("full_findings"), "review/summary.json"));
+      const back = make("button", "", t("return_filters")); back.onclick = restoreFilters; notice.append(back);
+    }
     id("page-status").textContent = fmt("page_status", { results: number(rows.length), page: state.page, pages: pages });
     id("previous").disabled = state.page <= 1;
     id("next").disabled = state.page >= pages;
   }
+
+  const renderAuditReading = () => {
+    const root = id("ai-summary"); root.replaceChildren();
+    const info = review.run_summary || { status: "missing" };
+    root.append(make("p", "notice", t("summary_notice")));
+    if (info.status !== "available" || !info.document) {
+      root.append(make("p", "muted", info.status === "failed" ? t("summary_failed") : info.status === "invalid" ? t("summary_invalid") : t("summary_missing")));
+    } else {
+      const doc = info.document;
+      root.append(make("p", "notice", info.verification === "matched" ? t("summary_matched") : info.verification === "changed" ? t("summary_changed") : t("summary_unverified")),
+        make("h3", "", doc.headline), make("p", "", t("summary_posture") + ": " + doc.posture),
+        detailFields([[t("model"), doc.model], [t("input_fingerprint"), doc.run_digest_sha256]]),
+        link(t("summary_source"), "audit/summary.json"));
+      [["themes", "summary_themes"], ["coverage_caveats", "summary_caveats"], ["disagreements", "summary_disagreements"], ["unknowns", "summary_unknowns"], ["priorities", "summary_priorities"]].forEach(([key, label]) => {
+        const entries = doc[key] || []; if (!entries.length) return;
+        const detail = make("details"); detail.append(make("summary", "", t(label)));
+        const list = make("ul");
+        entries.forEach(entry => {
+          const text = typeof entry === "string" ? entry : Object.values(entry).map(value => Array.isArray(value) ? value.join(", ") : value).join(" · ");
+          list.append(make("li", "", text));
+        });
+        detail.append(list); root.append(detail);
+      });
+    }
+    const gaps = id("scope-gaps"); gaps.replaceChildren();
+    const sources = [...Object.entries(review.tools || {}), ...Object.entries(review.scanners || {})];
+    sources.forEach(([name, data]) => {
+      const coverage = data.coverage || {};
+      const covered = coverage.analyzed ?? coverage.covered ?? t("recorded_count");
+      const total = coverage.effective_total ?? coverage.total ?? t("recorded_count");
+      const text = name + " · " + (data.status || t("recorded_count")) + " · " + coverageBasis(coverage.metric) + ": " + covered + " / " + total;
+      gaps.append(make("p", "", text));
+      if (coverage.analysis_reached !== undefined) gaps.append(make("p", "notice", t("coverage_analysis_reached") + ": " + coverage.analysis_reached + " / " + total));
+      if (data.unit_counts) gaps.append(detailFields([[t("unit_id"), data.unit_counts]]));
+      if (data.reason) gaps.append(make("p", "notice", data.reason));
+    });
+    const records = [...(review.coverage_gaps || []), ...((review.report_integrity || {}).omitted_units || [])];
+    records.forEach(record => gaps.append(make("p", "mono", JSON.stringify(record))));
+    if (!records.length) gaps.append(make("p", "muted", t("no_scope_gaps")));
+    const coverage = review.llm_coverage || {};
+    [["files", "coverage_files"], ["functions", "coverage_functions"], ["bytes", "coverage_bytes"]].forEach(([key, label]) => {
+      if (coverage[key]) gaps.append(make("p", "", "LLM · " + t(label) + ": " + (coverage[key].scanned ?? t("recorded_count")) + " / " + (coverage[key].total ?? t("recorded_count"))));
+    });
+    gaps.append(link("inputs/source-inventory.json", "inputs/source-inventory.json"));
+    id("mast-data-link").replaceChildren(link(t("full_findings"), "review/summary.json"));
+    id("full-findings-link").replaceChildren(link(t("full_findings"), "review/summary.json"));
+    id("full-assessment-link").replaceChildren(link(t("full_assessment"), "audit/assessment.json"));
+  };
 
   /* ---------- wiring ---------- */
   ["search", "context", "engine", "review-level", "severity", "tool", "cwe", "sort", "page-size"].forEach(x =>
@@ -1422,14 +1688,20 @@ _JS_MAIN = r"""
   // paginated, so both are expanded for the print and restored afterwards.
   let restore = null;
   window.addEventListener("beforeprint", () => {
+    const openIds = Array.from(document.querySelectorAll("details[id][open]")).map(node => node.id);
     const closed = Array.from(document.querySelectorAll("details:not([open])"));
-    closed.forEach(node => { node.open = true; });
     const size = id("page-size").value;
     const page = state.page;
+    const candidateSize = id("candidate-page-size").value;
+    const savedCandidatePage = candidatePage;
+    if (candidateSize !== "all") { id("candidate-page-size").value = "all"; candidatePage = 1; renderAssessment(); }
     if (size !== "all") { id("page-size").value = "all"; state.page = 1; renderFindings(); }
+    document.querySelectorAll("details").forEach(node => { node.open = true; });
     restore = () => {
       closed.forEach(node => { node.open = false; });
       if (size !== "all") { id("page-size").value = size; state.page = page; renderFindings(); }
+      if (candidateSize !== "all") { id("candidate-page-size").value = candidateSize; candidatePage = savedCandidatePage; renderAssessment(); }
+      document.querySelectorAll("details[id]").forEach(node => { node.open = openIds.includes(node.id); });
     };
   });
   window.addEventListener("afterprint", () => { if (restore) { restore(); restore = null; } });
@@ -1439,7 +1711,7 @@ _JS_MAIN = r"""
     ["search", "context", "engine", "review-level", "severity", "tool", "cwe"].forEach(x => { id(x).value = ""; });
     id("sort").value = "priority";
     state.page = 1;
-    state.fingerprints = null;
+    state.fingerprints = null; previousFilters = null; relationName = "";
     renderFindings();
   };
   const renderAll = () => {
@@ -1456,9 +1728,13 @@ _JS_MAIN = r"""
     renderContextNotice();
     renderFindings();
     renderAssessment();
+    renderAuditReading();
   };
-  id("origin").onchange = () => renderAssessment();
-  id("verdict-filter").onchange = () => renderAssessment();
+  id("candidate-previous").onclick = () => { candidatePage--; renderAssessment(); };
+  id("candidate-next").onclick = () => { candidatePage++; renderAssessment(); };
+  id("candidate-page-size").onchange = () => { candidatePage = 1; renderAssessment(); };
+  id("origin").onchange = () => { candidatePage = 1; renderAssessment(); };
+  id("verdict-filter").onchange = () => { candidatePage = 1; renderAssessment(); };
   id("lang-toggle").onclick = () => {
     lang = lang === "zh" ? "en" : "zh";
     try {
@@ -1477,96 +1753,97 @@ _HTML_BODY = r"""<div class="sheet">
 <div class="mast-top">
 <div>
 <p class="eyebrow">Code Analyzer</p>
-<h1 data-i18n="report_title">静态分析证据报告</h1>
+<h1 data-i18n="report_title">代码分析证据报告</h1>
 <p id="project">正在载入报告…</p>
 </div>
 <div class="mast-right">
 <p class="run-no" id="run-no"></p>
 <div class="mast-actions">
 <button id="lang-toggle" type="button">English</button>
-<a href="review/summary.json" data-i18n="open_json">查看原始 JSON</a>
+<span id="mast-data-link"></span>
 </div>
 </div>
 </div>
 <dl class="mast-meta" id="run-meta"></dl>
 </header>
-<nav class="nav">
-<a href="#overview"><span class="sec-no">1</span><span data-i18n="sec_overview">总体判定</span></a>
-<a href="#distribution"><span class="sec-no">2</span><span data-i18n="sec_distribution">发现分布</span></a>
-<a href="#tools"><span class="sec-no">3</span><span data-i18n="sec_tools">执行与原生证据</span></a>
-<a href="#scope"><span class="sec-no">4</span><span data-i18n="sec_scope">扫描范围</span></a>
-<a href="#overlap"><span class="sec-no">5</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></a>
-<a href="#diagnostics"><span class="sec-no">6</span><span data-i18n="sec_diagnostics">工具诊断</span></a>
-<a href="#findings"><span class="sec-no">7</span><span data-i18n="sec_findings">发现明细</span></a>
-<a href="#assessment"><span class="sec-no">8</span><span data-i18n="sec_assessment">跨引擎关联（非权威）</span></a>
+<nav class="nav" aria-label="Report sections">
+<a href="#overview"><span class="sec-no">1</span><span data-i18n="sec_overview"></span></a>
+<a href="#scope"><span class="sec-no">2</span><span data-i18n="sec_scope"></span></a>
+<a href="#assessment"><span class="sec-no">3</span><span data-i18n="sec_assessment"></span></a>
+<a href="#summary"><span class="sec-no">4</span><span data-i18n="sec_summary"></span></a>
+<a href="#findings"><span class="sec-no">5</span><span data-i18n="sec_findings"></span></a>
+<a href="#distribution"><span class="sec-no">6</span><span data-i18n="sec_distribution"></span></a>
+<a href="#tools"><span class="sec-no">7</span><span data-i18n="sec_tools"></span></a>
+<a href="#diagnostics"><span class="sec-no">8</span><span data-i18n="sec_diagnostics"></span></a>
+<a href="#overlap"><span class="sec-no">9</span><span data-i18n="sec_overlap"></span></a>
 </nav>
 <main>
 <p class="notice" data-i18n="disclaimer">派生的 findings 不具权威性。请对照其链接的原生工具报告与实际的构建配置逐条确认。</p>
 <section id="overview">
 <h2><span class="sec-no">§ 1</span><span data-i18n="sec_overview">总体判定</span></h2>
 <div class="verdict" id="verdict"></div>
+<p class="muted" data-i18n="audit_meaning"></p>
+<p><a href="#scope" data-i18n="sec_scope">扫描范围</a> · <a href="#diagnostics" data-i18n="sec_diagnostics">工具诊断</a></p>
 <div id="integrity-warning"></div>
 <div class="stats" id="cards"></div>
 </section>
-<section id="distribution">
-<h2><span class="sec-no">§ 2</span><span data-i18n="sec_distribution">发现分布</span></h2>
-<div class="charts">
-<article class="panel wide"><h3 data-i18n="chart_rl_comp">评分等级构成</h3><div id="rl-comp"></div></article>
-<article class="panel wide"><h3 data-i18n="chart_sev_comp">规范化严重度构成</h3><div id="sev-comp"></div></article>
-<article class="panel wide"><h3 data-i18n="chart_engine_comp">引擎构成 · 静态工具与 LLM</h3>
-<h4 class="comp-cap" data-i18n="chart_sev_comp">规范化严重度构成</h4><div id="engine-sev-comp"></div>
-<h4 class="comp-cap" data-i18n="chart_rl_comp">评分等级构成</h4><div id="engine-rl-comp"></div></article>
-<article class="panel wide"><h3 data-i18n="chart_heatmap">文件 × 严重度</h3><div id="heatmap"></div></article>
-<article class="panel"><h3 data-i18n="chart_tools">各分析器</h3><div id="tool-chart"></div></article>
-<article class="panel"><h3 data-i18n="chart_top_rules">规则 · 前列</h3><div id="rule-chart"></div></article>
-<article class="panel"><h3 data-i18n="chart_top_cwes">CWE · 前列</h3><div id="cwe-chart"></div></article>
-</div>
-</section>
-<section id="tools">
-<h2><span class="sec-no">§ 3</span><span data-i18n="sec_tools">执行与原生证据</span></h2>
-<div class="tools" id="tool-cards"></div>
-</section>
 <section id="scope">
-<h2><span class="sec-no">§ 4</span><span data-i18n="sec_scope">扫描范围</span></h2>
+<h2><span class="sec-no">§ 2</span><span data-i18n="sec_scope">扫描范围</span></h2>
 <article class="panel">
 <dl class="tool-values" id="scope-values"></dl>
+<h3 data-i18n="scope_gaps">覆盖缺口与省略单元</h3><div id="scope-gaps" class="scope-gaps"></div>
 <details><summary id="source-summary">源文件</summary><ol class="file-list" id="source-files"></ol></details>
 </article>
 </section>
-<section id="overlap">
+<section id="assessment">
 <div class="section-head">
-<h2><span class="sec-no">§ 5</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></h2>
-<span class="muted" id="overlap-count"></span>
+<h2><span class="sec-no">§ 3</span><span data-i18n="sec_assessment">跨引擎关联（非权威）</span></h2>
+<span class="muted" id="candidate-count"></span>
 </div>
-<div class="table-wrap"><table><thead><tr>
-<th data-i18n="th_category">类别</th>
-<th data-i18n="th_location">位置</th>
-<th data-i18n="th_tools">工具</th>
-<th data-i18n="th_evidence">证据</th>
-<th data-i18n="th_action">操作</th>
-</tr></thead><tbody id="overlap-body"></tbody></table></div>
-</section>
-<section id="diagnostics">
-<div class="section-head">
-<h2><span class="sec-no">§ 6</span><span data-i18n="sec_diagnostics">工具诊断</span></h2>
-<span class="muted" id="diagnostic-count"></span>
+<div class="notice" id="assessment-notice"></div>
+<p id="full-assessment-link"></p>
+<div class="stats" id="assessment-cards"></div>
+<article class="chart"><h4 class="comp-cap" data-i18n="chart_origin_comp">各来源的严重度构成</h4><div id="origin-comp"></div></article>
+<div class="controls">
+<label class="control"><span data-i18n="filter_origin">来源</span><select id="origin">
+<option value="" data-i18n="opt_all_origins">全部来源</option>
+<option value="llm-only" data-i18n="legend_llm_only">仅 LLM</option>
+<option value="both" data-i18n="legend_both">共同</option>
+<option value="static-only" data-i18n="legend_static_only">仅静态</option>
+</select></label>
+<label class="control"><span data-i18n="filter_verdict">判定</span><select id="verdict-filter">
+<option value="" data-i18n="opt_all_verdicts">全部判定</option>
+<option value="CONFIRMED" data-i18n="verdict_confirmed">CONFIRMED</option>
+<option value="LIKELY" data-i18n="verdict_likely">LIKELY</option>
+<option value="UNCERTAIN" data-i18n="verdict_uncertain">UNCERTAIN</option>
+<option value="FALSE_POSITIVE" data-i18n="verdict_false_positive">FALSE_POSITIVE</option>
+<option value="unvalidated" data-i18n="opt_unvalidated">未核验</option>
+</select></label>
 </div>
-<div class="table-wrap"><table><thead><tr>
-<th data-i18n="th_severity">严重度</th>
-<th data-i18n="th_tool">分析器</th>
-<th data-i18n="th_diag_category">类别</th>
-<th data-i18n="th_fatal">致命</th>
-<th data-i18n="th_location">位置</th>
-<th data-i18n="th_message">消息</th>
-<th data-i18n="th_evidence">证据</th>
-</tr></thead><tbody id="diagnostic-body"></tbody></table></div>
+<div class="table-wrap"><table class="reading-table"><thead><tr>
+<th data-i18n="th_candidate"></th>
+<th data-i18n="th_location"></th>
+<th data-i18n="th_sources"></th>
+<th data-i18n="th_verdict"></th>
+<th data-i18n="th_members"></th>
+</tr></thead><tbody id="candidate-body"></tbody></table></div>
+<div class="pagination" id="candidate-pagination">
+<span id="candidate-page-status" class="muted"></span>
+<span><select id="candidate-page-size" aria-label="Candidates per page"><option selected>25</option><option>50</option><option>100</option><option value="all" data-i18n="page_all">全部</option></select>
+<button id="candidate-previous" data-i18n="prev">上一页</button>
+<button id="candidate-next" data-i18n="next">下一页</button></span>
+</div>
 </section>
+<section id="summary"><h2><span class="sec-no">§ 4</span><span data-i18n="sec_summary">AI 总结（辅助意见）</span></h2><div id="ai-summary" class="evidence-detail evidence"></div></section>
 <section id="findings">
 <div class="section-head">
-<h2><span class="sec-no">§ 7</span><span data-i18n="sec_findings">发现明细</span></h2>
+<h2><span class="sec-no">§ 5</span><span data-i18n="sec_findings">发现明细</span></h2>
 <span class="muted" id="finding-total"></span>
 </div>
 <p class="notice" id="context-notice" hidden></p>
+<div class="notice" id="relation-notice" tabindex="-1" hidden></div>
+<p id="filter-caption" class="muted"></p>
+<p id="full-findings-link"></p>
 <div class="controls">
 <label class="control"><span data-i18n="search_label">搜索</span><input id="search" type="search" placeholder="规则、CWE、文件或消息"></label>
 <label class="control"><span data-i18n="filter_context">上下文</span><select id="context">
@@ -1600,18 +1877,12 @@ _HTML_BODY = r"""<div class="sheet">
 </select></label>
 <button id="reset" type="button" data-i18n="reset">重置</button>
 </div>
-<div class="table-wrap"><table><thead><tr>
-<th data-i18n="th_review_level">评分等级</th>
-<th data-i18n="th_severity">严重度</th>
-<th data-i18n="th_native">原生等级</th>
-<th data-i18n="th_context">上下文</th>
-<th data-i18n="th_tool">分析器</th>
-<th data-i18n="th_provenance">来源</th>
-<th data-i18n="th_rule">规则</th>
-<th data-i18n="th_cwe">CWE</th>
-<th data-i18n="th_location">位置</th>
-<th data-i18n="th_message">消息</th>
-<th data-i18n="th_evidence">证据</th>
+<div class="table-wrap"><table class="reading-table"><thead><tr>
+<th data-i18n="th_review_level"></th>
+<th data-i18n="th_location"></th>
+<th data-i18n="th_message"></th>
+<th data-i18n="th_provenance"></th>
+<th data-i18n="th_evidence"></th>
 </tr></thead><tbody id="finding-body"></tbody></table></div>
 <div class="pagination">
 <span id="page-status" class="muted"></span>
@@ -1622,41 +1893,51 @@ _HTML_BODY = r"""<div class="sheet">
 </span>
 </div>
 </section>
-<section id="assessment">
-<div class="section-head">
-<h2><span class="sec-no">§ 8</span><span data-i18n="sec_assessment">跨引擎关联（非权威）</span></h2>
-<span class="muted" id="candidate-count"></span>
+<section id="distribution">
+<h2><span class="sec-no">§ 6</span><span data-i18n="sec_distribution">发现分布</span></h2>
+<div class="charts">
+<article class="panel wide"><h3 data-i18n="chart_rl_comp">评分等级构成</h3><div id="rl-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_sev_comp">规范化严重度构成</h3><div id="sev-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_engine_comp">引擎构成 · 静态工具与 LLM</h3>
+<h4 class="comp-cap" data-i18n="chart_sev_comp">规范化严重度构成</h4><div id="engine-sev-comp"></div>
+<h4 class="comp-cap" data-i18n="chart_rl_comp">评分等级构成</h4><div id="engine-rl-comp"></div></article>
+<article class="panel wide"><h3 data-i18n="chart_heatmap">文件 × 严重度</h3><div id="heatmap"></div></article>
+<article class="panel"><h3 data-i18n="chart_tools">各分析器</h3><div id="tool-chart"></div></article>
+<article class="panel"><h3 data-i18n="chart_top_rules">规则 · 前列</h3><div id="rule-chart"></div></article>
+<article class="panel"><h3 data-i18n="chart_top_cwes">CWE · 前列</h3><div id="cwe-chart"></div></article>
 </div>
-<div class="notice" id="assessment-notice"></div>
-<div class="stats" id="assessment-cards"></div>
-<article class="chart"><h4 class="comp-cap" data-i18n="chart_origin_comp">各来源的严重度构成</h4><div id="origin-comp"></div></article>
-<div class="controls">
-<label class="control"><span data-i18n="filter_origin">来源</span><select id="origin">
-<option value="" data-i18n="opt_all_origins">全部来源</option>
-<option value="llm-only" data-i18n="legend_llm_only">仅 LLM</option>
-<option value="both" data-i18n="legend_both">共同</option>
-<option value="static-only" data-i18n="legend_static_only">仅静态</option>
-</select></label>
-<label class="control"><span data-i18n="filter_verdict">判定</span><select id="verdict-filter">
-<option value="" data-i18n="opt_all_verdicts">全部判定</option>
-<option value="CONFIRMED" data-i18n="verdict_confirmed">CONFIRMED</option>
-<option value="LIKELY" data-i18n="verdict_likely">LIKELY</option>
-<option value="UNCERTAIN" data-i18n="verdict_uncertain">UNCERTAIN</option>
-<option value="FALSE_POSITIVE" data-i18n="verdict_false_positive">FALSE_POSITIVE</option>
-<option value="unvalidated" data-i18n="opt_unvalidated">未核验</option>
-</select></label>
+</section>
+<section id="tools">
+<h2><span class="sec-no">§ 7</span><span data-i18n="sec_tools">执行与原生证据</span></h2>
+<div class="tools" id="tool-cards"></div>
+</section>
+<section id="diagnostics">
+<div class="section-head">
+<h2><span class="sec-no">§ 8</span><span data-i18n="sec_diagnostics">工具诊断</span></h2>
+<span class="muted" id="diagnostic-count"></span>
 </div>
 <div class="table-wrap"><table><thead><tr>
-<th data-i18n="th_candidate">候选</th>
-<th data-i18n="th_origin">来源</th>
-<th data-i18n="th_verdict">判定</th>
+<th data-i18n="th_severity">严重度</th>
+<th data-i18n="th_tool">分析器</th>
+<th data-i18n="th_diag_category">类别</th>
+<th data-i18n="th_fatal">致命</th>
 <th data-i18n="th_location">位置</th>
+<th data-i18n="th_message">消息</th>
+<th data-i18n="th_evidence">证据</th>
+</tr></thead><tbody id="diagnostic-body"></tbody></table></div>
+</section>
+<section id="overlap">
+<div class="section-head">
+<h2><span class="sec-no">§ 9</span><span data-i18n="sec_overlap">跨工具邻近重叠</span></h2>
+<span class="muted" id="overlap-count"></span>
+</div>
+<div class="table-wrap"><table><thead><tr>
 <th data-i18n="th_category">类别</th>
-<th data-i18n="th_severity">规范化严重度</th>
-<th data-i18n="th_sources">来源 producer</th>
-<th data-i18n="th_members">成员</th>
-<th></th>
-</tr></thead><tbody id="candidate-body"></tbody></table></div>
+<th data-i18n="th_location">位置</th>
+<th data-i18n="th_tools">工具</th>
+<th data-i18n="th_evidence">证据</th>
+<th data-i18n="th_action">操作</th>
+</tr></thead><tbody id="overlap-body"></tbody></table></div>
 </section>
 </main>
 <noscript><p class="notice">需要启用 JavaScript;完整数据仍在 <a href="review/summary.json">review/summary.json</a> 中。JavaScript is required; the complete data remains in review/summary.json.</p></noscript>
@@ -1668,7 +1949,7 @@ _TEMPLATE = "".join([
     '<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<meta name="color-scheme" content="light dark">',
-    "<title>Code Analyzer · 静态分析证据报告</title>\n<style>",
+    "<title>Code Analyzer · 代码分析证据报告</title>\n<style>",
     _CSS,
     "</style></head><body>\n",
     _HTML_BODY,

@@ -122,7 +122,7 @@ def test_every_dashboard_label_exists_in_both_languages() -> None:
 def test_the_findings_table_filters_and_reports_the_engine() -> None:
     html = render({"artifacts": [], "tools": {}}, _review([_finding(1, "llm")]))
 
-    controls = html.split('<div class="controls">', 1)[1].split("</div>", 1)[0]
+    controls = html.split('<section id="findings">', 1)[1].split('<div class="controls">', 1)[1].split("</div>", 1)[0]
     assert '<select id="engine">' in controls
     assert '<option value="static"' in controls and '<option value="llm"' in controls
     assert '"engine", "review-level"' in html
