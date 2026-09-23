@@ -31,11 +31,21 @@ class Recorder:
         self._next = _first_free(directory)
 
     def begin(self, payload: bytes, meta: dict[str, Any]) -> Exchange:
+        # Several clients record into one evaluation's model/ at once (the conversation, a review job, an
+        # extraction), each with its own counter: the directory is claimed atomically and a number another
+        # recorder took first is skipped, never shared.
+        self.directory.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            number = self._next
-            self._next += 1
-        path = self.directory / f"{number:04d}"
-        path.mkdir(parents=True, exist_ok=False)
+            while True:
+                number = self._next
+                path = self.directory / f"{number:04d}"
+                try:
+                    path.mkdir(exist_ok=False)
+                except FileExistsError:
+                    self._next = max(number + 1, _first_free(self.directory))
+                    continue
+                self._next = number + 1
+                break
         _write(path / "request.json", self._redact(payload))
         return Exchange(self, path, dict(meta))
 

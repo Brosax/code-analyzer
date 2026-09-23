@@ -286,3 +286,16 @@ def test_coverage_reports_verification_and_grounding(workspace: Workspace) -> No
     view = coverage(workspace, store, active.active_profile(workspace))
     assert view["verified"] == 1 and view["verdicts"]["CONFIRMED"] == 1
     assert view["lenses"]["verify"]["grounding_failure_rate"] == 0.0
+
+
+def test_an_unexpected_error_fails_one_task_not_the_job() -> None:
+    def work(task: Task) -> Attempt:
+        if task.id == "t1":
+            raise FileExistsError("model/0009")
+        return Attempt("done", gpu_seconds=1)
+
+    outcomes: list[tuple[str, str, str]] = []
+    summary = Engine(work, budget_seconds=100, on_outcome=lambda t, a: outcomes.append((t.id, a.status, a.reason))).run(
+        [Task("t1", None), Task("t2", None)])
+    assert summary.by_status == {"failed": 1, "done": 1} and summary.planned == summary.started == 2
+    assert outcomes[0][2].startswith("internal error: FileExistsError")

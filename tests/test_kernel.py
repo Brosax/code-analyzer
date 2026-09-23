@@ -214,3 +214,15 @@ def test_queued_messages_and_interruption(workspace: Workspace) -> None:
     assert workspace.ledger.of("user_said")[-1]["text"] == "（写于上一回合进行中）第二句"
     conversation.interrupt()
     assert threading.active_count() >= 1
+
+
+def test_a_job_can_be_shown_with_its_progress(workspace: Workspace) -> None:
+    job = {"id": "J3", "kind": "review", "status": "running", "exit_code": None, "elapsed_seconds": 140,
+           "progress": ["plan: 48 entries to verify", "20/48 reviewed, 300s of 1800s GPU budget used"]}
+    services = tools.Services(run_tools=lambda ws, t: None, jobs=lambda ws: [job], export=lambda ws, v, f: {})
+    context = tools.ToolContext(workspace, services)
+    shown = tools.run(context, "show", {"target": "J3"})
+    assert not shown.error and "20/48 reviewed" in shown.content and "review running" in shown.content
+    listed = tools.run(context, "list", {"kind": "job"})
+    assert "20/48 reviewed" in listed.content
+    assert tools.run(context, "show", {"target": "J9"}).error

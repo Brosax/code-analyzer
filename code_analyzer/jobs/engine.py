@@ -114,6 +114,8 @@ class Engine:
                     summary.breaker = (f"model host unreachable ({error.code}); circuit breaker after "
                                        f"{consecutive} consecutive failures")
                     self.progress(summary.breaker)
+            except Exception as error:  # noqa: BLE001 - one task's failure must not cost the rest of the job
+                attempt = Attempt("failed", f"internal error: {type(error).__name__}: {str(error)[:200]}")
             else:
                 if attempt.status in ("done", "cached"):
                     consecutive = 0

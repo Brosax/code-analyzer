@@ -316,3 +316,13 @@ def test_a_diff_against_an_old_index_rebuilds_it_first(server: App, tmp_path: Pa
     _wait(client, first)
     diff = client.get(f"/api/e/{first}/diff?against={first}")["diff"]
     assert diff["counts"]["kept"] == 1 and diff["counts"]["new"] == diff["counts"]["gone"] == 0
+
+
+def test_job_numbers_continue_across_a_restart(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    evaluation, workspace = _evaluation(server, client, tmp_path)
+    assert client.post(f"/api/e/{evaluation}/run_tools", {}, expect=202)["job"]["id"] == "J1"
+    _wait(client, evaluation)
+    restarted = App(Settings(data_root=server.data_root))            # a new server process, same evaluation
+    job = restarted.jobs.start(evaluation, "noop", lambda _job: 0)
+    assert job.id == "J2" and workspace.ledger.of("job_started")[-1]["job"] == "J2"

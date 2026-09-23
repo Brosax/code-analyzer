@@ -44,20 +44,32 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, on_finish: Callable[[Job], None] | None = None) -> None:
+    def __init__(self, on_finish: Callable[[Job], None] | None = None, *,
+                 on_start: Callable[[Job], None] | None = None,
+                 seed: Callable[[str], int] = lambda _evaluation: 0) -> None:
         self._lock = threading.Condition()
         self._jobs: dict[str, list[Job]] = {}
+        self._numbers: dict[str, int] = {}
         self.version = 0
         self.on_finish = on_finish
+        self.on_start = on_start
+        # The highest job number an evaluation has already used (from its ledger): numbers continue across
+        # restarts of the server, so "J3" names one job for the life of the evaluation.
+        self.seed = seed
 
     def start(self, evaluation: str, kind: str, work: Callable[[Job], int | None]) -> Job:
         with self._lock:
             jobs = self._jobs.setdefault(evaluation, [])
             if any(job.status == "running" for job in jobs):
                 raise UserError("a job is already running for this evaluation; stop it or wait for it")
-            job = Job(f"J{len(jobs) + 1}", evaluation, kind)
+            if evaluation not in self._numbers:
+                self._numbers[evaluation] = self.seed(evaluation)
+            self._numbers[evaluation] += 1
+            job = Job(f"J{self._numbers[evaluation]}", evaluation, kind)
             jobs.append(job)
             self._bump()
+        if self.on_start is not None:
+            self.on_start(job)
         thread = threading.Thread(target=self._run, args=(job, work), name=f"job-{evaluation}-{job.id}", daemon=True)
         thread.start()
         return job

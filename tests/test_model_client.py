@@ -331,3 +331,13 @@ def test_a_chunked_stream_cut_before_its_last_chunk_is_an_error(model_on: None) 
         assert caught.value.code == "TRANSPORT"
     finally:
         server.shutdown()
+
+
+def test_two_recorders_sharing_a_directory_never_collide(tmp_path: Path) -> None:
+    from code_analyzer.model.record import Recorder
+
+    chat, review = Recorder(tmp_path / "model"), Recorder(tmp_path / "model")   # both start at 0001
+    first = chat.begin(b"{}", {"purpose": "chat"})
+    second = review.begin(b"{}", {"purpose": "lens"})
+    third = chat.begin(b"{}", {"purpose": "chat"})
+    assert [p.path.name for p in (first, second, third)] == ["0001", "0002", "0003"]

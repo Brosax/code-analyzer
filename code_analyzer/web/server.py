@@ -81,7 +81,7 @@ class App:
         self.data_root = self.settings.data_root.expanduser()
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.port = port
-        self.jobs = JobManager(on_finish=self._job_finished)
+        self.jobs = JobManager(on_finish=self._job_finished, on_start=self._job_started, seed=self._last_job_number)
         # One GPU, one broker, shared by every evaluation this server hosts.
         self.broker = Broker()
         self._conversations: dict[str, Conversation] = {}
@@ -250,6 +250,15 @@ class App:
             events = self._deltas.get(key, [])
             start = max(0, len(events) - 2000) if index > len(events) else index
             return events[start:], len(events)
+
+    def _job_started(self, job: Job) -> None:
+        self.workspace(job.evaluation).ledger.append("job_started", job=job.id, job_kind=job.kind)
+
+    def _last_job_number(self, evaluation: str) -> int:
+        numbers = [int(match.group(1)) for record in self.workspace(evaluation).ledger.read()
+                   for value in (record.get("job"), record.get("job_id"))
+                   if isinstance(value, str) and (match := re.fullmatch(r"J(\d+)", value))]
+        return max(numbers, default=0)
 
     def _job_finished(self, job: Job) -> None:
         conversation = self._conversations.get(job.evaluation)

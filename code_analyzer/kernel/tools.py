@@ -85,7 +85,8 @@ def _list(ctx: ToolContext, args: dict[str, Any]) -> Result:
     page = int(args.get("page") or 1)
     if kind == "job":
         jobs = ctx.services.jobs(ctx.workspace)
-        lines = [f"{j['id']} {j['kind']} {j['status']} exit={j['exit_code']} {j['elapsed_seconds']}s" for j in jobs]
+        lines = [f"{j['id']} {j['kind']} {j['status']} exit={j['exit_code']} {j['elapsed_seconds']}s"
+                 + (f" · {finding_text(j['progress'][-1])}" if j.get("progress") else "") for j in jobs]
         return Result("\n".join(lines) or "no jobs yet")
     store = _store(ctx.workspace)
     try:
@@ -130,6 +131,13 @@ def _show(ctx: ToolContext, args: dict[str, Any]) -> Result:
     radius = min(int(args.get("radius") or SOURCE_RADIUS), 40)
     if re.fullmatch(r"R\d+", target):
         return _page_result(ctx, target, int(args.get("page") or 1))
+    if re.fullmatch(r"J\d+", target):
+        job = next((j for j in ctx.services.jobs(ctx.workspace) if j["id"] == target), None)
+        if job is None:
+            return Result(f"no job {target}", error=True)
+        tail = [finding_text(line) for line in (job.get("progress") or [])[-8:]]
+        return Result(_cap(f"{job['id']} {job['kind']} {job['status']} exit={job['exit_code']} "
+                           f"{job['elapsed_seconds']}s\n" + "\n".join(tail)))
     if target == "profile":
         profile = active.active_profile(ctx.workspace)
         view = active.view(profile)
