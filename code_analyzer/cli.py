@@ -97,12 +97,14 @@ def parser() -> argparse.ArgumentParser:
     assess.add_argument("--config", type=Path)
     assess.add_argument("--max-candidates", type=positive_int, metavar="N", help="validate at most N pending candidates, highest risk first")
     add_llm_arguments(assess)
+    web = commands.add_parser("web", help="open the local evaluation page (127.0.0.1); the default with no arguments")
+    web.add_argument("--port", type=int, help="port (default: settings.toml port, 8765)")
     evaluate = commands.add_parser(
         "evaluate", help="v3 headless evaluation: run the analyzers, index the evidence, number the vulnerability "
                          "list (no model); becomes `analyze` when the old runner is retired")
     evaluate.add_argument("source", type=Path)
-    evaluate.add_argument("--profile", default="rt700-tp-v1.1",
-                          help="a built-in profile (rt700-tp-v1.1, generic-sesip) or a profile TOML")
+    evaluate.add_argument("--profile", help="a built-in profile (rt700-tp-v1.1, generic-sesip) or a profile TOML; "
+                                            "default: the evaluation's own, or rt700-tp-v1.1 for a new one")
     evaluate.add_argument("--eval-dir", type=Path, help="evaluation directory (created if new, reused if it exists)")
     evaluate.add_argument("--buildctx", type=Path, help="a build context TOML ([build] and [tools] only)")
     evaluate.add_argument("--tool", action="append", choices=("cppcheck", "flawfinder", "splint"),
@@ -135,10 +137,11 @@ def main(argv: list[str] | None = None) -> int:
     root_parser = parser()
     if not raw_argv:
         if _has_tty():
-            raw_argv = ["tui", str(Path.cwd())]
+            raw_argv = ["web"]
         else:
             root_parser.print_help(file=sys.stderr)
-            print("\ncode-analyzer: hint: run 'code-analyzer tui [SOURCE]' in an interactive terminal", file=sys.stderr)
+            print("\ncode-analyzer: hint: run 'code-analyzer web' to open the evaluation page, or "
+                  "'code-analyzer evaluate SOURCE' for a headless run", file=sys.stderr)
             return 2
     # A third dispatch: neither a subcommand nor a flag, so it is something the
     # operator said.  The deterministic parser resolves it or reports why it
@@ -207,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
             return _probe(args)
         if args.command == "evaluate":
             return _evaluate(args)
+        if args.command == "web":
+            from .web.server import serve as serve_web
+
+            serve_web(port=args.port, announce=lambda line: print(line, file=sys.stderr, flush=True))
+            return 0
         if args.command == "compile-db":
             return _invoke("compile-db", ActionRequest(
                 "compile-db", source=args.source, args=args),

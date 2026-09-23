@@ -28,6 +28,7 @@ include = ["code_analyzer*"]
 [tool.setuptools.package-data]
 "code_analyzer.skills" = ["*/SKILL.md"]
 "code_analyzer.sesip" = ["builtin/*.toml"]
+"code_analyzer.web" = ["static/*"]
 
 [tool.ruff]
 target-version = "py311"

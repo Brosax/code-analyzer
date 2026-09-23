@@ -45,9 +45,9 @@ _TABLE_KEYS: dict[str, set[str]] = {
 _ARRAY_KEYS: dict[str, set[str]] = {
     "documents": {"role", "file", "sha256", "title"},
     "sfr": {"id", "catalogue", "title", "source", "keywords", "families"},
-    "toe_module": {"id", "paths", "sfr"},
+    "toe_module": {"id", "paths", "sfr", "description", "source"},
     "exclude": {"paths", "reason"},
-    "tsfi": {"id", "symbols", "attributes", "sfr"},
+    "tsfi": {"id", "symbols", "attributes", "sfr", "description", "source"},
     "level": {"id", "label", "rank", "description", "source"},
     "category": {"id", "label", "definition", "source"},
     "grading_rule": {"match", "level", "basis", "by", "at"},
@@ -206,8 +206,9 @@ def validate_profile(data: dict[str, Any]) -> list[str]:
         if isinstance(module, dict):
             problems += [f"toe_module {module.get('id')!r} names unknown SFR {s!r}"
                          for s in module.get("sfr", []) if s not in sfr_ids]
-            if not module.get("paths"):
-                problems.append(f"toe_module {module.get('id')!r} has no paths")
+            confirmed = isinstance(data.get("evaluation"), dict) and data["evaluation"].get("status") == "confirmed"
+            if not module.get("paths") and confirmed:
+                problems.append(f"toe_module {module.get('id')!r} has no paths; map it to source before confirming")
     for kind, target, known in (("grading_rule", "level", levels),
                                 ("category_rule", "category",
                                  {str(c.get("id")) for c in data.get("category", []) if isinstance(c, dict)})):

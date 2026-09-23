@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code-analyzer · 评估</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">code-analyzer</div>
+  <div id="eval-head" class="eval-head"></div>
+  <button id="switch-eval" class="btn small ghost" type="button" hidden>切换评估</button>
+  <div id="badges" class="badges"></div>
+  <ol id="stages" class="stages" aria-label="评估阶段"></ol>
+</header>
+
+<main id="picker" class="picker" hidden></main>
+
+<main id="workspace" class="workspace" hidden>
+  <section class="pane pane-left" aria-labelledby="timeline-title">
+    <h2 id="timeline-title" class="pane-title">时间线</h2>
+    <ol id="timeline" class="timeline"></ol>
+    <form id="composer" class="composer">
+      <label class="sr-only" for="composer-input">对话</label>
+      <textarea id="composer-input" rows="2" disabled placeholder="正在连接…"></textarea>
+      <div class="composer-actions">
+        <button id="composer-stop" class="btn small danger" type="button" hidden>打断</button>
+        <button id="composer-send" class="btn primary" type="submit" disabled>发送</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="pane pane-right" aria-label="工作区">
+    <div id="tabs" class="tabs" role="tablist" aria-label="视图">
+      <button type="button" role="tab" id="tab-list" data-tab="list" aria-controls="panel">清单</button>
+      <button type="button" role="tab" id="tab-evidence" data-tab="evidence" aria-controls="panel">证据</button>
+      <button type="button" role="tab" id="tab-profile" data-tab="profile" aria-controls="panel">档案</button>
+      <button type="button" role="tab" id="tab-coverage" data-tab="coverage" aria-controls="panel">覆盖</button>
+      <button type="button" role="tab" id="tab-tasks" data-tab="tasks" aria-controls="panel">任务</button>
+    </div>
+    <div id="panel" class="panel" role="tabpanel" tabindex="-1"></div>
+  </section>
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

@@ -22,7 +22,7 @@ from ..persist import jsonl_bytes
 from .findings import ParsedRun, key, line_number
 from .triage import Cluster
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PAGE_SIZE = 20
 
 _FINDING_COLUMNS = (
@@ -59,7 +59,7 @@ CREATE TABLE pvs(
   proposed_level TEXT, module TEXT, sfr TEXT, sfr_ids TEXT, anchor TEXT, cluster_id TEXT, path TEXT,
   function TEXT, family TEXT, line_start INTEGER, line_end INTEGER, members INTEGER, tools TEXT,
   priority INTEGER NOT NULL, priority_why TEXT, multi_engine INTEGER, match TEXT, status TEXT NOT NULL,
-  row TEXT NOT NULL) WITHOUT ROWID;
+  note TEXT NOT NULL DEFAULT '', row TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX pvs_rank ON pvs(partition, priority DESC, path, line_start);
 CREATE TABLE triage(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
@@ -120,11 +120,11 @@ class Store:
 
     def _load_pvs(self, entries: list[Any], triage: dict[str, int]) -> None:
         self.db.executemany(
-            "INSERT INTO pvs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pvs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ((e.pv_id, e.partition, e.level, _rank(e.level), e.level_basis, e.proposed_level, e.module, _json(e.sfr),
               "," + ",".join(s["id"] for s in e.sfr) + ",", e.anchor, e.cluster_id, e.path, e.function, e.family,
               e.line_start, e.line_end, len(e.members), ",".join(e.tools), e.priority, _json(e.priority_why),
-              int(e.multi_engine), e.match, "open", _json(e.as_row()))
+              int(e.multi_engine), e.match, "open", "", _json(e.as_row()))
              for e in entries if e.pv_id))
         self.db.executemany("INSERT INTO triage VALUES (?, ?)", sorted(triage.items()))
 
@@ -172,7 +172,7 @@ class Store:
         total = self.db.execute(f"SELECT COUNT(*) FROM pvs{clause}", args).fetchone()[0]
         rows = self.db.execute(
             f"SELECT pv_id, partition, level, level_basis, proposed_level, module, sfr, path, function, family, "
-            f"line_start, line_end, members, tools, priority, status FROM pvs{clause} ORDER BY {order} "
+            f"line_start, line_end, members, tools, priority, status, note FROM pvs{clause} ORDER BY {order} "
             f"LIMIT ? OFFSET ?", [*args, PAGE_SIZE, (page - 1) * PAGE_SIZE])
         partitions = dict(self.db.execute(f"SELECT partition, COUNT(*) FROM pvs{clause} GROUP BY partition", args)
                           .fetchall())
@@ -185,8 +185,28 @@ class Store:
         return {"total": total, "page": page, "rows": out, "by_partition": partitions, "by_level": levels}
 
     def pv(self, pv_id: str) -> dict[str, Any] | None:
-        row = self.db.execute("SELECT row FROM pvs WHERE pv_id = ?", (pv_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        row = self.db.execute("SELECT row, status, note, partition, level, level_basis FROM pvs WHERE pv_id = ?",
+                              (pv_id,)).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(row[0]), "status": row[1], "note": row[2], "partition": row[3], "level": row[4],
+                "level_basis": row[5]}
+
+    def all_pvs(self) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT row, status, note, partition, level, level_basis FROM pvs ORDER BY pv_id")
+        return [{**json.loads(r[0]), "status": r[1], "note": r[2], "partition": r[3], "level": r[4],
+                 "level_basis": r[5]} for r in rows]
+
+    def set_status(self, pv_id: str, status: str, note: str) -> bool:
+        with self.db:
+            return self.db.execute("UPDATE pvs SET status = ?, note = ? WHERE pv_id = ?",
+                                   (status, note, pv_id)).rowcount == 1
+
+    def set_level(self, pv_id: str, level: str, basis: str, partition: str) -> bool:
+        with self.db:
+            return self.db.execute(
+                "UPDATE pvs SET level = ?, level_rank = ?, level_basis = ?, partition = ? WHERE pv_id = ?",
+                (level, _rank(level), basis, partition, pv_id)).rowcount == 1
 
     def triage_counts(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT key, value FROM triage ORDER BY key").fetchall())
@@ -214,8 +234,26 @@ class Store:
             out += jsonl_bytes({"meta": dict(row)})
         return bytes(out)
 
+    def schema_version(self) -> int:
+        try:
+            row = self.db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        except sqlite3.DatabaseError:
+            return 0
+        return int(row[0]) if row else 0
+
     def close(self) -> None:
         self.db.close()
+
+
+def index_current(path: Path) -> bool:
+    """Whether ``path`` holds an index this code can read; derived data is rebuilt, never migrated."""
+    if not path.exists():
+        return False
+    store = Store(path)
+    try:
+        return store.schema_version() == SCHEMA_VERSION
+    finally:
+        store.close()
 
 
 _FINDING_FILTERS = {"tool": "tool = ?", "rule": "rule_id = ?", "level": "review_level = ?",

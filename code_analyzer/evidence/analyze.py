@@ -31,12 +31,19 @@ from ..config import DEFAULTS, validate_config
 from ..errors import UserError
 from ..persist import json_bytes, jsonl_bytes
 from ..review import should_fail
-from ..sesip.profile import DEFAULT_HEADLESS, Profile, load_profile
+from ..sesip.active import active_profile, save_draft, select_builtin
+from ..sesip.profile import BUILTINS, DEFAULT_HEADLESS, Profile, load_profile
 from ..sesip.pv import build_entries, number, numbering_record
 from ..tools import TOOL_NAMES
-from .buildctx_schema import buildctx_sha, buildctx_text, default_buildctx
+from .buildctx_schema import (
+    buildctx_sha,
+    buildctx_text,
+    default_buildctx,
+    parse_buildctx,
+)
 from .findings import parse_run
-from .store import Store
+from .overlays import replay
+from .store import Store, index_current
 from .triage import cluster
 from .workspace import Workspace, _atomic
 
@@ -53,16 +60,15 @@ class Outcome:
 
 
 def evaluate(source: Path, *, eval_dir: Path | None = None, data_root: Path | None = None,
-             profile: str | Path = DEFAULT_HEADLESS, buildctx: dict[str, Any] | None = None,
+             profile: str | Path | None = None, buildctx: dict[str, Any] | None = None,
              tools: list[str] | None = None, compile_db: Path | None | bool = None,
              exclude: list[str] | None = None, fail_on: str = "none",
              progress: Callable[[str], None] = lambda _line: None,
              cancellation: CancellationToken | None = None) -> Outcome:
     source = source.expanduser().resolve()
     workspace = _workspace(source, eval_dir, data_root)
-    chosen = load_profile(profile if isinstance(profile, str) else Path(profile))
-    workspace.ledger.append("profile_selected", name=chosen.name, sha256=chosen.sha256, status=chosen.status)
-    context = buildctx or default_buildctx()
+    chosen = _choose_profile(workspace, profile)
+    context = buildctx or current_buildctx(workspace)
     number_, sha = _record_buildctx(workspace, context)
     progress(f"evaluation {workspace.root.name}: profile {chosen.name}, build context v{number_}")
 
@@ -119,8 +125,10 @@ def index(workspace: Workspace, profile: Profile, run_dir: Path, *,
         "kept": sum(1 for e in listed if e.match != "new"), "new": sum(1 for e in listed if e.match == "new"),
     }
     assert counts["in_toe"] == sum(triage.counts.values()), "conservation: every in-TOE cluster has a partition"
-    Store.build(workspace.index_path, parsed, clusters, pvs=listed,
-                triage={k: v for k, v in counts.items() if isinstance(v, int)}).close()
+    store = Store.build(workspace.index_path, parsed, clusters, pvs=listed,
+                        triage={k: v for k, v in counts.items() if isinstance(v, int)})
+    replay(workspace, store)
+    store.close()
     workspace.ledger.append("index_built", numbering_version=version, profile_sha256=profile.sha256,
                             run_dir=_relative(run_dir, workspace.root),
                             **{k: v for k, v in counts.items() if isinstance(v, int)})
@@ -128,6 +136,47 @@ def index(workspace: Workspace, profile: Profile, run_dir: Path, *,
              f"{counts['partition_below']} below threshold; {counts['kept']} kept their numbers, "
              f"{counts['new']} new, {counts['retired']} retired")
     return counts, parsed.findings
+
+
+def reindex(workspace: Workspace, *, progress: Callable[[str], None] = lambda _line: None) -> dict[str, Any]:
+    """Rebuild the list from the last completed call's evidence, under the current profile. No tool runs."""
+    calls = [r for r in workspace.ledger.of("call_finished") if r.get("run_dir") and r.get("exit_code") != 130]
+    if not calls:
+        raise UserError("no completed tool run to rebuild the list from; run the tools first")
+    counts, _ = index(workspace, active_profile(workspace), workspace.root / calls[-1]["run_dir"], progress=progress)
+    return counts
+
+
+def ensure_index(workspace: Workspace) -> bool:
+    """Make sure index.sqlite is current, rebuilding it from the evidence when its schema is old.
+    Returns False when there is nothing to build from yet."""
+    if index_current(workspace.index_path):
+        return True
+    if not any(r.get("run_dir") and r.get("exit_code") != 130 for r in workspace.ledger.of("call_finished")):
+        return False
+    reindex(workspace)
+    return True
+
+
+def current_buildctx(workspace: Workspace) -> dict[str, Any]:
+    known = workspace.ledger.of("buildctx_version")
+    if not known:
+        return default_buildctx()
+    return parse_buildctx(workspace.version_text("buildctx", int(known[-1]["version"])))
+
+
+def _choose_profile(workspace: Workspace, profile: str | Path | None) -> Profile:
+    """The profile to grade with: an explicit one is recorded as selected; otherwise the evaluation's own."""
+    if profile is None:
+        if not workspace.ledger.of("profile_selected"):
+            return select_builtin(workspace, DEFAULT_HEADLESS)
+        return active_profile(workspace)
+    if isinstance(profile, str) and profile in BUILTINS:
+        current = workspace.ledger.of("profile_selected")
+        if current and current[-1].get("source") == "builtin" and current[-1]["name"] == profile:
+            return load_profile(profile)
+        return select_builtin(workspace, profile)
+    return save_draft(workspace, Path(profile).expanduser().read_text(encoding="utf-8"))
 
 
 def latest_numbering(workspace: Workspace) -> list[dict[str, Any]]:

@@ -59,7 +59,7 @@ def test_every_cli_subcommand_is_backed_by_exactly_one_registry_action() -> None
     # `evaluate` are v3 commands outside this legacy registry (docs/v3-design.md §1).
     # Everything else a subcommand can do, the conversation can ask for by name.
     backed = set(BY_CLI_COMMAND)
-    assert commands - backed == {"tui", "probe", "evaluate"}
+    assert commands - backed == {"tui", "probe", "evaluate", "web"}
     assert backed <= commands
     assert len({action.name for action in REGISTRY}) == len(REGISTRY)
 
