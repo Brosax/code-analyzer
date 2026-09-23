@@ -252,7 +252,8 @@ code_analyzer/
             findings.py triage.py store.py(index.sqlite) grounding.py analyze.py
   sesip/    documents.py catalogue.py profile.py grading.py relevance.py pv.py coverage.py
             builtin/{generic-sesip.toml, rt700-tp-v1.1.toml}
-  review/   code/{index,units,context}.py schema.py verdict.py lenses.py lenses/*.md（15 个）
+  aireview/ code.py contracts.py prompt.py lenses.py lenses/*.md（15 个）
+            （M7 实际落地为 aireview/：旧的 review.py 模块到 M9 才删除，同名包会遮蔽它）
   export/   listing.py(xlsx/csv/md) sanitize.py sarif.py
   web/      server.py blocks.py static/{index.html,app.js,app.css}
 ```
@@ -649,7 +650,7 @@ status="confirmed" version=1 confirmed_by="fgt" confirmed_at="…" base="extract
 
 ## 6. AI 审查这一步
 
-**lens 库 `review/lenses/*.md`，共 15 个**：1 个复核 lens，14 个发现型 lens。
+**lens 库 `aireview/lenses/*.md`，共 15 个**：1 个复核 lens，14 个发现型 lens。
 
 - frontmatter 写 `id`、`version`、`contract: verdict|findings`、`applies_to{sfr_catalogue[], rule_families[], symbols[]}`、`requires{attacker.physical?}`。
 - 正文不超过 900 token。

@@ -101,3 +101,32 @@ A non-2xx response carries `{"error": "<human sentence>"}`.
     and not yet closed by a `status` block with the same `refs.approval`.
   - `status`: an approval decided or expired, a turn interrupted, or "no conclusion in 3 steps".
   - `error`: the agent failed (for example the model host is unreachable). Show it plainly; buttons still work.
+
+## M7: targeted AI review
+
+- `GET /api/e/<id>` additionally returns `"review": {"verified", "listed"}` (listed entries with a grounded AI
+  verdict) and `"model_pin": {"host", "port", "model", "addresses"}|null`. With no pin, `agent.available` is false
+  and says to pin on the profile page.
+- `POST /api/e/<id>/pin_model` `{}` → `{"model_pin": {…}}`: pins the configured local model host (a human act,
+  recorded as `model_pinned`). 409 when the host cannot be resolved.
+- `POST /api/e/<id>/review/plan` `{"focus": {"sfr": "SESIP-SIP,SESIP-SS"?, "module"?, "partition"?}, "targets":
+  ["PV-0007"]?, "depth": "quick"|"normal", "lens"?}` → `{"plan": {"counts": {"T1", "T2", "V"}, "targets", "skipped":
+  {reason: n}, "estimate_seconds", "basis": "估算：…", "budget_minutes", "sample": [Target], "grant": {"granted",
+  "used", "left"}}}`. Deterministic; no model call. `quick` = verify listed entries only (T1); `normal` adds T2
+  (functions with no tool alarm that the profile ties to an SFR or TSFI).
+- `POST /api/e/<id>/review/start` same body + `"budget_minutes"` (1–240) → `202 {"job": JobSummary}` (kind
+  `review`). The click is the grant (`review_granted`). 400 without a budget, 409 when the model lane is off or a
+  job is running.
+- `GET /api/e/<id>/coverage` → `{"coverage": {"triage", "sfr": [{"id", "title"}], "modules": [...], "matrix":
+  {sfr: {module: {"listed", "verified", "looked"}}}, "lenses": {lens: {"asked", "answered", "failed",
+  "unscheduled", "claims", "grounded", "grounding_failure_rate", "gpu_seconds"}}, "verdicts": {"CONFIRMED", …,
+  "none"}, "listed", "verified", "promoted", "origin", "unreviewed": {reason: n}, "jobs", "granted_seconds"}}`.
+- PvRow gains `ai_verdict` (list), and the entry (`GET …/pvs/<pv_id>`) gains `ai`: `{"verdict", "confidence",
+  "decisive_line", "evidence_quote", "rationale", "exploit_note", "level_suggestion", "category_suggestion", "sfr",
+  "lens", "lens_version", "model", "prompt_sha256", "job", "at"}|null` (grounded verdicts only), `proposed_from`
+  (`rule`|`ai`|""), and `origin` (`tool`|`tool+ai`|`ai`). Filter `?ai=CONFIRMED`.
+- Members of a promoted AI finding carry `engine: "llm"`, `af_id`, `lens`, `verdict`, `evidence_quote`.
+- New Block titles: 模型主机已钉住, AI 审查 J… 开始 / 结束 (planned = reviewed + unscheduled, with reasons),
+  AI 发现 AF-n 经复核进入未分级分区.
+- The chat's `review` tool plans the same way; it shows an approval card (GPU minutes) unless the plan has at
+  most 3 units and the GPU time already granted covers the estimate.

@@ -242,3 +242,47 @@ def test_an_approval_card_is_decided_by_the_page_only_with_its_hash(server: App,
     decided = client.post(f"/api/e/{evaluation}/approvals/{card['approval_id']}/decide",
                           {"decision": "approve", "sha": card["args_sha256"]})
     assert decided["card"]["kind"] == "export" and workspace.ledger.of("export_written")
+
+
+def test_review_is_planned_by_the_page_and_started_only_with_a_budget(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    evaluation, workspace = _evaluation(server, client, tmp_path)
+    client.post(f"/api/e/{evaluation}/run_tools", {}, expect=202)
+    _wait(client, evaluation)
+    plan = client.post(f"/api/e/{evaluation}/review/plan", {"depth": "quick"})["plan"]
+    assert plan["counts"]["T1"] == 1 and plan["budget_minutes"] >= 1 and plan["basis"].startswith("估算")
+    status, _, _ = client.request("POST", f"/api/e/{evaluation}/review/start", {"depth": "quick"})
+    assert status == 400                      # no budget, no GPU time
+    status, _, payload = client.request("POST", f"/api/e/{evaluation}/review/start",
+                                        {"depth": "quick", "budget_minutes": 5})
+    assert status == 409 and "CODE_ANALYZER_NO_MODEL" in json.loads(payload)["error"]
+    assert not workspace.ledger.of("review_granted")
+    view = client.get(f"/api/e/{evaluation}/coverage")["coverage"]
+    assert view["listed"] == 1 and view["verified"] == 0 and view["triage"]["partition_main"] == 1
+
+
+def test_an_unpinned_evaluation_is_pinned_by_a_click(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    evaluation, workspace = _evaluation(server, client, tmp_path)
+    data = workspace.evaluation
+    data["model_pin"] = None
+    (workspace.root / "evaluation.json").write_text(json.dumps(data), encoding="utf-8")
+    assert client.get(f"/api/e/{evaluation}")["model_pin"] is None
+    pinned = client.post(f"/api/e/{evaluation}/pin_model", {})["model_pin"]
+    assert pinned["addresses"] and workspace.evaluation["model_pin"]["host"] == pinned["host"]
+    assert workspace.ledger.of("model_pinned")[-1]["by"] == "analyst"
+    assert any(b["title"].startswith("模型主机已钉住") for b in client.get(f"/api/e/{evaluation}")["blocks"])
+
+
+def test_an_index_from_an_older_version_is_rebuilt_when_the_page_opens(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    evaluation, workspace = _evaluation(server, client, tmp_path)
+    client.post(f"/api/e/{evaluation}/run_tools", {}, expect=202)
+    _wait(client, evaluation)
+    import sqlite3
+    with sqlite3.connect(workspace.index_path) as db:
+        db.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    view = client.get(f"/api/e/{evaluation}")
+    assert view["jobs"][-1]["kind"] == "reindex"
+    _wait(client, evaluation)
+    assert client.get(f"/api/e/{evaluation}")["triage"]["partition_main"] == 1

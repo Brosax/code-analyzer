@@ -35,6 +35,7 @@ from ..sesip.active import active_profile, save_draft, select_builtin
 from ..sesip.profile import BUILTINS, DEFAULT_HEADLESS, Profile, load_profile
 from ..sesip.pv import build_entries, number, numbering_record
 from ..tools import TOOL_NAMES
+from . import promoted
 from .buildctx_schema import (
     buildctx_sha,
     buildctx_text,
@@ -44,7 +45,7 @@ from .buildctx_schema import (
 from .findings import parse_run
 from .overlays import replay
 from .store import Store, index_current
-from .triage import cluster
+from .triage import SourceLines, cluster
 from .workspace import Workspace, _atomic
 
 EXIT_GATE = 1
@@ -108,7 +109,10 @@ def index(workspace: Workspace, profile: Profile, run_dir: Path, *,
           progress: Callable[[str], None] = lambda _line: None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Parse a call's evidence, cluster it, number the list, and write index.sqlite."""
     parsed = parse_run(run_dir, source=workspace.source)
-    clusters = cluster(parsed.findings, parsed.source)
+    lines = SourceLines(parsed.source)
+    ai_rows, ai_stale = promoted.rows(workspace, lines, str)
+    parsed.findings.extend(ai_rows)
+    clusters = cluster(parsed.findings, parsed.source, lines=lines)
     members: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in parsed.findings:
         if row.get("cluster_id"):
@@ -123,6 +127,7 @@ def index(workspace: Workspace, profile: Profile, run_dir: Path, *,
         "outside_toe": triage.outside_toe, **{f"partition_{k}": v for k, v in triage.counts.items()},
         "listed": len(listed), "retired": len(retired),
         "kept": sum(1 for e in listed if e.match != "new"), "new": sum(1 for e in listed if e.match == "new"),
+        "ai_promoted": len(ai_rows), "ai_stale": ai_stale,
     }
     assert counts["in_toe"] == sum(triage.counts.values()), "conservation: every in-TOE cluster has a partition"
     store = Store.build(workspace.index_path, parsed, clusters, pvs=listed,

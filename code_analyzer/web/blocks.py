@@ -109,6 +109,25 @@ def block(record: dict[str, Any]) -> dict[str, Any] | None:
         return {**base, "kind": "summary", "title": f"补丁 {record.get('patch_id')} 已应用，构建上下文 v{record.get('buildctx_version')}",
                 "detail": (f"{record.get('tool')}：失败单元 {record.get('failed_before')} → {record.get('failed_after')}，"
                            f"进入分析 {record.get('reached_before')} → {record.get('reached_after')}")}
+    if kind == "model_pinned":
+        return {**base, "kind": "event", "title": f"模型主机已钉住：{record.get('host')}:{record.get('port')}",
+                "detail": f"{record.get('model')} · {', '.join(record.get('addresses') or [])} · {record.get('by')}"}
+    if kind == "review_started":
+        counts = record.get("counts") or {}
+        return {**base, "kind": "job", "title": f"AI 审查 {record.get('job')} 开始",
+                "detail": (f"核实 {counts.get('T1', 0)} 条清单条目、查看 {counts.get('T2', 0)} 个无告警单元；"
+                           f"GPU 额度 {round(float(record.get('budget_seconds') or 0) / 60)} 分钟"),
+                "refs": {"job": record.get("job")}}
+    if kind == "review_finished":
+        reasons = "；".join(f"{k} {v}" for k, v in (record.get("unscheduled_reasons") or {}).items())
+        return {**base, "kind": "summary", "title": f"AI 审查 {record.get('job')} 结束",
+                "detail": (f"计划 {record.get('planned')} = 已审 {record.get('started')} + 未排上 "
+                           f"{record.get('unscheduled')}{('（' + reasons + '）') if reasons else ''}；"
+                           f"GPU {record.get('gpu_seconds')} 秒；新进入清单的 AI 发现 {record.get('promoted', 0)} 条"),
+                "refs": {"job": record.get("job")}}
+    if kind == "ai_promoted":
+        return {**base, "kind": "event", "title": f"AI 发现 {record.get('af')} 经复核（{record.get('verdict')}）进入未分级分区",
+                "detail": f"{record.get('path')}:{record.get('line')} {record.get('message')}"}
     if kind == "document_added":
         return {**base, "kind": "event", "title": f"文档已上传：{record.get('name')}",
                 "detail": f"sha256 {str(record.get('sha256', ''))[:12]}"}

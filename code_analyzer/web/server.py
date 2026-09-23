@@ -13,7 +13,8 @@ Security, in order of the checks every request meets:
 5. Responses carry ``Content-Security-Policy: default-src 'self'``; the page
    has no inline script and inserts every piece of data with textContent.
 
-No endpoint reaches a model in M3; the agent arrives in M5.
+The model is reached only by the conversation and by review/extraction jobs, always through
+the one broker and the evaluation's pinned host (model/evaluation.py).
 """
 from __future__ import annotations
 
@@ -39,22 +40,25 @@ from ..evidence.analyze import ensure_index, evaluate, reindex
 from ..evidence.store import Store, index_current
 from ..evidence.workspace import EVALUATION_FILE, Workspace, _atomic
 from ..export.listing import LeakFound, export
-from ..jobs import buildctx_job, extract_job
+from ..jobs import buildctx_job, compile_db_job, extract_job, lens_job
 from ..jobs.manager import Job, JobManager
 from ..kernel import approvals, tools
 from ..kernel.loop import Kernel
 from ..kernel.session import Conversation
+from ..kernel.tools import review_plan
 from ..model.broker import Broker
 from ..model.client import disabled_by_env
 from ..model.evaluation import client_for, local_endpoint, pin_local
 from ..model.probe import latest_probe
 from ..persist import json_bytes
 from ..sesip import active
+from ..sesip.coverage import coverage
 from ..sesip.profile import BUILTINS
 from ..settings import Settings, load_settings
 from .blocks import blocks
 
 BIND_HOST = "127.0.0.1"
+MAX_REVIEW_MINUTES = 240.0
 COOKIE = "ca_session"
 MAX_JSON = 1024 * 1024
 MAX_DOCUMENT = 64 * 1024 * 1024
@@ -192,7 +196,32 @@ class App:
             jobs=lambda ws: [job.summary() for job in self.jobs.jobs(ws.root.name)],
             export=lambda ws, variant, formats: export(ws, variant, formats),
             rebuild=lambda ws: self.rebuild(ws),
-            apply_patch=lambda ws, patch_id, selected: self.apply_patch(ws, patch_id, selected))
+            apply_patch=lambda ws, patch_id, selected: self.apply_patch(ws, patch_id, selected),
+            review=lambda ws, arguments: self.review(ws, arguments),
+            compile_db=lambda ws, number: self.compile_db(ws, number))
+
+    def compile_db(self, workspace: Workspace, number: int) -> Job:
+        def work(job: Job) -> int:
+            outcome = compile_db_job.run(workspace, number, progress=lambda line: self.jobs.log(job, line),
+                                         cancelled=job.token.is_cancelled)
+            return 0 if outcome["usable"] else 20
+        return self.jobs.start(workspace.root.name, "compile_db", work)
+
+    def review(self, workspace: Workspace, arguments: dict[str, Any]) -> Job:
+        """Start a targeted review job within the GPU budget the arguments carry (a human granted it)."""
+        available, reason = self.agent_available()
+        if not available:
+            raise UserError(reason)
+        budget = max(60.0, min(float(arguments.get("budget_minutes") or 10), MAX_REVIEW_MINUTES) * 60)
+
+        def work(job: Job) -> int:
+            client = client_for(workspace, self.settings, review=True)
+            lens_job.run(workspace, client=client, broker=self.broker, token=job.token, job_id=job.id,
+                         budget_seconds=budget, focus=arguments.get("focus") or {},
+                         targets=list(arguments.get("targets") or []), depth=str(arguments.get("depth") or "normal"),
+                         lens=str(arguments.get("lens") or ""), progress=lambda line: self.jobs.log(job, line))
+            return 0
+        return self.jobs.start(workspace.root.name, "review", work)
 
     def apply_patch(self, workspace: Workspace, patch_id: str, selected: list[int]) -> Job:
         def work(job: Job) -> int:
@@ -265,6 +294,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         (re.compile(rf"/api/e/({_ID})/source"), "source"),
         (re.compile(rf"/api/e/({_ID})/stream"), "stream"),
         (re.compile(rf"/api/e/({_ID})/exports/(E\d+)/({_ID})"), "download"),
+        (re.compile(rf"/api/e/({_ID})/coverage"), "coverage"),
     ]
     routes_post: list[tuple[re.Pattern[str], str]] = [
         (re.compile(r"/api/evaluations"), "create"),
@@ -281,6 +311,11 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         (re.compile(rf"/api/e/({_ID})/interrupt"), "interrupt"),
         (re.compile(rf"/api/e/({_ID})/typing"), "typing"),
         (re.compile(rf"/api/e/({_ID})/approvals/(A\d+)/decide"), "decide"),
+        (re.compile(rf"/api/e/({_ID})/review/plan"), "review_plan"),
+        (re.compile(rf"/api/e/({_ID})/review/start"), "review_start"),
+        (re.compile(rf"/api/e/({_ID})/pin_model"), "pin_model"),
+        (re.compile(rf"/api/e/({_ID})/compile_db/propose"), "compile_db_propose"),
+        (re.compile(rf"/api/e/({_ID})/compile_db/run"), "compile_db_run"),
     ]
 
     class Handler(BaseHTTPRequestHandler):
@@ -392,7 +427,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
 
         def get_evaluation(self, evaluation: str, *, query: dict[str, str]) -> None:
             workspace = app.workspace(evaluation)
+            if not index_current(workspace.index_path):
+                app.rebuild(workspace)  # derived data from an older version: rebuilt in the background
             available, reason = app.agent_available()
+            pin = workspace.evaluation.get("model_pin")
+            if available and not pin:
+                available, reason = False, "还没有钉住模型主机：在「档案」页点「钉住本地模型主机」"
             conversation = app._conversations.get(evaluation)
             self._json(200, {"evaluation": app.summary(workspace),
                              "profile": active.view(active.active_profile(workspace)),
@@ -401,7 +441,10 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                              "agent": {"available": available, "reason": reason, "codec": app.codec,
                                        "busy": bool(conversation and conversation.busy),
                                        "model": app.settings.local_model},
-                             "approvals": [_card(a) for a in approvals.pending(workspace)]})
+                             "approvals": [_card(a) for a in approvals.pending(workspace)],
+                             "review": _review_summary(workspace),
+                             "model_pin": {k: pin.get(k) for k in ("host", "port", "model", "addresses")}
+                             if pin else None})
 
         def _store(self, workspace: Workspace) -> Store:
             if app.jobs.running(workspace.root.name) is None and not ensure_index(workspace):
@@ -413,8 +456,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def get_pvs(self, evaluation: str, *, query: dict[str, str]) -> None:
             store = self._store(app.workspace(evaluation))
             try:
-                where = {k: query[k] for k in ("partition", "level", "module", "sfr", "status", "path", "family")
-                         if query.get(k)}
+                where = {k: query[k] for k in ("partition", "level", "module", "sfr", "status", "path", "family", "ai",
+                                               "origin") if query.get(k)}
                 result = store.list_pvs(where, sort=query.get("sort", "priority"), page=_page(query))
             finally:
                 store.close()
@@ -431,11 +474,20 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             finally:
                 store.close()
             fields = ("tool", "rule_id", "line", "column", "review_level", "original_severity", "message", "cwe",
-                      "evidence_context", "fingerprint")
+                      "evidence_context", "fingerprint", "engine", "af_id", "lens", "verdict", "evidence_quote")
             rows = [{k: m.get(k, "") for k in fields} for m in members]
             marked = {_int(m.get("line")) for m in members}
             source = _source(workspace, entry["path"], int(entry["line_start"]), 12, marked)
             self._json(200, {"pv": entry, "members": rows, "source": source})
+
+        def get_coverage(self, evaluation: str, *, query: dict[str, str]) -> None:
+            workspace = app.workspace(evaluation)
+            store = Store(workspace.index_path) if index_current(workspace.index_path) else None
+            try:
+                self._json(200, {"coverage": coverage(workspace, store, active.active_profile(workspace))})
+            finally:
+                if store is not None:
+                    store.close()
 
         def get_findings(self, evaluation: str, *, query: dict[str, str]) -> None:
             store = self._store(app.workspace(evaluation))
@@ -631,6 +683,70 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                                       sha=str(body.get("sha", "")))
             self._json(200, {"result": result.content, "card": result.card})
 
+        def _review_arguments(self) -> dict[str, Any]:
+            body = self._json_body()
+            focus = body.get("focus") if isinstance(body.get("focus"), dict) else {}
+            return {"focus": {k: str(focus[k]) for k in ("sfr", "module", "partition") if focus.get(k)},
+                    "targets": [str(t) for t in body.get("targets") or [] if isinstance(t, str)][:200],
+                    "depth": "quick" if body.get("depth") == "quick" else "normal",
+                    "lens": str(body.get("lens") or ""), "budget_minutes": body.get("budget_minutes")}
+
+        def post_review_plan(self, evaluation: str) -> None:
+            arguments = self._review_arguments()
+            workspace = app.workspace(evaluation)
+            try:
+                self._json(200, {"plan": review_plan(workspace, arguments)})
+            except UserError as error:
+                raise HttpError(409, str(error)) from None
+
+        def post_review_start(self, evaluation: str) -> None:
+            arguments = self._review_arguments()
+            workspace = app.workspace(evaluation)
+            try:
+                minutes = min(float(arguments.get("budget_minutes") or 0), MAX_REVIEW_MINUTES)
+            except (TypeError, ValueError):
+                minutes = 0
+            if minutes < 1:
+                raise HttpError(400, "budget_minutes must be at least 1")
+            arguments["budget_minutes"] = minutes
+            try:
+                job = app.review(workspace, arguments)
+            except UserError as error:
+                raise HttpError(409, str(error)) from None
+            # The click is the grant: recorded like an approved card, by the analyst.
+            workspace.ledger.append("review_granted", budget_seconds=minutes * 60, by="analyst", job=job.id,
+                                    arguments={k: v for k, v in arguments.items() if k != "budget_minutes"})
+            self._json(202, {"job": job.summary()})
+
+        def post_compile_db_propose(self, evaluation: str) -> None:
+            body = self._json_body()
+            defines = body.get("defines") if isinstance(body.get("defines"), dict) else {}
+            try:
+                proposal = compile_db_job.propose(app.workspace(evaluation), preset=str(body.get("preset") or ""),
+                                                  generator=str(body.get("generator") or ""), defines=defines,
+                                                  toolchain_file=str(body.get("toolchain_file") or ""))
+            except UserError as error:
+                raise HttpError(400, str(error)) from None
+            self._json(200, {"proposal": proposal})
+
+        def post_compile_db_run(self, evaluation: str) -> None:
+            body = self._json_body()
+            try:
+                job = app.compile_db(app.workspace(evaluation), int(body.get("number") or 0))
+            except (UserError, ValueError) as error:
+                raise HttpError(409, str(error)) from None
+            self._json(202, {"job": job.summary()})
+
+        def post_pin_model(self, evaluation: str) -> None:
+            self._json_body()
+            workspace = app.workspace(evaluation)
+            pin = pin_local(app.settings)
+            if pin is None:
+                raise HttpError(409, f"cannot resolve the local model host {app.settings.local_endpoint}; "
+                                     "check settings.toml and the network, then try again")
+            workspace.pin_model(pin, by="analyst")
+            self._json(200, {"model_pin": {k: pin.get(k) for k in ("host", "port", "model", "addresses")}})
+
         def post_document(self, evaluation: str) -> None:
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/octet-stream":
                 raise HttpError(415, "upload the document as application/octet-stream")
@@ -679,6 +795,17 @@ def serve(settings: Settings | None = None, *, port: int | None = None,
         server.serve_forever()
     finally:
         server.server_close()
+
+
+def _review_summary(workspace: Workspace) -> dict[str, int]:
+    if not index_current(workspace.index_path):
+        return {"verified": 0, "listed": 0}
+    store = Store(workspace.index_path)
+    try:
+        counts = store.ai_counts()
+    finally:
+        store.close()
+    return {"verified": sum(n for verdict, n in counts.items() if verdict), "listed": sum(counts.values())}
 
 
 def _card(record: dict[str, Any]) -> dict[str, Any]:

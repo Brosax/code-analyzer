@@ -104,6 +104,10 @@ class SourceLines:
                 best = name
         return best
 
+    def line_count(self, path: str) -> int:
+        self._load(path)
+        return len(self._lines[path])
+
     def line_text_sha(self, path: str, line: int) -> str:
         self._load(path)
         lines = self._lines[path]

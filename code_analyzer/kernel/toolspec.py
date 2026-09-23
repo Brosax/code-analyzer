@@ -114,8 +114,10 @@ PROFILE_EDIT = ToolSpec(
     frozenset({"record"}), "render")
 
 REVIEW = ToolSpec(
-    "review", "Plan targeted AI review on the GPU: verify entries and look for new issues in SFR-relevant "
-              "code. Shows a plan card; runs after approval or within an approved budget.",
+    "review", "Plan targeted AI review on the GPU: verify list entries, or look for new issues in SFR-relevant "
+              "code. targets: PV-0007, path::function or path:line (only those are reviewed); otherwise focus "
+              "narrows by SFR (comma-separated ids), TOE module or partition. depth quick = verify entries only. "
+              "Shows a plan card; runs after approval or within an approved budget.",
     _obj({"targets": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
           "focus": _obj({"sfr": {"type": "string"}, "module": {"type": "string"},
                          "partition": {"type": "string", "enum": ["main", "unmapped"]}}),

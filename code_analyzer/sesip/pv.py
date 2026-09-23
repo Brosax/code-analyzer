@@ -61,6 +61,7 @@ class Entry:
     multi_engine: bool
     pv_id: str = ""
     match: str = ""                 # how the number was kept: fingerprint | anchor | moved | new
+    origin: str = "tool"            # tool | tool+ai | ai (a promoted AI finding is a member)
 
     def as_row(self) -> dict[str, Any]:
         return asdict(self)
@@ -95,14 +96,19 @@ def build_entries(clusters: Iterable[dict[str, Any]], members_of: dict[str, list
             suggestions = [g[2] for g, _ in grades if g[2]]
             proposed = max(suggestions, key=profile.rank) if suggestions else ""
         tools = sorted({str(row["tool"]) for row in members})
-        multi = len(tools) >= 2
+        # Engines agreeing means independent tools; an AI finding is advice and never counts as one.
+        static = {str(row["tool"]) for row in members if row.get("engine") != "llm"}
+        ai = len(static) < len(tools)
+        origin = ("tool+ai" if static else "ai") if ai else "tool"
+        multi = len(static) >= 2
         rank = profile.rank(level) if level != UNMAPPED else 0
         if level == UNMAPPED:
             partition = "unmapped"
         elif rank >= minimum or multi:
             partition = "main"
         else:
-            partition = "below"
+            # A verified, grounded AI finding keeps the entry listed for a human to check.
+            partition = "unmapped" if ai else "below"
         decisive = max(members, key=lambda row: (profile.rank(profile.grade(row)[0]), -line_number(row)))
         decisive_sha = str(decisive.get("line_text_sha") or "")
         family = str(cluster["family"])
@@ -128,7 +134,7 @@ def build_entries(clusters: Iterable[dict[str, Any]], members_of: dict[str, list
             int(cluster["line_start"]), int(cluster["line_end"]), module, partition, level, basis, proposed, sfr,
             tools, sorted({str(row["fingerprint"]) for row in members}),
             sorted({str(row.get("line_text_sha") or "") for row in members} - {""}), decisive_sha,
-            sum(why.values()), why, multi,
+            sum(why.values()), why, multi, origin=origin,
         ))
     counts = {"main": 0, "unmapped": 0, "below": 0}
     for entry in entries:

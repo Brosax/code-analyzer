@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import tomllib
 from collections.abc import Callable
@@ -32,6 +33,8 @@ from .codecs import data_block, finding_text
 from .toolspec import BY_NAME
 
 MAX_CONTENT_CHARS = 2400   # ~600 tokens of mixed Chinese/English
+SMALL_REVIEW = 3           # at most this many units run inside an existing grant without a new card
+REVIEW_MAX_MINUTES = 240
 SOURCE_RADIUS = 15
 NEVER_FROM_MODEL = frozenset({"status", "version", "confirmed_by", "confirmed_at", "confidentiality",
                               "allow_public_model", "id"})
@@ -53,6 +56,8 @@ class Services:
     export: Callable[[Workspace, str, list[str]], dict[str, Any]]
     rebuild: Callable[[Workspace], Any] = lambda _ws: None
     apply_patch: Callable[[Workspace, str, list[int]], Any] = lambda _ws, _p, _s: None
+    review: Callable[[Workspace, dict[str, Any]], Any] = lambda _ws, _a: None
+    compile_db: Callable[[Workspace, int], Any] = lambda _ws, _n: None
 
 
 @dataclass
@@ -85,10 +90,10 @@ def _list(ctx: ToolContext, args: dict[str, Any]) -> Result:
     store = _store(ctx.workspace)
     try:
         if kind == "coverage":
-            return Result(_coverage(store))
+            return Result(_coverage(ctx.workspace, store))
         if kind == "pv":
-            filters = {k: where[k] for k in ("partition", "level", "module", "sfr", "status", "path", "family")
-                       if where.get(k)}
+            filters = {k: where[k] for k in ("partition", "level", "module", "sfr", "status", "path", "family", "ai",
+                                             "origin") if where.get(k)}
             if where.get("category"):
                 filters["family"] = where["category"]
             sort = {"priority": "priority", "level": "level", "path": "path"}.get(args.get("sort", "priority"),
@@ -137,7 +142,7 @@ def _show(ctx: ToolContext, args: dict[str, Any]) -> Result:
     store = _store(ctx.workspace)
     try:
         if target == "coverage":
-            return Result(_coverage(store))
+            return Result(_coverage(ctx.workspace, store))
         if re.fullmatch(r"PV-\d+", target):
             entry = store.pv(target)
             if entry is None:
@@ -153,6 +158,16 @@ def _show(ctx: ToolContext, args: dict[str, Any]) -> Result:
                              f"{member['line']} [{member.get('review_level')}] {finding_text(member['message'])}")
             if len(members) > 12:
                 lines.append(f"  … {len(members) - 12} more members")
+            opinion = entry.get("ai")
+            if opinion:
+                lines.append(f"AI ({opinion.get('lens')} lens, advice only): {opinion['verdict']} "
+                             f"{opinion['confidence']}, decisive line {opinion['decisive_line']}"
+                             + (f", suggests level {opinion['level_suggestion']}" if opinion.get("level_suggestion")
+                                else ""))
+                if part in ("ai", "summary"):
+                    lines.append("  " + finding_text(opinion.get("rationale", "")))
+            elif part == "ai":
+                lines.append("no grounded AI verdict on this entry yet (review can verify it)")
             if part in ("evidence", "summary"):
                 lines.append(_source(ctx.workspace, entry["path"], int(entry["line_start"]), min(radius, 8)))
             return Result(_cap("\n".join(lines)))
@@ -224,8 +239,21 @@ def _build_context(ctx: ToolContext, args: dict[str, Any]) -> Result:
                                 "summary": f"应用构建上下文补丁 {document['patch_id']}（{document['tool']}，"
                                            f"{len(chosen)} 项已勾选；{probe_text}）",
                                 "writes": ["buildctx 新版本", f"重跑 {document['failed_units']} 个失败单元"]})
-    return Result("compile_db (a sandboxed CMake configure) is not available yet; ask the evaluator for a "
-                  "compile_commands.json and use patch meanwhile", error=True)
+    from ..jobs import compile_db_job  # noqa: PLC0415
+
+    defines = {}
+    for item in args.get("defines") or []:
+        name, _, value = str(item).partition("=")
+        defines[name.strip()] = value.strip()
+    proposal = compile_db_job.propose(ctx.workspace, preset=str(args.get("preset") or ""),
+                                      generator=str(args.get("generator") or ""), defines=defines,
+                                      toolchain_file=str(args.get("toolchain_file") or ""))
+    number = proposal["number"]
+    return Result(f"B{number} prepared, not run: {' '.join(proposal['argv'])}\nit runs only after the evaluator "
+                  "approves the card, inside a sandbox (no network, source read-only, configure only)",
+                  approval={"tool": "compile_db", "arguments": {"number": number, "argv": proposal["argv"]},
+                            "summary": f"在沙箱里运行 CMake 配置 B{number}（只配置不构建；无网络；源码只读）",
+                            "writes": [proposal["build_dir"], "成功时：构建上下文新版本（使用该编译数据库）"]})
 
 
 def _profile_edit(ctx: ToolContext, args: dict[str, Any]) -> Result:
@@ -248,9 +276,44 @@ def _profile_edit(ctx: ToolContext, args: dict[str, Any]) -> Result:
     return Result(f"saved draft {draft.name}: {diff}", card={"kind": "profile", "profile": draft.name, "diff": diff})
 
 
+def review_plan(workspace: Workspace, arguments: dict[str, Any]) -> dict[str, Any]:
+    """The deterministic plan for a review, its GPU estimate (labelled) and the budget to ask for."""
+    from ..jobs import lens_job  # noqa: PLC0415 - pulls in the analyzer stack
+    from ..sesip.coverage import granted_seconds  # noqa: PLC0415
+
+    context = lens_job.setup(workspace)
+    plan = lens_job.make_plan(context, focus=arguments.get("focus") or {}, targets=arguments.get("targets") or [],
+                              depth=str(arguments.get("depth") or "normal"), lens=str(arguments.get("lens") or ""))
+    seconds, basis = lens_job.estimate(workspace, plan)
+    minutes = max(1, min(REVIEW_MAX_MINUTES, math.ceil(seconds * 1.2 / 60))) if plan.targets else 0
+    return {"counts": plan.counts(), "skipped": plan.skipped, "estimate_seconds": round(seconds),
+            "basis": basis, "budget_minutes": minutes, "targets": len(plan.targets),
+            "sample": [t.as_dict() for t in plan.targets[:15]], "grant": granted_seconds(workspace)}
+
+
 def _review(ctx: ToolContext, args: dict[str, Any]) -> Result:
-    return Result("AI review on the GPU arrives in a later version (M7). You can already discuss entries with "
-                  "show and list; say so to the evaluator.", error=True)
+    arguments = {"focus": {k: str(v) for k, v in (args.get("focus") or {}).items() if v},
+                 "targets": [str(t) for t in args.get("targets") or []],
+                 "depth": "quick" if args.get("depth") == "quick" else "normal", "lens": str(args.get("lens") or "")}
+    plan = review_plan(ctx.workspace, arguments)
+    counts, skipped = plan["counts"], plan["skipped"]
+    if not plan["targets"]:
+        return Result(f"nothing to review for that focus; skipped: {skipped or 'none'}")
+    minutes = plan["budget_minutes"]
+    text = (f"plan: verify {counts['T1']} list entr(ies), look at {counts['T2']} unit(s) with no tool alarm; "
+            f"{plan['basis']}, about {plan['estimate_seconds'] // 60} min GPU; skipped {skipped or 'none'}")
+    left = plan["grant"]["left"]
+    if plan["targets"] <= SMALL_REVIEW and left >= plan["estimate_seconds"]:
+        job = ctx.services.review(ctx.workspace, {**arguments, "budget_minutes": min(minutes, left / 60)})
+        summary = job.summary() if hasattr(job, "summary") else dict(job or {})
+        return Result(f"{text}\nstarted {summary.get('id')} within the GPU time already granted ({left:.0f}s left)",
+                      card={"kind": "job", "job": summary})
+    return Result(text + "\nthe evaluator approves the GPU time on the card",
+                  approval={"tool": "review", "arguments": {**arguments, "budget_minutes": minutes},
+                            "summary": f"AI 审查：核实 {counts['T1']} 条清单条目、查看 {counts['T2']} 个无告警单元；"
+                                       f"GPU 额度 {minutes} 分钟（{plan['basis']}）",
+                            "writes": [f"GPU 额度 {minutes} 分钟", "AI 意见附在条目上（不移除条目）",
+                                       "经二次复核的 AI 新发现进入未分级分区"]})
 
 
 def _export(ctx: ToolContext, args: dict[str, Any]) -> Result:
@@ -268,6 +331,17 @@ def execute_approved(ctx: ToolContext, tool: str, arguments: dict[str, Any]) -> 
         result = ctx.services.export(ctx.workspace, arguments["variant"], arguments["formats"])
         return Result(f"exported {result['id']}: {', '.join(f['name'] for f in result['files'])}; "
                       f"leak check {result['leak_check']}", card={"kind": "export", "export": result})
+    if tool == "review":
+        job = ctx.services.review(ctx.workspace, arguments)
+        summary = job.summary() if hasattr(job, "summary") else dict(job or {})
+        ctx.workspace.ledger.append("review_granted", budget_seconds=float(arguments["budget_minutes"]) * 60,
+                                    job=summary.get("id"), arguments={k: v for k, v in arguments.items()
+                                                                      if k != "budget_minutes"})
+        return Result(f"review started as {summary.get('id')}", card={"kind": "job", "job": summary})
+    if tool == "compile_db":
+        job = ctx.services.compile_db(ctx.workspace, int(arguments["number"]))
+        summary = job.summary() if hasattr(job, "summary") else dict(job or {})
+        return Result(f"configuring B{arguments['number']} as {summary.get('id')}", card={"kind": "job", "job": summary})
     if tool == "apply_patch":
         job = ctx.services.apply_patch(ctx.workspace, arguments["patch_id"], list(arguments["selected"]))
         summary = job.summary() if hasattr(job, "summary") else dict(job or {})
@@ -323,18 +397,28 @@ def _store(workspace: Workspace) -> Store:
 def _pv_line(row: dict[str, Any]) -> str:
     sfr = ",".join(s["id"] for s in row.get("sfr", []) if s.get("basis") in STRONG_SFR_BASES) or "-"
     level = row["level"] if row["level"] != "unmapped" else f"unmapped(建议 {row.get('proposed_level') or '-'})"
+    verdict = row.get("ai_verdict") or (row.get("ai") or {}).get("verdict") or ""
     return (f"{row['pv_id']} {level} [{row.get('partition')}] {row['path']}:{row['line_start']} "
-            f"{row.get('function') or ''}() {row.get('family')} SFR {sfr} {row.get('tools')} {row.get('status')}")
+            f"{row.get('function') or ''}() {row.get('family')} SFR {sfr} {row.get('tools')} {row.get('status')}"
+            + (f" AI:{verdict}" if verdict else ""))
 
 
-def _coverage(store: Store) -> str:
+def _coverage(workspace: Workspace, store: Store) -> str:
+    from ..sesip.coverage import coverage  # noqa: PLC0415
+
     counts = store.triage_counts()
     by_module = store.db.execute("SELECT module, partition, COUNT(*) FROM pvs GROUP BY module, partition").fetchall()
     modules = "; ".join(f"{m}/{p}: {n}" for m, p, n in by_module)
+    view = coverage(workspace, store, active.active_profile(workspace))
+    lenses = "; ".join(f"{name} {t['answered']}/{t['asked']} answered, grounding failures "
+                       f"{t['grounding_failure_rate'] if t['grounding_failure_rate'] is not None else '-'}"
+                       for name, t in view["lenses"].items()) or "no AI review yet"
     return (f"in-TOE clusters {counts.get('in_toe', 0)} = main {counts.get('partition_main', 0)} + unmapped "
             f"{counts.get('partition_unmapped', 0)} + below {counts.get('partition_below', 0)}; outside TOE "
             f"{counts.get('outside_toe', 0)}; listed {counts.get('listed', 0)}\nby module: {modules}\n"
-            "AI review coverage: none yet")
+            f"AI: {view['verified']}/{view['listed']} listed entries verified; verdicts {view['verdicts']}; "
+            f"promoted AI findings {view['promoted']}; unreviewed {view['unreviewed'] or 'none'}\n"
+            f"lenses: {lenses}; GPU grant {view['granted_seconds']}")
 
 
 def _source(workspace: Workspace, relative: str, line: int, radius: int) -> str:

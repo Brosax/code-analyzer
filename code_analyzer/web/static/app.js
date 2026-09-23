@@ -28,7 +28,9 @@ const BLOCK_KIND = {
   event: '事件', job: '任务', summary: '清单', status: '标记', export: '导出', profile: '档案',
   user: '评估员', queued: '排队', agent: 'agent', tool: '工具', approval: '批准卡', error: '出错',
 };
-const JOB_KIND = { static: '跑工具', extract: '档案抽取', reindex: '重建清单' };
+const JOB_KIND = { static: '跑工具', extract: '档案抽取', reindex: '重建清单', patch: '构建上下文补丁', review: 'AI 审查', compile_db: '编译数据库' };
+const VERDICT = { CONFIRMED: '成立', LIKELY: '可能成立', UNCERTAIN: '无法判定', FALSE_POSITIVE: 'AI 认为误报', none: '未核实' };
+const DEPTH = { quick: '只核实清单条目（T1）', normal: '核实条目 + 查看无告警的 SFR 相关代码（T1 + T2）' };
 const JOB_STATUS = { running: '运行中', finished: '已完成', failed: '失败', stopped: '已停止' };
 const WHY = { level: '等级', strong_sfr: '强 SFR 关联', tsfi_near: '靠近 TSFI', security_family: '安全相关缺陷族',
   engines_agree: '多引擎一致', build_aware: '构建感知' };
@@ -71,6 +73,9 @@ const S = {
   confirmBy: '',
   docs: [],
   extractJob: '',
+  coverage: null,     // GET /coverage while 覆盖 is shown
+  reviewForm: { sfr: '', module: '', partition: '', depth: 'quick' },
+  reviewPlan: null,
   busy: false,        // a conversation turn is running
   live: null,         // {el, textEl, text, note}: the reply streaming in
   typingAt: 0,
@@ -215,6 +220,10 @@ function levelCell(r) {
     r.level === 'unmapped' && r.proposed_level ? h('span', { class: 'proposed' }, `建议: ${levelLabel(r.proposed_level)}`) : null];
 }
 
+const verdictChip = (verdict) => (verdict
+  ? h('span', { class: `vd vd-${String(verdict).toLowerCase()}`, title: 'AI 意见（建议，不移除条目）' }, VERDICT[verdict] || verdict)
+  : h('span', { class: 'faint' }, '—'));
+
 function sfrTags(list, max = 2) {
   const items = [...(list || [])].sort((a, b) => STRONG_SFR.has(b.basis) - STRONG_SFR.has(a.basis));
   const tags = items.slice(0, max).map((s) => h('span', {
@@ -314,7 +323,7 @@ async function openEval(id) {
     id, ev: null, filters: { ...BLANK_FILTERS }, pages: { main: 1, unmapped: 1 }, picked: new Set(),
     exportOpen: false, exportResult: null, pvId: null, pv: null, source: null, toml: '', tomlSha: '',
     tomlDirty: false, tomlError: '', docs: [], extractJob: '', blockIds: new Set(), jobStatus: new Map(),
-    busy: false, live: null, typingAt: 0, approvalEls: new Map(),
+    busy: false, live: null, typingAt: 0, approvalEls: new Map(), coverage: null, reviewPlan: null,
   });
   $('picker').hidden = true;
   $('workspace').hidden = false;
@@ -347,6 +356,15 @@ function panelBusy() {
   return Boolean(a && $('panel').contains(a) && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && a.type === 'text')));
 }
 
+function reviewStage(jobs) {
+  const running = jobs.some((j) => j.status === 'running' && j.kind === 'review');
+  const r = S.ev.review || { verified: 0, listed: 0 };
+  const li = (cls, state) => h('li', { class: cls }, h('span', { class: 'stage-name' }, 'AI 审查'), h('span', { class: 'stage-state' }, state));
+  if (running) return li('running', '运行中');
+  if (r.verified) return li(r.verified >= r.listed ? 'done' : 'current', `已核实 ${r.verified}/${r.listed}`);
+  return li(S.ev.triage ? 'current' : '', '未开始');
+}
+
 function renderTop() {
   const { evaluation: e, profile: p, triage, jobs } = S.ev;
   document.title = `${e.name} · code-analyzer`;
@@ -364,7 +382,7 @@ function renderTop() {
   fill($('stages'),
     stage('档案', p.status === 'confirmed' ? 'done' : 'current', PROFILE_STATUS[p.status] || p.status),
     stage('工具', tools ? 'running' : triage ? 'done' : '', tools ? '运行中' : triage ? '' : '未运行'),
-    stage('AI 审查', 'off', '未接入'),
+    reviewStage(jobs),
     stage('清单', triage ? 'done' : '', triage ? `${triage.listed} 条` : '—'));
   $('tab-tasks').classList.toggle('busy', Boolean(running));
 }
@@ -704,7 +722,7 @@ function refreshList() {
   if (!S.listEls) return;
   if (!S.ev.triage) {  // nothing indexed yet: say so without asking the server for a 409
     const running = S.ev.jobs.some((j) => j.status === 'running');
-    fill(S.listEls.main, noList(running ? '工具正在运行，结束后清单自动出现。' : '先跑一次工具（只占 CPU），清单由工具结果生成。'));
+    fill(S.listEls.main, noList(running ? '任务正在运行，结束后清单自动出现。' : '先跑一次工具（只占 CPU），清单由工具结果生成。'));
     S.listEls.unmapped.hidden = true;
     return;
   }
@@ -760,7 +778,7 @@ function partSection(part, res, pages) {
       box.dispatchEvent(new Event('change'));
     }
   } } }) : null;
-  const cols = ['条目', '标题', '模块', 'SFR', '等级', '位置', '引擎', '状态', '优先级'];
+  const cols = ['条目', '标题', '模块', 'SFR', '等级', '位置', '引擎', 'AI', '状态', '优先级'];
   const table = h('table', { class: 'grid' },
     h('thead', null, h('tr', null, unmapped ? h('th', { scope: 'col' }, all) : null,
       cols.map((c) => h('th', { scope: 'col', class: c === '优先级' ? 'num' : null }, c)))), tbody);
@@ -792,6 +810,7 @@ function pvRow(r, unmapped) {
     h('td', { class: 'nowrap' }, levelCell(r)),
     pathCell(pathText(r)),
     h('td', { class: 'cell-tools' }, toolsText(r.tools)),
+    h('td', { class: 'nowrap' }, verdictChip(r.ai_verdict)),
     h('td', { class: 'nowrap', on: inert }, sel, r.note ? h('span', { class: 'row-note', title: r.note }, r.note) : null),
     h('td', { class: 'num' }, r.priority),
   ]);
@@ -909,8 +928,55 @@ function renderEvidence(panel) {
     section(`${pv.pv_id} · ${pv.family || ''} ${pv.function || ''}`, [facts, dispose],
       button('‹ 回到清单', () => setTab('list'), 'btn small ghost')),
     section('优先级构成', whyList(pv)),
+    section('AI 意见', aiOpinion(pv)),
     section(`成员发现（${members.length}）`, membersTable(members)),
     section('源码', sourcePanel()));
+}
+
+/** The AI's grounded verdict on an entry, or a way to ask for one.  Advice only: it never moves the entry. */
+function aiOpinion(pv) {
+  const ai = pv.ai;
+  if (!ai) {
+    const box = h('div', { class: 'row center' }, h('span', { class: 'muted' }, '还没有经过接地校验的 AI 意见。'));
+    box.appendChild(button('让 AI 核实这一条', () => planReview({ targets: [pv.pv_id], depth: 'quick' }, box), 'btn small'));
+    return box;
+  }
+  const line = Number(ai.decisive_line) || 0;
+  const fact = (label, ...value) => [h('dt', null, label), h('dd', null, value)];
+  return [
+    h('dl', { class: 'facts' },
+      fact('判断', verdictChip(ai.verdict), h('span', { class: 'muted' }, ` 置信度 ${ai.confidence}`)),
+      fact('决定行', line ? button(String(line), () => loadSource(line), 'btn small ghost', { title: '在源码中定位' }) : '—',
+        ai.evidence_quote ? h('code', { class: 'quote' }, ai.evidence_quote) : null),
+      fact('理由', h('span', { class: 'prose' }, ai.rationale || '—')),
+      ai.exploit_note ? fact('可利用性', h('span', { class: 'prose' }, ai.exploit_note)) : null,
+      ai.level_suggestion ? fact('建议等级', levelChip(ai.level_suggestion)) : null,
+      fact('来源', h('span', { class: 'muted' }, `${ai.lens} 透镜 v${ai.lens_version} · ${ai.model} · ${ai.job} · ${fmtTime(ai.at)}`))),
+    h('p', { class: 'note' }, 'AI 意见只是建议：条目仍在清单中，处置由评估员决定。'),
+  ];
+}
+
+/** Ask the server for a review plan, show it where the button was, start only on a second click. */
+async function planReview(args, box) {
+  const res = await act(() => post(ep('/review/plan'), args));
+  if (!res) return;
+  const plan = res.plan;
+  if (!plan.targets) {
+    fill(box, h('span', { class: 'muted' }, `没有需要审查的单元（${Object.entries(plan.skipped).map(([k, n]) => `${k} ${n}`).join('；') || '范围为空'}）。`));
+    return;
+  }
+  const minutes = h('input', { type: 'number', min: '1', max: '240', value: String(plan.budget_minutes), class: 'small num-input', 'aria-label': 'GPU 额度（分钟）' });
+  const start = button('开始审查', async () => {
+    start.disabled = true;
+    const out = await act(() => post(ep('/review/start'), { ...args, budget_minutes: Number(minutes.value) }));
+    if (!out) { start.disabled = false; return; }
+    upsertJob(out.job);
+    fill(box, h('span', { class: 'muted' }, `已开始 ${out.job.id}；结果会出现在时间线和清单里。`));
+  }, 'btn small primary');
+  fill(box,
+    h('span', null, `核实 ${plan.counts.T1} 条、查看 ${plan.counts.T2} 个单元；约 ${fmtElapsed(plan.estimate_seconds)} GPU`),
+    h('span', { class: 'faint small' }, plan.basis),
+    h('label', { class: 'row center small' }, 'GPU 额度', minutes, '分钟'), start);
 }
 
 function whyList(pv) {
@@ -973,6 +1039,13 @@ async function loadSource(line) {
 }
 
 // -- 档案 ---------------------------------------------------------------------------------------
+async function pinModel() {
+  const out = await act(() => post(ep('/pin_model')));
+  if (!out) return;
+  toast(`已钉住 ${out.model_pin.host}:${out.model_pin.port}（${out.model_pin.model}）`, 'info');
+  loadEval();
+}
+
 function renderProfile(panel) {
   const p = S.ev.profile;
   if (S.tomlSha !== p.sha256 && !S.tomlDirty) Object.assign(S, { toml: p.text, tomlSha: p.sha256 });
@@ -987,8 +1060,14 @@ function renderProfile(panel) {
       h('label', { class: 'field' }, '确认人', by),
       h('button', { class: 'btn primary', type: 'submit' }, '确认档案'),
       h('span', { class: 'muted small' }, p.status === 'builtin' ? '内置档案会先复制进本评估，再标为已确认。' : '确认后按此档案重算分级和清单。'));
+  const pin = S.ev.model_pin;
+  const pinRow = h('div', { class: 'row center' }, h('span', { class: 'muted' }, '模型主机'),
+    pin ? h('span', { class: 'mono' }, `${pin.host}:${pin.port} · ${pin.model} · ${(pin.addresses || []).join(', ')}`)
+      : h('span', { class: 'error-text' }, '未钉住：对话和 AI 审查都不会发出请求'),
+    button(pin ? '重新钉住' : '钉住本地模型主机', pinModel, pin ? 'btn small ghost' : 'btn small primary'));
   fill(panel,
     section('档案', [
+      pinRow,
       h('p', null, h('b', null, p.name), ' ', h('span', { class: `badge ${p.status}` }, PROFILE_STATUS[p.status] || p.status),
         h('span', { class: 'muted small mono' }, `  sha256 ${short(p.sha256)}`)),
       h('div', { class: 'row' }, h('label', { class: 'field' }, '内置档案', builtin),
@@ -1119,6 +1198,7 @@ function renderCoverage(panel) {
   }
   const sum = t.partition_main + t.partition_unmapped + t.partition_below;
   const stat = (value, label) => h('div', { class: 'stat' }, h('div', { class: 'stat-value' }, value), h('div', { class: 'stat-label' }, label));
+  const aiBox = h('div', null, h('p', { class: 'empty' }, '正在载入覆盖情况…'));
   fill(panel,
     section('分诊守恒', [
       h('p', { class: 'equation' }, 'TOE 内 ', h('b', null, t.in_toe), ' = 主分区 ', h('b', null, t.partition_main),
@@ -1129,7 +1209,70 @@ function renderCoverage(panel) {
         stat(t.outside_toe, 'TOE 外'), stat(t.listed, '列入清单'), stat(t.kept, '保持编号'), stat(t.new, '新增编号'),
         stat(t.retired, '退役编号')),
     ]),
-    h('p', { class: 'note' }, 'SFR × TOE 模块的覆盖矩阵、未审列表和接地失败率，会在接入 AI 审查后出现在这里。'));
+    section('开始 AI 审查', reviewForm()),
+    aiBox);
+  loadCoverage(aiBox);
+}
+
+async function loadCoverage(box) {
+  const id = S.id;
+  const res = await act(() => api(ep('/coverage')));
+  if (!res || id !== S.id || !box.isConnected) return;
+  const c = res.coverage;
+  S.coverage = c;
+  const stat = (value, label) => h('div', { class: 'stat' }, h('div', { class: 'stat-value' }, value), h('div', { class: 'stat-label' }, label));
+  const verdicts = Object.entries(c.verdicts).map(([v, n]) => stat(n, VERDICT[v] || v));
+  const matrix = c.sfr.length && c.modules.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'grid matrix' },
+    h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'SFR'), c.modules.map((m) => h('th', { scope: 'col', class: 'num' }, m)))),
+    h('tbody', null, c.sfr.map((sfr) => h('tr', null, h('th', { scope: 'row', title: sfr.title }, sfr.id),
+      c.modules.map((m) => {
+        const cell = c.matrix[sfr.id][m];
+        const text = cell.listed || cell.looked ? `${cell.verified}/${cell.listed}${cell.looked ? ` · 看 ${cell.looked}` : ''}` : '—';
+        return h('td', { class: `num${cell.listed && cell.verified === cell.listed ? ' ok-text' : ''}` }, text);
+    })))))) : h('p', { class: 'empty' }, '档案里没有 SFR 或 TOE 模块。');
+  const lenses = Object.entries(c.lenses);
+  const lensTable = lenses.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'grid' },
+    h('thead', null, h('tr', null, ['透镜', '请求', '已答', '失败', '未排上', '论断', '接地失败率', 'GPU 秒'].map((x) => h('th', { scope: 'col' }, x)))),
+    h('tbody', null, lenses.map(([name, l]) => h('tr', null, h('td', { class: 'cell-id' }, name),
+      [l.asked, l.answered, l.failed, l.unscheduled, l.claims].map((n) => h('td', { class: 'num' }, n)),
+      h('td', { class: 'num' }, l.grounding_failure_rate === null ? '—' : `${Math.round(l.grounding_failure_rate * 100)}%`),
+      h('td', { class: 'num' }, l.gpu_seconds)))))) : h('p', { class: 'empty' }, '还没有 AI 审查。');
+  const unreviewed = Object.entries(c.unreviewed);
+  const g = c.granted_seconds;
+  fill(box,
+    section('AI 审查', [
+      h('p', { class: 'equation' }, '清单 ', h('b', null, c.listed), ' 条，AI 已核实 ', h('b', null, c.verified),
+        ' 条；经二次复核进入清单的 AI 新发现 ', h('b', null, c.promoted), ' 条'),
+      h('div', { class: 'stats' }, verdicts),
+      h('p', { class: 'muted' }, `GPU 额度：已批准 ${fmtElapsed(g.granted)}，已用 ${fmtElapsed(g.used)}，剩余 ${fmtElapsed(g.left)}。`),
+    ]),
+    section('SFR × TOE 模块（已核实/清单条目 · 查看过的无告警单元）', matrix),
+    section('透镜与接地', [lensTable, h('p', { class: 'note' }, '接地失败：AI 引用的行号或原文不在它看到的代码里。这样的论断不会进入清单。')]),
+    section('没有审查到的单元', unreviewed.length
+      ? h('ul', { class: 'plain' }, unreviewed.map(([reason, n]) => h('li', null, `${reason}：${n}`)))
+      : h('p', { class: 'empty' }, '没有：计划内的单元都已审查。')));
+}
+
+function reviewForm() {
+  const f = S.reviewForm;
+  const p = S.ev.profile;
+  const box = h('div', { class: 'review-plan' });
+  const pick = (key, label, options) => h('label', { class: 'field' }, label,
+    selectEl([['', '全部'], ...options], f[key], (v) => { f[key] = v; }));
+  const form = h('form', { class: 'toolbar filters', on: { submit: (ev) => {
+    ev.preventDefault();
+    const focus = Object.fromEntries(['sfr', 'module', 'partition'].filter((k) => f[k]).map((k) => [k, f[k]]));
+    planReview({ focus, depth: f.depth }, box);
+  } } },
+  pick('sfr', 'SFR', (p.sfr || []).map((s) => [s.id, `${s.id} ${s.title || ''}`])),
+  pick('module', 'TOE 模块', (p.toe_modules || []).map((m) => [m.id, m.id])),
+  pick('partition', '分区', [['main', PARTS.main], ['unmapped', PARTS.unmapped]]),
+  h('label', { class: 'field' }, '深度', selectEl(Object.entries(DEPTH), f.depth, (v) => { f.depth = v; })),
+  h('button', { class: 'btn', type: 'submit', disabled: !(S.ev.agent && S.ev.agent.available) }, '生成计划'));
+  return [form, box, h('p', { class: 'note' },
+    S.ev.agent && S.ev.agent.available
+      ? '计划是确定性的：先列出要看的单元和估算的 GPU 时长，你点「开始审查」才会占用 GPU；对话优先，审查在对话空闲时进行。'
+      : (S.ev.agent && S.ev.agent.reason) || '模型通道不可用。')];
 }
 
 // -- 任务 ---------------------------------------------------------------------------------------
@@ -1146,8 +1289,43 @@ function renderTasks(panel) {
       h('p', { class: 'muted small' }, '不勾选则跑全部可用工具。只用 CPU；结束后清单自动更新。'),
       h('div', { class: 'row center' }, boxes, h('span', { class: 'spacer' }), S.runBtn),
     ]),
-    section('任务', S.jobsEl));
+    section('任务', S.jobsEl),
+    section('编译数据库（可选，CMake 项目）', compileDbForm()));
   renderJobs();
+}
+
+/** Preview the exact CMake configure command; it runs only on the second click, inside the sandbox. */
+function compileDbForm() {
+  const generator = selectEl([['', '默认'], ['Ninja', 'Ninja'], ['Unix Makefiles', 'Unix Makefiles']], '', () => {}, { 'aria-label': '生成器' });
+  const toolchain = h('input', { type: 'text', placeholder: '源码树内的相对路径（可选）', spellcheck: 'false', 'aria-label': '工具链文件' });
+  const defines = h('textarea', { rows: 3, placeholder: '每行一个 NAME=VALUE，例如 TFM_PLATFORM=arm/mps2/an521', spellcheck: 'false', 'aria-label': 'CMake 定义' });
+  const out = h('div', { class: 'review-plan' });
+  const preview = async (ev) => {
+    ev.preventDefault();
+    const defs = {};
+    for (const line of defines.value.split('\n')) {
+      const [name, ...rest] = line.split('=');
+      if (name.trim()) defs[name.trim()] = rest.join('=').trim();
+    }
+    const res = await act(() => post(ep('/compile_db/propose'), { generator: generator.value, toolchain_file: toolchain.value.trim(), defines: defs }));
+    if (!res) return;
+    const p = res.proposal;
+    const go = button('在沙箱里运行', async () => {
+      go.disabled = true;
+      const started = await act(() => post(ep('/compile_db/run'), { number: p.number }));
+      if (!started) { go.disabled = false; return; }
+      upsertJob(started.job);
+      fill(out, h('span', { class: 'muted' }, `已开始 ${started.job.id}：只配置不构建，结果见任务记录。`));
+    }, 'btn small primary');
+    fill(out, h('pre', { class: 'agent-code' }, p.argv.join(' ')), go);
+  };
+  return [
+    h('form', { class: 'toolbar filters', on: { submit: preview } },
+      h('label', { class: 'field' }, '生成器', generator), h('label', { class: 'field' }, '工具链文件', toolchain),
+      h('label', { class: 'field' }, 'CMake 定义', defines), h('button', { class: 'btn', type: 'submit' }, '预览命令')),
+    out,
+    h('p', { class: 'note' }, '运行在 bubblewrap 沙箱里：无网络，除本评估的构建目录外全部只读（源码树也只读），只做 CMake 配置、不编译。成功时生成新的构建上下文版本，下次跑工具即可按编译数据库分析。'),
+  ];
 }
 
 async function runTools() {

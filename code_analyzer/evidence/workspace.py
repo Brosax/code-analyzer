@@ -132,6 +132,14 @@ class Workspace:
         workspace.reconcile()
         return workspace
 
+    def pin_model(self, pin: dict[str, Any], *, by: str) -> None:
+        """Pin the model host this evaluation's content may go to (a human act, recorded)."""
+        evaluation = self.evaluation
+        evaluation["model_pin"] = pin
+        _atomic(self.root / EVALUATION_FILE, json_bytes(evaluation))
+        self.ledger.append("model_pinned", host=pin.get("host"), port=pin.get("port"),
+                           addresses=pin.get("addresses"), model=pin.get("model"), by=by)
+
     # -- accessors ---------------------------------------------------------------------
     @property
     def evaluation(self) -> dict[str, Any]:

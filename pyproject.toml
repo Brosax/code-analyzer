@@ -29,6 +29,7 @@ include = ["code_analyzer*"]
 "code_analyzer.skills" = ["*/SKILL.md"]
 "code_analyzer.sesip" = ["builtin/*.toml"]
 "code_analyzer.web" = ["static/*"]
+"code_analyzer.aireview" = ["lenses/*.md"]
 
 [tool.ruff]
 target-version = "py311"

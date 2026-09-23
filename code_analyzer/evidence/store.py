@@ -22,7 +22,7 @@ from ..persist import jsonl_bytes
 from .findings import ParsedRun, key, line_number
 from .triage import Cluster
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PAGE_SIZE = 20
 
 _FINDING_COLUMNS = (
@@ -59,7 +59,8 @@ CREATE TABLE pvs(
   proposed_level TEXT, module TEXT, sfr TEXT, sfr_ids TEXT, anchor TEXT, cluster_id TEXT, path TEXT,
   function TEXT, family TEXT, line_start INTEGER, line_end INTEGER, members INTEGER, tools TEXT,
   priority INTEGER NOT NULL, priority_why TEXT, multi_engine INTEGER, match TEXT, status TEXT NOT NULL,
-  note TEXT NOT NULL DEFAULT '', row TEXT NOT NULL) WITHOUT ROWID;
+  note TEXT NOT NULL DEFAULT '', ai TEXT NOT NULL DEFAULT '', ai_verdict TEXT NOT NULL DEFAULT '',
+  proposed_from TEXT NOT NULL DEFAULT '', row TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX pvs_rank ON pvs(partition, priority DESC, path, line_start);
 CREATE TABLE triage(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
@@ -120,11 +121,11 @@ class Store:
 
     def _load_pvs(self, entries: list[Any], triage: dict[str, int]) -> None:
         self.db.executemany(
-            "INSERT INTO pvs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pvs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ((e.pv_id, e.partition, e.level, _rank(e.level), e.level_basis, e.proposed_level, e.module, _json(e.sfr),
               "," + ",".join(s["id"] for s in e.sfr) + ",", e.anchor, e.cluster_id, e.path, e.function, e.family,
               e.line_start, e.line_end, len(e.members), ",".join(e.tools), e.priority, _json(e.priority_why),
-              int(e.multi_engine), e.match, "open", "", _json(e.as_row()))
+              int(e.multi_engine), e.match, "open", "", "", "", "rule" if e.proposed_level else "", _json(e.as_row()))
              for e in entries if e.pv_id))
         self.db.executemany("INSERT INTO triage VALUES (?, ?)", sorted(triage.items()))
 
@@ -171,8 +172,9 @@ class Store:
                  "path": "path, line_start"}.get(sort, "priority DESC, path, line_start")
         total = self.db.execute(f"SELECT COUNT(*) FROM pvs{clause}", args).fetchone()[0]
         rows = self.db.execute(
-            f"SELECT pv_id, partition, level, level_basis, proposed_level, module, sfr, path, function, family, "
-            f"line_start, line_end, members, tools, priority, status, note FROM pvs{clause} ORDER BY {order} "
+            f"SELECT pv_id, partition, level, level_basis, proposed_level, proposed_from, module, sfr, path, function, "
+            f"family, line_start, line_end, members, tools, priority, status, note, ai_verdict FROM pvs{clause} "
+            f"ORDER BY {order} "
             f"LIMIT ? OFFSET ?", [*args, PAGE_SIZE, (page - 1) * PAGE_SIZE])
         partitions = dict(self.db.execute(f"SELECT partition, COUNT(*) FROM pvs{clause} GROUP BY partition", args)
                           .fetchall())
@@ -184,18 +186,26 @@ class Store:
             out.append(item)
         return {"total": total, "page": page, "rows": out, "by_partition": partitions, "by_level": levels}
 
+    _PV_LIVE = "row, status, note, partition, level, level_basis, proposed_level, proposed_from, ai"
+
     def pv(self, pv_id: str) -> dict[str, Any] | None:
-        row = self.db.execute("SELECT row, status, note, partition, level, level_basis FROM pvs WHERE pv_id = ?",
-                              (pv_id,)).fetchone()
-        if row is None:
-            return None
-        return {**json.loads(row[0]), "status": row[1], "note": row[2], "partition": row[3], "level": row[4],
-                "level_basis": row[5]}
+        row = self.db.execute(f"SELECT {self._PV_LIVE} FROM pvs WHERE pv_id = ?", (pv_id,)).fetchone()
+        return None if row is None else _live(row)
 
     def all_pvs(self) -> list[dict[str, Any]]:
-        rows = self.db.execute("SELECT row, status, note, partition, level, level_basis FROM pvs ORDER BY pv_id")
-        return [{**json.loads(r[0]), "status": r[1], "note": r[2], "partition": r[3], "level": r[4],
-                 "level_basis": r[5]} for r in rows]
+        return [_live(r) for r in self.db.execute(f"SELECT {self._PV_LIVE} FROM pvs ORDER BY pv_id")]
+
+    def set_ai(self, pv_id: str, opinion: dict[str, Any]) -> bool:
+        """Attach the AI's (grounded) opinion.  It never moves the entry; an unmapped entry with no rule
+        proposal takes the AI's level suggestion as its proposal, for an analyst to accept or not."""
+        with self.db:
+            changed = self.db.execute("UPDATE pvs SET ai = ?, ai_verdict = ? WHERE pv_id = ?",
+                                      (_json(opinion), str(opinion.get("verdict", "")), pv_id)).rowcount == 1
+            suggestion = str(opinion.get("level_suggestion") or "")
+            if changed and suggestion:
+                self.db.execute("UPDATE pvs SET proposed_level = ?, proposed_from = 'ai' WHERE pv_id = ? AND "
+                                "level_basis = 'unmapped' AND proposed_from != 'rule'", (suggestion, pv_id))
+            return changed
 
     def set_status(self, pv_id: str, status: str, note: str) -> bool:
         with self.db:
@@ -207,6 +217,10 @@ class Store:
             return self.db.execute(
                 "UPDATE pvs SET level = ?, level_rank = ?, level_basis = ?, partition = ? WHERE pv_id = ?",
                 (level, _rank(level), basis, partition, pv_id)).rowcount == 1
+
+    def ai_counts(self) -> dict[str, int]:
+        """Listed entries by the AI's verdict ("" = not verified)."""
+        return dict(self.db.execute("SELECT ai_verdict, COUNT(*) FROM pvs GROUP BY ai_verdict").fetchall())
 
     def triage_counts(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT key, value FROM triage ORDER BY key").fetchall())
@@ -245,6 +259,12 @@ class Store:
         self.db.close()
 
 
+def _live(row: Any) -> dict[str, Any]:
+    return {**json.loads(row[0]), "status": row[1], "note": row[2], "partition": row[3], "level": row[4],
+            "level_basis": row[5], "proposed_level": row[6], "proposed_from": row[7],
+            "ai": json.loads(row[8]) if row[8] else None}
+
+
 def index_current(path: Path) -> bool:
     """Whether ``path`` holds an index this code can read; derived data is rebuilt, never migrated."""
     if not path.exists():
@@ -260,7 +280,8 @@ _FINDING_FILTERS = {"tool": "tool = ?", "rule": "rule_id = ?", "level": "review_
                     "view_class": "view_class = ?", "family": "family = ?", "cluster": "cluster_id = ?",
                     "path": "path GLOB ?", "function": "function = ?"}
 _PV_FILTERS = {"partition": "partition = ?", "level": "level = ?", "module": "module = ?", "family": "family = ?",
-               "path": "path GLOB ?", "sfr": "sfr_ids LIKE '%,' || ? || ',%'", "status": "status = ?"}
+               "path": "path GLOB ?", "sfr": "sfr_ids LIKE '%,' || ? || ',%'", "status": "status = ?",
+               "ai": "ai_verdict = ?", "origin": "json_extract(row, '$.origin') = ?"}
 _CLUSTER_FILTERS = {"path": "path GLOB ?", "family": "family = ?", "level": "top_level = ?",
                     "function": "function = ?", "tool": "(',' || tools || ',') LIKE '%,' || ? || ',%'"}
 
