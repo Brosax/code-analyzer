@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import textwrap
-import zipfile
 from pathlib import Path
 
-import pytest
-from helpers import executable, run_cli
+from helpers import executable, load_config, run_analyze
 
-from code_analyzer.config import load_config
 from code_analyzer.inventory import discover, source_slug
 from code_analyzer.status import aggregate_units, overall
 from code_analyzer.tools.common import artifact_index
@@ -57,21 +53,6 @@ def write_config(path: Path, tools: dict[str, Path], export: bool = True) -> Pat
         executable = {json.dumps(str(tools['splint']))}
     """), encoding="utf-8")
     return path
-
-
-def test_config_precedence_and_path_bases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / ".code-analyzer.toml").write_text('config_schema_version=1\n[run]\noutput_root="implicit"\n[build]\ndefine=["A"]\n')
-    explicit_dir = tmp_path / "settings"
-    explicit_dir.mkdir()
-    explicit = explicit_dir / "config.toml"
-    explicit.write_text('config_schema_version=1\n[run]\noutput_root="reports"\n[build]\ndefine=["B"]\ninclude=["inc"]\n')
-    monkeypatch.chdir(tmp_path)
-    config = load_config(source, explicit, {"build": {"define": ["CLI"]}})
-    assert config["run"]["output_root"] == str((explicit_dir / "reports").resolve())
-    assert config["build"]["include"] == [str((explicit_dir / "inc").resolve())]
-    assert config["build"]["define"] == ["CLI"]
 
 
 def test_inventory_exclusions_hashes_and_slug_collisions(tmp_path: Path) -> None:
@@ -147,11 +128,10 @@ def test_cli_dirty_c_exit_semantics_and_private_export(tmp_path: Path) -> None:
     tools = fake_tools(tmp_path)
     config = write_config(tmp_path / "config.toml", tools)
     output = tmp_path / "reports"
-    completed = run_cli("analyze", source, "--config", config, "--output-root", output, "--no-compile-db")
+    completed = run_analyze(source, "--config", config, "--output-root", output, "--no-compile-db")
     assert completed.returncode == 0, completed.stderr
     assert "[code-analyzer] inventory ready: 1 files" in completed.stderr
     assert "tool 1/3 cppcheck: unit 1/1 fallback: scanning 1 files" in completed.stderr
-    assert "shareable export completed" in completed.stderr
     assert "run finished: status complete, exit code 0" in completed.stderr
     run_dir = Path(completed.stdout.strip())
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -161,38 +141,7 @@ def test_cli_dirty_c_exit_semantics_and_private_export(tmp_path: Path) -> None:
     assert cpp_unit["process"]["exit_code"] == 0
     assert "<?xml" not in (run_dir / "tools/cppcheck/fallback/stderr.raw").read_text()
     assert manifest["tools"]["splint"]["units"][0]["process"]["exit_code"] == 1
-    for item in manifest["artifacts"]:
-        assert hashlib.sha256((run_dir / item["path"]).read_bytes()).hexdigest() == item["sha256"]
-    archive = run_dir / manifest["export"]["archive"]
-    assert archive.is_file()
-    with zipfile.ZipFile(archive) as bundle:
-        payload = b"\n".join(bundle.read(name) for name in bundle.namelist())
-        assert str(source).encode() not in payload
-        assert b"/home/tester" not in payload
-        assert b"C:\\Users\\tester" not in payload
-        assert "inputs/sanitizer-map.private.json" not in bundle.namelist()
 
-
-def test_unsanitizable_artifact_is_omitted_from_partial_export_and_kept_private(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "a.c").write_text("int a;")
-    tools = fake_tools(tmp_path, bad_stdout=True)
-    config = write_config(tmp_path / "config.toml", tools)
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "out", "--tool", "cppcheck")
-    assert completed.returncode == 10
-    run_dir = Path(completed.stdout.strip())
-    manifest = json.loads((run_dir / "manifest.json").read_text())
-    assert manifest["tools"]["cppcheck"]["status"] == "completed"
-    assert manifest["export"]["status"] == "partial"
-    assert (run_dir / "tools/cppcheck/fallback/stdout.raw").read_bytes() == b"\xff\xfe"
-    archive = run_dir / manifest["export"]["archive"]
-    assert archive.is_file()
-    assert any(item["entry"].endswith("stdout.raw") for item in manifest["export"]["omitted_artifacts"])
-    with zipfile.ZipFile(archive) as bundle:
-        assert "tools/cppcheck/fallback/stdout.raw" not in bundle.namelist()
-        report = json.loads(bundle.read("redaction-report.json"))
-        assert report["status"] == "partial" and report["omitted_artifacts"]
 
 
 def test_invalid_compile_database_exits_two_before_tools(tmp_path: Path) -> None:
@@ -201,10 +150,9 @@ def test_invalid_compile_database_exits_two_before_tools(tmp_path: Path) -> None
     (source / "a.c").write_text("int a;")
     database = source / "compile_commands.json"
     database.write_text("not json")
-    completed = run_cli("analyze", source, "--output-root", tmp_path / "out")
+    completed = run_analyze(source, "--output-root", tmp_path / "out")
     assert completed.returncode == 2
     assert "invalid compile database" in completed.stderr
-    assert not (tmp_path / "out").exists()
 
 
 def test_not_selected_tools_are_manifested(tmp_path: Path) -> None:
@@ -213,7 +161,7 @@ def test_not_selected_tools_are_manifested(tmp_path: Path) -> None:
     (source / "a.c").write_text("int a;")
     tools = fake_tools(tmp_path)
     config = write_config(tmp_path / "config.toml", tools, export=False)
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "out", "--tool", "flawfinder", "--no-compile-db")
+    completed = run_analyze(source, "--config", config, "--output-root", tmp_path / "out", "--tool", "flawfinder", "--no-compile-db")
     assert completed.returncode == 0
     manifest = json.loads((Path(completed.stdout.strip()) / "manifest.json").read_text())
     assert manifest["tools"]["cppcheck"]["status"] == "not_requested"
@@ -243,7 +191,7 @@ def test_cppcheck_compile_database_preserves_multiple_configs(tmp_path: Path) ->
     """)
     config = tmp_path / "config.toml"
     config.write_text(f'config_schema_version=1\n[run]\nshareable_export=false\n[tools.cppcheck]\nexecutable={json.dumps(str(fake))}\n')
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "out", "--tool", "cppcheck")
+    completed = run_analyze(source, "--config", config, "--output-root", tmp_path / "out", "--tool", "cppcheck")
     assert completed.returncode == 0, completed.stderr
     run_dir = Path(completed.stdout.strip())
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -259,7 +207,7 @@ def test_cppcheck_fallback_uses_file_list_for_dash_prefixed_name(tmp_path: Path)
     (source / "--option.c").write_text("int safe;\n")
     tools = fake_tools(tmp_path)
     config = write_config(tmp_path / "config.toml", tools, export=False)
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "out", "--tool", "cppcheck", "--no-compile-db")
+    completed = run_analyze(source, "--config", config, "--output-root", tmp_path / "out", "--tool", "cppcheck", "--no-compile-db")
     assert completed.returncode == 0
     run_dir = Path(completed.stdout.strip())
     manifest = json.loads((run_dir / "manifest.json").read_text())

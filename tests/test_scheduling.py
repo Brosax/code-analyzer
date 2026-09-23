@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
+from helpers import run_analyze
 
 from code_analyzer.process import run_process
 
@@ -42,11 +41,8 @@ def test_splint_budget_accounts_unscheduled_tus(tmp_path: Path, jobs: int) -> No
         total_timeout_seconds = 0.02
         jobs = {jobs}
     """))
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    result = subprocess.run(
-        [sys.executable, "-m", "code_analyzer", "analyze", str(source), "--config", str(config), "--output-root", str(tmp_path / "out"), "--tool", "splint", "--no-compile-db"],
-        env=env, text=True, capture_output=True, timeout=30,
-    )
+    result = run_analyze(source, "--config", config, "--output-root", tmp_path / "out", "--tool", "splint",
+                         "--no-compile-db", timeout=30)
     assert result.returncode == 20
     manifest = json.loads((Path(result.stdout.strip()) / "manifest.json").read_text())
     units = manifest["tools"]["splint"]["units"]

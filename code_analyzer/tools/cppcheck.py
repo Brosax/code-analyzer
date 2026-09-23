@@ -7,12 +7,16 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
-from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
-from .adapter import Adapter, RunContext
-from .common import announce_never_ran, attach_artifacts, output_room, unit_outcome
+from .adapter import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT, Adapter, RunContext
+from .common import (
+    announce_never_ran,
+    attach_artifacts,
+    error_excerpt,
+    output_room,
+    unit_outcome,
+)
 
 
 def run(
@@ -278,7 +282,7 @@ def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list
     # Imported here, not at module scope: parsing a native report produces
     # review rows, so it lives in the review layer, and that layer imports this
     # package.  Late binding keeps the dependency one-way.
-    from ..review import _parse_cppcheck_units
+    from ..evidence.parsing import _parse_cppcheck_units
 
     return _parse_cppcheck_units(source, run_dir, execution)
 

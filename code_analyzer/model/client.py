@@ -29,10 +29,10 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..core.text import single_line
 from ..defaults import endpoint_class
 from ..errors import UserError
 from ..persist import json_bytes
-from ..progress import single_line
 
 NO_MODEL_ENV = "CODE_ANALYZER_NO_MODEL"
 TRANSPORTS = ("v1", "api_chat")

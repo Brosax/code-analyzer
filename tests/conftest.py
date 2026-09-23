@@ -1,15 +1,8 @@
 """Shared pytest configuration.
 
-Keeps the package importable under a bare ``pytest`` invocation (which does
-not put the repository root on ``sys.path``) and the shared ``helpers``
-module importable regardless of the invocation directory.
-
-It also keeps the suite honest about the provider.  Free text now routes to a
-model by default, so without a seam "691 tests green" would quietly mean
-"green on a machine whose GPU host happened to be up" -- and on a machine
-where it is down, a blackholed endpoint costs 30 seconds per call.  The
-autouse fixture below switches the model lane off and stubs the one function
-that would reach it.
+Keeps the package importable under a bare ``pytest`` invocation and the shared ``helpers`` module importable
+regardless of the invocation directory, and keeps the suite honest about the model: no test opens a socket to a
+model unless it removes ``CODE_ANALYZER_NO_MODEL`` itself (and then it talks to a FakeTransport).
 """
 from __future__ import annotations
 
@@ -26,52 +19,13 @@ for _entry in (str(_TESTS_DIR.parent), str(_TESTS_DIR)):
 
 @pytest.fixture(autouse=True)
 def no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No test opens a socket to a model unless it says so.
-
-    Two mechanisms, because either alone leaves a hole.  ``CODE_ANALYZER_NO_MODEL``
-    makes ``propose.gate`` refuse before anything connects, which covers code
-    that calls the gate directly.  The stub on ``propose.propose`` covers the
-    TUI, whose ``_propose_worker`` imports it inside the function -- so a
-    module-attribute patch really is what it resolves.
-
-    Deliberately NOT patched: ``propose.gate``.  ``propose()`` resolves it as a
-    module global, so patching it would hijack the very tests that check the
-    gate's own behaviour.
-    """
+    """The model lane is off unless a test turns it on (``client.chat`` refuses before any socket)."""
     monkeypatch.setenv("CODE_ANALYZER_NO_MODEL", "1")
-
-    from code_analyzer.llm import propose as propose_module
-
-    def refused(utterance: str, config: object, **_kwargs: object) -> object:
-        return propose_module.Proposal(
-            "skipped", "CODE_ANALYZER_NO_MODEL=1 已关闭模型通道（测试）",
-            model=str((config or {}).get("llm", {}).get("model") or None) if isinstance(config, dict) else None,
-        )
-
-    monkeypatch.setattr(propose_module, "propose", refused)
 
 
 @pytest.fixture(autouse=True)
 def private_home(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Nothing a test does lands in the operator's ~/.code-analyzer.
-
-    Before this, the TUI tests wrote 612 session journals into the real
-    sessions directory, where they were indistinguishable from real use.
-    """
+    """Nothing a test does lands in the operator's ~/.code-analyzer."""
     home = tmp_path_factory.mktemp("code-analyzer-home")
     monkeypatch.setenv("CODE_ANALYZER_HOME", str(home))
-    monkeypatch.setenv("CODE_ANALYZER_ASK_ROOT", str(home / "ask"))
-    from code_analyzer import journal
-
-    monkeypatch.setattr(journal, "SESSIONS_DIRECTORY", home / "sessions")
     return home
-
-
-@pytest.fixture
-def provider_lane_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Opt back in: for the tests that exercise the gate's own refusals.
-
-    They still never reach a live provider -- they point at an unconfigured or
-    a closed endpoint -- but they need ``gate`` to get past the env switch.
-    """
-    monkeypatch.delenv("CODE_ANALYZER_NO_MODEL", raising=False)

@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 from helpers import ROOT, executable, run_cli
-from test_core import write_config
 
 from code_analyzer.errors import UserError
 from code_analyzer.evidence.buildctx_schema import (
@@ -143,23 +142,21 @@ def project(tmp_path: Path) -> Path:
     return source
 
 
-def test_evaluate_matches_the_old_runner_and_numbers_the_list(tmp_path: Path) -> None:
+def test_analyze_records_the_call_and_numbers_the_list(tmp_path: Path) -> None:
+    # The static path is the old runner's, minus its report phases; equivalence on Juliet (exit code, every unit's
+    # status, every finding key) was checked against the old runner before it was removed (v3 M9).
     source = project(tmp_path)
     tools = fake_tools(tmp_path, source / "a.c")
-    old = run_cli("analyze", source, "--config", write_config(tmp_path / "config.toml", tools, export=False),
-                  "--output-root", tmp_path / "old", "--no-compile-db")
-    new = run_cli("evaluate", source, "--eval-dir", tmp_path / "eval", "--buildctx", buildctx_file(tmp_path, tools),
+    new = run_cli("analyze", source, "--eval-dir", tmp_path / "eval", "--buildctx", buildctx_file(tmp_path, tools),
                   "--no-compile-db")
-    assert new.returncode == old.returncode == 0, new.stderr
+    assert new.returncode == 0, new.stderr
     workspace = Workspace.open(Path(new.stdout.strip()))
     [call] = workspace.ledger.of("call_finished")
     run_dir = workspace.root / call["run_dir"]
-    old_manifest = json.loads((Path(old.stdout.strip()) / "manifest.json").read_text())
-    new_manifest = json.loads((run_dir / "manifest.json").read_text())
-    units = lambda manifest: {  # noqa: E731
-        tool: [(u["id"], u["status"]) for u in item.get("units", [])] for tool, item in manifest["tools"].items()}
-    assert units(new_manifest) == units(old_manifest)
-    assert new_manifest["review"]["status"] == "disabled" and new_manifest["export"]["status"] == "disabled"
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    units = {tool: [(u["id"], u["status"]) for u in item.get("units", [])] for tool, item in manifest["tools"].items()}
+    assert units["cppcheck"] == [("fallback", "completed")] and manifest["status"] == "complete"
+    assert set(manifest) >= {"tools", "source_inventory", "compile_database"} and "review" not in manifest
 
     store = Store(workspace.index_path)
     listing = store.list_pvs()
@@ -170,7 +167,7 @@ def test_evaluate_matches_the_old_runner_and_numbers_the_list(tmp_path: Path) ->
     assert triage["in_toe"] == triage["partition_main"] + triage["partition_unmapped"] + triage["partition_below"]
     assert store.list_findings({"view_class": "diagnostic"})["total"] == 1
 
-    again = run_cli("evaluate", source, "--eval-dir", workspace.root, "--buildctx", buildctx_file(tmp_path, tools),
+    again = run_cli("analyze", source, "--eval-dir", workspace.root, "--buildctx", buildctx_file(tmp_path, tools),
                     "--no-compile-db")
     assert again.returncode == 0, again.stderr
     built = Workspace.open(workspace.root).ledger.of("index_built")
@@ -181,7 +178,7 @@ def test_evaluate_matches_the_old_runner_and_numbers_the_list(tmp_path: Path) ->
 def test_fail_on_gates_only_native_findings(tmp_path: Path) -> None:
     source = project(tmp_path)
     tools = fake_tools(tmp_path, source / "a.c")
-    completed = run_cli("evaluate", source, "--eval-dir", tmp_path / "eval", "--buildctx",
+    completed = run_cli("analyze", source, "--eval-dir", tmp_path / "eval", "--buildctx",
                         buildctx_file(tmp_path, tools), "--no-compile-db", "--fail-on", "high")
     assert completed.returncode == 1, completed.stderr
     assert Workspace.open(tmp_path / "eval").ledger.of("gate_triggered")
@@ -189,7 +186,7 @@ def test_fail_on_gates_only_native_findings(tmp_path: Path) -> None:
 
 def _start(tmp_path: Path, source: Path, tools: dict[str, Path]) -> subprocess.Popen[str]:
     return subprocess.Popen(
-        [sys.executable, "-m", "code_analyzer", "evaluate", str(source), "--eval-dir", str(tmp_path / "eval"),
+        [sys.executable, "-S", "-m", "code_analyzer", "analyze", str(source), "--eval-dir", str(tmp_path / "eval"),
          "--buildctx", str(buildctx_file(tmp_path, tools)), "--no-compile-db"],
         cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)}, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)

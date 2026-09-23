@@ -27,16 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..analysis import CancellationToken
 from ..config import DEFAULTS, validate_config
+from ..core.cancel import CancellationToken
 from ..errors import UserError
 from ..persist import json_bytes, jsonl_bytes
-from ..review import should_fail
 from ..sesip.active import active_profile, save_draft, select_builtin
 from ..sesip.profile import BUILTINS, DEFAULT_HEADLESS, Profile, load_profile
 from ..sesip.pv import build_entries, number, numbering_record
+from ..settings import load_settings
 from ..tools import TOOL_NAMES
-from . import promoted
+from . import promoted, static_run
 from .buildctx_schema import (
     buildctx_sha,
     buildctx_text,
@@ -45,6 +45,7 @@ from .buildctx_schema import (
 )
 from .findings import parse_run
 from .overlays import replay
+from .parsing import should_fail
 from .store import Store, index_current
 from .triage import SourceLines, cluster
 from .workspace import Workspace, _atomic
@@ -79,12 +80,8 @@ def evaluate(source: Path, *, eval_dir: Path | None = None, data_root: Path | No
     config = static_config(context, output_root=call_dir, tools=tools, compile_db=compile_db, exclude=exclude)
     workspace.ledger.append("call_started", call_id=call_id, call_kind="static", tools=_enabled(config),
                             buildctx_sha=sha, scope="all")
-    from ..runner import (
-        _analyze,  # noqa: PLC0415 - the runner imports the whole old stack
-    )
-
     try:
-        exit_code, run_dir = _analyze(source, config, progress, cancellation=cancellation)
+        exit_code, run_dir = static_run.run(source, config, progress, cancellation=cancellation)
     except BaseException:
         workspace.ledger.append("call_finished", call_id=call_id, status="failed", exit_code=20)
         raise
@@ -215,10 +212,12 @@ def static_config(buildctx: dict[str, Any], *, output_root: Path, tools: list[st
     config = copy.deepcopy(DEFAULTS)
     config["build"] = copy.deepcopy(buildctx["build"])
     config["tools"] = copy.deepcopy(buildctx["tools"])
-    config["run"].update({"output_root": str(output_root), "shareable_export": False})
-    config["review"]["enabled"] = False
-    config["llm"]["enabled"] = False
-    config["audit"]["enabled"] = False
+    config["run"]["output_root"] = str(output_root)
+    # settings.toml [analyzers] names where each tool lives on this host; a build context that names its own
+    # executable keeps it.
+    for name, path in load_settings().analyzers.items():
+        if path and name in config["tools"] and config["tools"][name]["executable"] == name:
+            config["tools"][name]["executable"] = str(Path(path).expanduser())
     # The build context is driven from the conversation (v3 M6); the old
     # in-run loop that could stop and wait for a decision stays off.
     config["build"]["assist"] = "off"

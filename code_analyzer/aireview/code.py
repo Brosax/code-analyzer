@@ -1,7 +1,7 @@
 """The code a lens is shown: functions, their lines, and a static call graph.
 
 Built once per source inventory with the proven approximate parser
-(llm/index.py) and cached under ``aireview/`` as a slim JSON (functions and
+(core/cindex.py) and cached under ``aireview/`` as a slim JSON (functions and
 calls only).  The call graph is "static approximation": names resolved against
 the repository's own definitions, no function pointers, no macros that expand
 to calls -- good enough to rank relevance, never used as proof.
@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.cindex import build_index
 from ..evidence.workspace import Workspace, _atomic
-from ..llm.index import build_index
 from ..persist import json_bytes
 
 INDEX_VERSION = 1

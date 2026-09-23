@@ -4,17 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-analyzer"
-version = "2.0.0"
-description = "Evidence-first C/C++ static analysis runner for WSL"
+version = "3.0.0"
+description = "SESIP code evaluation: static analyzers, a numbered vulnerability list, targeted AI review on a local GPU"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-# deepseek-harness-sdk is pinned exactly: upstream is a release candidate that
-# states it will make compatibility-breaking changes.
-dependencies = ["textual>=8.2.8,<9", "deepseek-harness-sdk==0.1.1rc1"]
+# None: the standard library only.  pdftotext (poppler) and bwrap are optional external programs.
+dependencies = []
 
 [project.optional-dependencies]
-# setuptools: tests/test_llm_config.py builds a wheel to prove the skills ship.
+# setuptools: tests/test_packaging.py builds a wheel to prove the data files ship.
 dev = ["pytest>=8", "ruff>=0.5", "setuptools>=77"]
 
 [project.scripts]
@@ -23,10 +22,8 @@ code-analyzer = "code_analyzer.cli:main"
 [tool.setuptools.packages.find]
 include = ["code_analyzer*"]
 
-# The scanner skills live in hyphenated, non-package directories: without this
-# they are missing from every non-editable install and the LLM phase fails.
+# Data files that are not Python modules: without these a non-editable install lacks them.
 [tool.setuptools.package-data]
-"code_analyzer.skills" = ["*/SKILL.md"]
 "code_analyzer.sesip" = ["builtin/*.toml"]
 "code_analyzer.web" = ["static/*"]
 "code_analyzer.aireview" = ["lenses/*.md"]
@@ -46,6 +43,5 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
   "live_tools: requires installed native analyzers",
-  "live_llm: requires a reachable LLM endpoint",
   "tfm_full: slow, manual full-repository acceptance test",
 ]

@@ -8,7 +8,7 @@ import pytest
 from fake_transport import FakeTransport, delta, sse
 from test_evaluate import SOURCE, buildctx_file, fake_tools
 
-from code_analyzer.analysis import CancellationToken
+from code_analyzer.core.cancel import CancellationToken
 from code_analyzer.errors import UserError
 from code_analyzer.evidence.analyze import evaluate
 from code_analyzer.evidence.buildctx_schema import load_buildctx

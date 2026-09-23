@@ -29,14 +29,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..review import (
+from ..tools import TOOL_NAMES, adapter
+from .parsing import (
     _deduplicate,
     _parse_llm_units,
     _scanner_executions,
     canonical_path,
     enrich_row,
 )
-from ..tools import TOOL_NAMES, adapter
 
 VIEW_CLASSES = ("finding", "diagnostic", "out_of_tree", "superseded", "inactive_config")
 

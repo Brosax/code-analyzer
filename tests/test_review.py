@@ -11,7 +11,7 @@ from test_evaluate import SOURCE, buildctx_file, fake_tools
 
 from code_analyzer.aireview import contracts
 from code_analyzer.aireview import lenses as lens_mod
-from code_analyzer.analysis import CancellationToken
+from code_analyzer.core.cancel import CancellationToken
 from code_analyzer.core.tomlw import dumps
 from code_analyzer.evidence.analyze import evaluate
 from code_analyzer.evidence.buildctx_schema import load_buildctx

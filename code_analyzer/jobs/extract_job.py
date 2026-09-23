@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..analysis import CancellationToken
+from ..core.cancel import CancellationToken
 from ..core.tomlw import dumps
 from ..errors import UserError
 from ..evidence.workspace import Workspace, _atomic

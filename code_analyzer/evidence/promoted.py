@@ -17,8 +17,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from ..review import enrich_row
 from .findings import view_class
+from .parsing import enrich_row
 from .triage import SourceLines
 from .workspace import Workspace
 

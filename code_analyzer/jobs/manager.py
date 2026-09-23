@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..analysis import CancellationToken
+from ..core.cancel import CancellationToken
 from ..errors import UserError
 
 LOG_LINES = 200

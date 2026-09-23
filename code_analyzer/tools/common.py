@@ -6,12 +6,11 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..events import EVENTS_FILE
-
 # Where the runner's narrative log lives, relative to the run directory; the
 # writer is runlog.RunLogger, named here so the artifact index can skip it
 # without importing the writer.
 RUN_LOG_FILE = "logs/runner.log"
+EVENTS_FILE = "events.jsonl"   # written by runs before v3; still skipped when indexing old run directories
 
 # The vocabulary of analyzer *diagnostics* -- lines that say the tool could not
 # do its job, as opposed to findings about the code.  Shared by the review
@@ -277,3 +276,16 @@ def artifact_index(
 
 def attach_artifacts(unit: dict, directory: Path, run_dir: Path) -> None:
     unit["artifacts"] = [artifact(path, run_dir) for path in sorted(directory.iterdir()) if path.is_file()]
+
+
+MAX_EXCERPT_CHARS = 400
+
+
+def error_excerpt(text: str, limit: int = 6) -> list[str]:
+    """The lines worth quoting from a tool's output: diagnostics first, else the tail."""
+    from ..core.text import single_line  # noqa: PLC0415
+
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    diagnostics = [line for line in lines if is_diagnostic(line)]
+    chosen = diagnostics[:limit] if diagnostics else lines[-limit:]
+    return [single_line(line)[:MAX_EXCERPT_CHARS] for line in chosen]

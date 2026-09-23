@@ -7,14 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
-from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
-from .adapter import Adapter, RunContext
+from .adapter import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT, Adapter, RunContext
 from .common import (
     announce_never_ran,
     attach_artifacts,
+    error_excerpt,
     output_room,
     unit_outcome,
     utf8_validation,
@@ -198,7 +197,9 @@ def _run(executable: str, ctx: RunContext) -> dict[str, Any]:
 
 
 def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    from ..review import _parse_flawfinder_units  # late-bound; see cppcheck._parse
+    from ..evidence.parsing import (
+        _parse_flawfinder_units,  # late-bound; see cppcheck._parse
+    )
 
     return _parse_flawfinder_units(source, run_dir, execution)
 

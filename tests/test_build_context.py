@@ -5,6 +5,7 @@ import copy
 from pathlib import Path
 
 import pytest
+from helpers import load_config
 
 from code_analyzer.build_context import (
     AUTHORITY,
@@ -19,7 +20,6 @@ from code_analyzer.build_context import (
     write_round,
     write_stubs,
 )
-from code_analyzer.config import load_config
 from code_analyzer.errors import UserError
 from code_analyzer.includes import candidate_dirs, include_index, scan_includes
 from code_analyzer.tools.common import effective_units, merge_attempt

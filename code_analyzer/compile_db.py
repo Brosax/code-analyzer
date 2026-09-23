@@ -343,3 +343,48 @@ def _include_path(value: str, directory: Path) -> str:
     if not path.is_absolute():
         path = directory / path
     return str(path.resolve())
+
+
+# -- CMake configure presets (the compile_db job offers only a preset the project declares) --
+
+def read_presets(source: Path) -> dict[str, Any]:
+    files: list[str] = []
+    raw_presets: dict[str, dict[str, Any]] = {}
+    for name in ("CMakePresets.json", "CMakeUserPresets.json"):
+        path = source / name
+        if not path.is_file():
+            continue
+        files.append(str(path))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        for item in data.get("configurePresets", []) if isinstance(data, dict) else []:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                raw_presets[item["name"]] = item
+    presets: list[dict[str, Any]] = []
+    for name, item in raw_presets.items():
+        if item.get("hidden", False):
+            continue
+        binary_dir = _inherited_preset_value(name, "binaryDir", raw_presets, set())
+        presets.append({"name": name, "binaryDir": binary_dir if isinstance(binary_dir, str) else None})
+    return {"files": files, "presets": presets}
+
+
+def _inherited_preset_value(name: str, key: str, presets: dict[str, dict[str, Any]], seen: set[str]) -> Any:
+    if name in seen or name not in presets:
+        return None
+    item = presets[name]
+    if key in item:
+        return item[key]
+    parents = item.get("inherits", [])
+    if isinstance(parents, str):
+        parents = [parents]
+    if not isinstance(parents, list):
+        return None
+    for parent in parents:
+        if isinstance(parent, str):
+            value = _inherited_preset_value(parent, key, presets, seen | {name})
+            if value is not None:
+                return value
+    return None

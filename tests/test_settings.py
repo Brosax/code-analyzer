@@ -37,3 +37,17 @@ def test_bad_settings_are_errors(tmp_path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
     with pytest.raises(UserError):
         load_settings(path)
+
+
+def test_analyzer_paths_from_settings_reach_the_tool_call(tmp_path, monkeypatch) -> None:
+    from code_analyzer.evidence.analyze import static_config
+    from code_analyzer.evidence.buildctx_schema import default_buildctx
+
+    monkeypatch.setenv("CODE_ANALYZER_HOME", str(tmp_path))
+    (tmp_path / "settings.toml").write_text('[analyzers]\ncppcheck = "~/.local/bin/cppcheck"\n', encoding="utf-8")
+    context = default_buildctx()
+    context["tools"]["splint"]["executable"] = "/opt/splint/bin/splint"
+    config = static_config(context, output_root=tmp_path / "out")
+    assert config["tools"]["cppcheck"]["executable"].endswith("/.local/bin/cppcheck")
+    assert config["tools"]["splint"]["executable"] == "/opt/splint/bin/splint"   # the build context's own wins
+    assert config["tools"]["flawfinder"]["executable"] == "flawfinder"

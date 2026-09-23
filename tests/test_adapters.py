@@ -14,11 +14,11 @@ from typing import Any
 
 import pytest
 
-from code_analyzer import doctor, review, runner
 from code_analyzer import tools as tools_package
-from code_analyzer.analysis import AnalysisRequest, run_analysis
 from code_analyzer.config import DEFAULTS, validate_config
 from code_analyzer.errors import UserError
+from code_analyzer.evidence import parsing as review
+from code_analyzer.evidence import static_run as runner
 from code_analyzer.tools import (
     TOOL_NAMES,
     Adapter,
@@ -49,9 +49,7 @@ def test_the_registry_is_exactly_the_declared_tool_names() -> None:
     (
         pytest.param(lambda: adapter(UNKNOWN), id="lookup"),
         pytest.param(lambda: runner._version(UNKNOWN, "/bin/true"), id="runner-version"),
-        pytest.param(lambda: runner._incompatibility(UNKNOWN, "/bin/true"), id="runner-incompatibility"),
-        pytest.param(lambda: doctor._guidance(UNKNOWN), id="doctor-guidance"),
-        pytest.param(lambda: doctor.probe_tool(UNKNOWN, "sh"), id="doctor-probe"),
+        pytest.param(lambda: runner.incompatibility(UNKNOWN, "/bin/true"), id="runner-incompatibility"),
     ),
 )
 def test_an_unknown_analyzer_fails_by_name_at_every_former_crash_point(call) -> None:
@@ -114,25 +112,23 @@ def test_a_substituted_adapter_is_the_one_the_runner_calls(tmp_path: Path, monke
 
     config = validate_config(json.loads(json.dumps(DEFAULTS)))
     config["run"]["output_root"] = str(tmp_path / "reports")
-    config["run"]["shareable_export"] = False
     config["build"]["compile_database_mode"] = "disabled"
     for name in TOOL_NAMES:
         config["tools"][name]["enabled"] = name == "cppcheck"
     config["tools"]["cppcheck"]["executable"] = "/bin/true"
 
-    result = run_analysis(AnalysisRequest(source, config))
+    _code, run_dir = runner.run(source, config, lambda _line: None)
 
-    assert result.report_directory is not None
     [context] = seen
     assert isinstance(context, RunContext)
-    assert context.source == source.resolve() and context.run_dir == result.report_directory
+    assert context.source == source.resolve() and context.run_dir == run_dir
     assert isinstance(context.compile_db, CompileDatabase)
     # The compile database travels as one object now, not as two positional
     # arguments one adapter took and another did not.
     assert context.compile_db.entries == [] and context.compile_db.present is False
     assert [item["path"] for item in context.inventory] == ["main.c"]
     assert context.cancelled() is False
-    manifest = json.loads((result.report_directory / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["tools"]["cppcheck"]["status"] == "completed"
     assert manifest["tools"]["cppcheck"]["executable"] == "/bin/true"
 
@@ -152,7 +148,7 @@ def test_the_canary_isolates_every_adapter_the_same_way(tmp_path: Path, monkeypa
         {**adapters(), "cppcheck": Adapter(**{**vars(fake), "canary": canary})},
     )
 
-    ok, reason = doctor.verify_canary("cppcheck", "/bin/true")
+    ok, reason = runner.canary("cppcheck", "/bin/true")
 
     assert ok is False and reason == "minimal cppcheck canary did not produce a valid native report"
     assert "int main(void)" in seen["source"]
@@ -201,13 +197,12 @@ def test_the_run_shares_one_output_budget_across_every_adapter(
 
     config = validate_config(json.loads(json.dumps(DEFAULTS)))
     config["run"]["output_root"] = str(tmp_path / "reports")
-    config["run"]["shareable_export"] = False
     config["build"]["compile_database_mode"] = "disabled"
     for name in TOOL_NAMES:
         config["tools"][name]["enabled"] = name == "cppcheck"
     config["tools"]["cppcheck"]["executable"] = "/bin/true"
 
-    run_analysis(AnalysisRequest(source, config))
+    runner.run(source, config, lambda _line: None)
 
     [context] = seen
     assert context.output_budget is not None

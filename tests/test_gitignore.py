@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers import load_config
 
-from code_analyzer.config import load_config
 from code_analyzer.inventory import discover
 
 # A rule of every shape Git defines, spread over three levels of ignore file.

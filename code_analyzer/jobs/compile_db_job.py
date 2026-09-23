@@ -17,8 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..compile_db import inspect_compile_db
-from ..compile_db_wizard import _read_presets
+from ..compile_db import inspect_compile_db, read_presets
 from ..core import sandbox
 from ..errors import UserError
 from ..evidence.analyze import current_buildctx
@@ -53,7 +52,7 @@ def propose(workspace: Workspace, *, preset: str = "", generator: str = "", defi
     build = workspace.root / "compile_db" / f"B{number}"
     argv = ["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
     if preset:
-        presets = {item["name"] for item in _read_presets(source)["presets"]}
+        presets = {item["name"] for item in read_presets(source)["presets"]}
         if preset not in presets:
             raise UserError(f"unknown configure preset {preset!r}; the project declares {sorted(presets) or 'none'}")
         argv = ["cmake", "--preset", preset, "-S", str(source), "-B", str(build), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]

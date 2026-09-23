@@ -11,7 +11,7 @@ for the wire:
   fails: prose first, then at the very END of the reply at most one fenced
   ```call block (or a Qwen/Hermes ``<tool_call>``).  Only the tail is looked at,
   so a JSON example the agent shows the user in prose is never mistaken for a
-  call -- the generic salvage in harness/schema.py (``_candidates``) would have
+  call -- the generic salvage in core/jsontext.py (``candidates``) would have
   taken any ``{...}`` anywhere, which is exactly the bug this avoids.
 
 Untrusted text (findings, source, ST excerpts) only ever enters a prompt via
@@ -25,8 +25,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.jsontext import drop_trailing_commas
+from ..core.text import single_line
 from ..model.client import DeltaSink, Reply
-from ..progress import single_line
 from .toolspec import ToolSpec
 
 CALL_FENCE = "```call"
@@ -270,15 +271,11 @@ def parse_arguments(raw: str) -> tuple[dict[str, Any], str | None]:
 
 
 def _loads(text: str) -> tuple[Any, str | None]:
-    from ..harness.schema import (
-        _drop_trailing_commas,  # noqa: PLC0415 - moves with harness/schema in M9
-    )
-
     try:
         return json.loads(text), None
     except ValueError as first:
         try:
-            return json.loads(_drop_trailing_commas(text)), None
+            return json.loads(drop_trailing_commas(text)), None
         except ValueError:
             return None, str(first)
 

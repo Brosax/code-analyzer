@@ -101,6 +101,10 @@ class RunContext:
     attempt: int = 1
 
 
+# What a unit checkpoint answers (an optional run control passed in RunContext.control; None runs every unit).
+RUN, SKIP_UNIT, SKIP_PRODUCER, CANCELLED = "run", "skip_unit", "skip_producer", "cancelled"
+
+
 @dataclass(frozen=True)
 class Adapter:
     """One native analyzer, declared once.

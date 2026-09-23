@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from helpers import executable, run_cli
+from helpers import executable, run_analyze
 from test_core import write_config
 
 from code_analyzer.evidence.findings import (
@@ -222,7 +222,7 @@ def test_a_finished_run_imports_with_view_classes(tmp_path: Path) -> None:
     """)
     config = write_config(tmp_path / "config.toml", {"cppcheck": cppcheck, "flawfinder": flawfinder, "splint": splint},
                           export=False)
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "reports", "--no-compile-db")
+    completed = run_analyze(source, "--config", config, "--output-root", tmp_path / "reports", "--no-compile-db")
     assert completed.returncode in (0, 10), completed.stderr
     run_dir = Path(completed.stdout.strip())
     parsed = parse_run(run_dir)

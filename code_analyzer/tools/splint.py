@@ -11,14 +11,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..compile_db import splint_flags
-from ..control import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT
 from ..process import run_process
-from ..runlog import error_excerpt
 from ..status import aggregate_units, counts
-from .adapter import Adapter, RunContext
+from .adapter import CANCELLED, RUN, SKIP_PRODUCER, SKIP_UNIT, Adapter, RunContext
 from .common import (
     announce_never_ran,
     attach_artifacts,
+    error_excerpt,
     is_diagnostic,
     output_room,
     unit_outcome,
@@ -581,7 +580,9 @@ def _rerun(executable: str, ctx: RunContext, files: Sequence[str]) -> dict[str, 
 
 
 def _parse(source: Path, run_dir: Path, execution: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    from ..review import _parse_splint_units  # late-bound; see cppcheck._parse
+    from ..evidence.parsing import (
+        _parse_splint_units,  # late-bound; see cppcheck._parse
+    )
 
     return _parse_splint_units(source, run_dir, execution)
 

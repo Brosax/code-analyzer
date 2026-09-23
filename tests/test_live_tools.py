@@ -4,11 +4,10 @@ import json
 import os
 import shutil
 import stat
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
+from helpers import run_analyze
 
 ROOT = Path(__file__).parents[1]
 
@@ -20,11 +19,7 @@ def test_live_tools_via_public_cli(tmp_path: Path) -> None:
     source.mkdir()
     (source / "unsafe.c").write_text("#include <string.h>\nint main(int n, char **v) { char b[2]; if(n) strcpy(b,v[0]); return b[3]; }\n")
     (source / "clean.cpp").write_text("int add(int a, int b) { return a + b; }\n")
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    completed = subprocess.run(
-        [sys.executable, "-m", "code_analyzer", "analyze", str(source), "--output-root", str(tmp_path / "reports"), "--no-compile-db"],
-        env=env, text=True, capture_output=True, timeout=300,
-    )
+    completed = run_analyze(source, "--output-root", tmp_path / "reports", "--no-compile-db", timeout=300)
     assert completed.returncode in {0, 10}, completed.stderr
     manifest = json.loads((Path(completed.stdout.strip()) / "manifest.json").read_text())
     assert all(manifest["tools"][name]["status"] != "missing" for name in ("cppcheck", "flawfinder", "splint"))
@@ -59,11 +54,8 @@ def test_live_cppcheck_multiple_defines_are_one_project_pass(tmp_path: Path) -> 
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
     config = tmp_path / "config.toml"
     config.write_text(f'config_schema_version=1\n[run]\nshareable_export=false\n[tools.cppcheck]\nexecutable={json.dumps(str(wrapper))}\n')
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    completed = subprocess.run(
-        [sys.executable, "-m", "code_analyzer", "analyze", str(source), "--config", str(config), "--output-root", str(tmp_path / "reports"), "--tool", "cppcheck"],
-        env=env, text=True, capture_output=True, timeout=120,
-    )
+    completed = run_analyze(source, "--config", config, "--output-root", tmp_path / "reports", "--tool", "cppcheck",
+                            timeout=120)
     assert completed.returncode == 0, completed.stderr
     run_dir = Path(completed.stdout.strip())
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -77,10 +69,7 @@ def test_live_cppcheck_multiple_defines_are_one_project_pass(tmp_path: Path) -> 
 @pytest.mark.skipif(os.environ.get("CODE_ANALYZER_TFM_FULL") != "1", reason="manual release acceptance only")
 def test_tfm_full_degraded_accounting(tmp_path: Path) -> None:
     source = ROOT / "trusted-firmware-m"
-    completed = subprocess.run(
-        [sys.executable, "-m", "code_analyzer", "analyze", str(source), "--output-root", str(tmp_path / "reports"), "--no-compile-db"],
-        cwd=ROOT, text=True, capture_output=True, timeout=8 * 60 * 60,
-    )
+    completed = run_analyze(source, "--output-root", tmp_path / "reports", "--no-compile-db", timeout=8 * 60 * 60)
     assert completed.returncode in {0, 10}
     run_dir = Path(completed.stdout.strip())
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -89,5 +78,3 @@ def test_tfm_full_degraded_accounting(tmp_path: Path) -> None:
     for item in manifest["tools"].values():
         counts = item["unit_counts"]
         assert counts["planned"] == counts["started"] + counts["unscheduled"]
-    assert manifest["export"]["status"] == "completed"
-    assert (run_dir / manifest["export"]["archive"]).is_file()

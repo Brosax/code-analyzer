@@ -1,6 +1,6 @@
 # code-analyzer v3 设计
 
-> 状态：2026-09-22 批准。实施路线见文末 §10（M0–M9）。本文取代 `docs/platform-architecture.md` 与 `docs/llm-scan-architecture.md` 中与之冲突的部分；两份旧文档将在 M9 重写或删除。
+> 状态：2026-09-22 批准。实施路线见文末 §10（M0–M9）。本文取代旧的 `docs/platform-architecture.md` 与 `docs/llm-scan-architecture.md`（两者已在 M9 删除）。
 
 ## 第一部分：背景、实测与选型
 

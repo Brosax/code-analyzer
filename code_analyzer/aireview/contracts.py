@@ -17,7 +17,7 @@ import hashlib
 import json
 from typing import Any
 
-from ..harness.schema import _candidates, _drop_trailing_commas, line_number
+from ..core.jsontext import candidates, drop_trailing_commas, line_number
 from ..persist import json_bytes
 
 VERDICTS = ("CONFIRMED", "LIKELY", "UNCERTAIN", "FALSE_POSITIVE")
@@ -133,8 +133,8 @@ def instructions(contract: str, *, allow_need: bool) -> str:
 def _json_object(text: str) -> tuple[dict[str, Any] | None, str]:
     if not isinstance(text, str) or not text.strip():
         return None, "empty response"
-    for candidate in _candidates(text):
-        for attempt in (candidate, _drop_trailing_commas(candidate)):
+    for candidate in candidates(text):
+        for attempt in (candidate, drop_trailing_commas(candidate)):
             try:
                 value = json.loads(attempt)
             except (json.JSONDecodeError, ValueError, RecursionError):

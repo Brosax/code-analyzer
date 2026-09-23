@@ -7,8 +7,8 @@ import textwrap
 import time
 from pathlib import Path
 
-from code_analyzer.analysis import AnalysisEvent, AnalysisRequest, run_analysis
-from code_analyzer.config import load_config
+from helpers import load_config
+
 from code_analyzer.process import MAX_LIVE_LINE_CHARS, run_process
 from code_analyzer.tools import cppcheck, flawfinder, splint
 
@@ -153,47 +153,6 @@ def test_adapters_apply_fixed_live_output_filters(tmp_path: Path) -> None:
     assert {(stream, line) for _, stream, line in splint_output} == {
         ("stdout", "splint out"), ("stderr", "Finished checking"),
     }
-
-
-def test_headless_service_emits_output_metadata_without_using_logs_as_status(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
-    fake = _executable(tmp_path / "cppcheck", """
-        import pathlib, sys
-        if '--version' in sys.argv:
-            print('Cppcheck test'); raise SystemExit()
-        if '--help' in sys.argv:
-            print('usage --xml-version --output-file --project --file-list --check-level --check-library --checkers-report --cppcheck-build-dir')
-            raise SystemExit()
-        report = pathlib.Path(next(value.split('=', 1)[1] for value in sys.argv if value.startswith('--output-file=')))
-        report.write_text('<results><errors/></results>')
-        print('failed is only analyzer text')
-        print('readable diagnostic', file=sys.stderr)
-    """)
-    config = load_config(source, None, {
-        "run": {"output_root": str(tmp_path / "reports"), "shareable_export": False},
-        "review": {"enabled": False},
-        "build": {"compile_database_mode": "disabled"},
-        "tools": {
-            "cppcheck": {"enabled": True, "executable": str(fake)},
-            "flawfinder": {"enabled": False},
-            "splint": {"enabled": False},
-        },
-    })
-    events: list[AnalysisEvent] = []
-
-    result = run_analysis(AnalysisRequest(source, config), events=events.append)
-
-    assert result.exit_code == 0
-    output = [event for event in events if event.phase == "output"]
-    assert {(event.tool, event.unit, event.stream, event.message) for event in output} == {
-        ("cppcheck", "fallback", "stdout", "failed is only analyzer text"),
-        ("cppcheck", "fallback", "stderr", "readable diagnostic"),
-    }
-    assert next(event for event in events if event.phase == "tool" and event.status == "completed").message.startswith("cppcheck finished")
-    progress_values = [event.progress for event in events if event.progress is not None]
-    assert progress_values == sorted(progress_values)
 
 
 # The log batching this file used to assert on lives with the interface that

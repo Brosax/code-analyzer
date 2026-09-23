@@ -14,7 +14,7 @@ judges): a function-wide 30-line window and keyword-derived families put
 prototype warnings under "crypto-misuse" -- the message named a crypto
 function -- and only 84% of clusters were one defect.
 
-Functions come from the repository index's stdlib parser (llm/index.py);
+Functions come from the repository index's stdlib parser (core/cindex.py);
 the family from ``audit.correlation_category``, the same vocabulary both
 engines already correlate under.  Only rows whose view class is ``finding``
 are clustered: noise, superseded attempts and system headers never become a
@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..audit import correlation_category
-from ..llm.index import decode_source, parse_source
+from ..core.cindex import decode_source, parse_source
+from .families import correlation_category
 from .findings import key, line_number
 
 CLUSTER_GAP_LINES = 3

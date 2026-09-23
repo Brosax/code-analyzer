@@ -7,17 +7,11 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from helpers import executable
+from helpers import executable, load_config
 
-from code_analyzer.cli import _overrides, parser
-from code_analyzer.config import (
-    effective_toml,
-    load_config,
-    save_config_snapshot,
-    validate_config,
-)
+from code_analyzer.config import effective_toml
 from code_analyzer.errors import UserError
-from code_analyzer.review import _validate_splint_report
+from code_analyzer.evidence.parsing import _validate_splint_report
 from code_analyzer.tools import splint
 from code_analyzer.tools.splint_csv import splint_rows
 
@@ -227,8 +221,8 @@ def test_overrides_round_trip_through_toml(tmp_path: Path) -> None:
     assert "[[build.overrides]]" in text and 'match = "platform/ext/target/arm/corstone1000/**"' in text
     # The array of tables follows the section's scalars, so a reload files
     # `assist` under [build] and not under the last override.
-    assert text.index("assist = ") < text.index("[[build.overrides]]") < text.index("[review]")
-    saved = save_config_snapshot(source, config, tmp_path / "snapshot.toml")
+    assert text.index("assist = ") < text.index("[[build.overrides]]") < text.index("[tools.cppcheck]")
+    saved = _snapshot(config, tmp_path / "snapshot.toml")
     reloaded = load_config(source, saved)
     assert reloaded["build"]["overrides"] == config["build"]["overrides"]
     assert reloaded["tools"]["splint"]["report_reserved_names"] is False
@@ -242,8 +236,6 @@ def test_overrides_round_trip_through_toml(tmp_path: Path) -> None:
         ({"build": {"assist": "always"}}, "build.assist must be off, propose, or auto"),
         ({"build": {"assist_rounds": 3}}, "build.assist_rounds must be at most 2"),
         ({"tools": {"splint": {"mode": "paranoid"}}}, "tools.splint.mode must be"),
-        ({"run": {"log_level": "trace"}}, "run.log_level must be"),
-        ({"llm": {"consecutive_failure_limit": -1}}, "llm.consecutive_failure_limit must be"),
     ),
 )
 def test_invalid_new_keys_are_rejected(tmp_path: Path, patch: dict, message: str) -> None:
@@ -258,17 +250,6 @@ def test_the_defaults_leave_the_argv_contract_unchanged(tmp_path: Path) -> None:
     argv = _argv(tmp_path, result["units"][0])
     assert argv[:4] == ["+nof", "-strict", "+unixlib", "+showsummary"]
     assert not any(flag in argv for flag in ("-isoreserved", "+trytorecover", "-skipsysheaders", "-systemdirs"))
-
-
-def test_cli_flags_map_onto_the_typed_keys(tmp_path: Path) -> None:
-    args = parser().parse_args([
-        "analyze", str(tmp_path), "--splint-mode", "weak", "--build-assist", "auto", "--log-level", "debug",
-    ])
-    overrides = _overrides(args)
-    assert overrides["tools"]["splint"]["mode"] == "weak"
-    assert overrides["build"]["assist"] == "auto"
-    assert overrides["run"]["log_level"] == "debug"
-    validate_config(load_config(tmp_path, None, overrides))
 
 
 # --- what the review of M1 established -------------------------------------------
@@ -363,7 +344,7 @@ def test_an_empty_overrides_list_is_written_so_a_snapshot_cancels_lower_layers(t
     assert config["build"]["overrides"] == []
     text = effective_toml(config)
     assert "overrides = []" in text and "[[build.overrides]]" not in text
-    saved = save_config_snapshot(source, config, tmp_path / "snapshot.toml")
+    saved = _snapshot(config, tmp_path / "snapshot.toml")
     assert load_config(source, saved)["build"]["overrides"] == []
 
 
@@ -379,37 +360,6 @@ def test_a_non_string_override_path_is_a_user_error(tmp_path: Path) -> None:
         load_config(source, explicit)
 
 
-def test_the_shareable_export_keeps_a_recovered_splint_report(tmp_path: Path) -> None:
-    """Run the CLI with a fake Splint that writes Splint's unescaped quote; the report must be exported."""
-    import json as _json
-    import zipfile
-
-    from helpers import run_cli
-
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "a.c").write_text("int x;\n", encoding="utf-8")
-    fake = _fake_splint(tmp_path, csv_text=HEADER + NESTED_QUOTE_ROW, stderr_text="Finished checking --- 1 code warning\n")
-    config = tmp_path / "config.toml"
-    config.write_text(textwrap.dedent(f"""
-        config_schema_version = 2
-        [tools.cppcheck]
-        enabled = false
-        [tools.flawfinder]
-        enabled = false
-        [tools.splint]
-        executable = {_json.dumps(str(fake))}
-    """), encoding="utf-8")
-    completed = run_cli("analyze", source, "--config", config, "--output-root", tmp_path / "out", "--no-compile-db")
-    assert completed.returncode == 0, completed.stderr
-    run_dir = Path(completed.stdout.strip())
-    manifest = _json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["export"]["status"] == "completed"
-    unit = manifest["tools"]["splint"]["units"][0]
-    assert unit["csv_recovered_rows"] == 1
-    with zipfile.ZipFile(run_dir / manifest["export"]["archive"]) as bundle:
-        names = set(bundle.namelist())
-        assert f"tools/splint/{unit['id']}/report.csv" in names
-        exported = bundle.read(f"tools/splint/{unit['id']}/report.csv").decode("utf-8")
-    rows, recovered, error = splint_rows(exported)
-    assert error is None and recovered == 0 and rows[1][7].startswith("#error ")
+def _snapshot(config: dict, path: Path) -> Path:
+    path.write_text(effective_toml(config), encoding="utf-8")
+    return path

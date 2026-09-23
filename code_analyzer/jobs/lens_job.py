@@ -35,7 +35,7 @@ from typing import Any
 from ..aireview import contracts, prompt
 from ..aireview import lenses as lens_mod
 from ..aireview.code import CodeIndex
-from ..analysis import CancellationToken
+from ..core.cancel import CancellationToken
 from ..defaults import endpoint_class
 from ..errors import UserError
 from ..evidence.analyze import ensure_index, reindex
