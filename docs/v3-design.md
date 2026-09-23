@@ -937,3 +937,28 @@ conftest 从 M0 起同时设置 `CODE_ANALYZER_NO_MODEL` 和 `CODE_ANALYZER_HOME
 - /home/ubuntu/workspace/code-analyzer/code_analyzer/config.py 与 /home/ubuntu/workspace/code-analyzer/code_analyzer/build_context.py（buildctx 校验器 :464-545、TOML 写出器 :665-713、`ConfigPatch.apply` :206、`validate_patch` :392）
 - /home/ubuntu/workspace/code-analyzer/code_analyzer/harness/runtime.py 与 /home/ubuntu/workspace/code-analyzer/code_analyzer/harness/schema.py（`endpoint_context_length` :420-494、bwrap :625-689、`_matching` :200、`_drop_trailing_commas` :226、`parse_findings` :129）
 - /home/ubuntu/workspace/code-analyzer/code_analyzer/grading.py 与 /home/ubuntu/workspace/code-analyzer/code_analyzer/actions.py（内置档案 rt700-tp-v1.1 的来源；从效果派生批准 :176-208，演化为 kernel/registry.py）
+---
+
+## 实施记录（as built，2026-09-23）
+
+| 期 | 提交 | 真机验收（实测） |
+|---|---|---|
+| M0 | 3b2921d | 探针：codec native、批量并发 1、断开不释放 GPU（Ollama 0.32.14）；前缀缓存快 5.7 倍；json_schema 5/5 |
+| M1 | 6f25c5d | TF-M：88,233 行诊断、182 行树外、主键零重复、22,747 簇、重建字节一致；查询 p95 60 ms；抽样聚类判定 100% |
+| M2 | 70e8b3a | Juliet 与旧 runner 退出码、逐单元状态、(指纹, 单元) 集合一致；TF-M 重跑编号 100% 保持，上游插 20 行 99.32% |
+| M3–M6 | 3dcbd6d | 网页只靠按钮走完 Juliet；合成 ST 抽取 55 s、引文全部核实；对话冷 16 s / 热 4–8 s 首字；打字“批准”不生效；TF-M splint 进入分析 123→173→256→282→295/1588（4 个确定性补丁，基线 289） |
+| M7 | 2df5f01 | Juliet T1 48/48 已核实、接地失败 0%、10 分 44 秒 GPU；T2 点名 bad 函数 32 任务、14 条晋升，CWE121/401/457/476 全部成为已接地条目；TF-M 两个 SFR、60 分钟额度见下 |
+| M8 | c6f2169 | 公开通道、沿用构建上下文、版本对比（Juliet 两个评估 48 保留）；b.ai 真机待用户提供新 key |
+| M9 | 分支 m9-cleanup | 删除旧程序 −44k 行、运行时依赖 0、四条命令；旧 runner 对照 Juliet 一致后删除；等用户试用网页后合并 |
+
+与设计的偏差（均已落地并有测试）：
+
+- **包名**：AI 审查放在 `aireview/`，不是 `review/`——旧的 `review.py` 到 M9 才删除，同名包会遮蔽它。
+- **lens 的检查项决定它能发现什么**：Juliet 第一次 T2 漏掉 CWE401，因为没有一个 lens 写了“正常路径上分配了却不释放”。error-path 1.1.0 补上后两例都找到。
+- **二次复核按“单元 × 类别”一组一次**，晋升只取离复核决定行最近的那条：逐条复核会给铺垫行盖章（第一次 45 条晋升、891 s；改后 14 条、442 s，每条都在出错的那一行）。
+- **T2 的排除更窄**：函数只有在工具已经报过“这个 lens 负责的缺陷族”时才被这个 lens 跳过；无关的告警不再挡住 SFR 相关代码。评估员也可以点名函数（`path::function`、`path:line`），默认用 memory 与 error-path 两个 lens。
+- **焦点可以是多个 SFR**（逗号分隔）。
+- **模型主机钉住**加了按钮：无头 `evaluate` 建的评估原本没有钉住的主机，页面上却没有入口。
+- **旧索引**在打开评估或做版本对比时后台重建，不再要求“先打开一次”。
+- **沙箱**：bwrap 的私有 /tmp 会遮住放在 /tmp 下的源码树，改为之后再只读绑定回来。
+- **打包**：`kernel/method.md`（agent 的系统提示）原先不在 package-data 里，非可编辑安装会缺；`settings.toml [analyzers]` 原先读了不用。两处都已修复并有测试。
