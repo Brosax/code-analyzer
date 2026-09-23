@@ -500,6 +500,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def get_diff(self, evaluation: str, *, query: dict[str, str]) -> None:
             head = app.workspace(evaluation)
             base = app.workspace(query.get("against", ""))
+            stale = [ws for ws in (base, head) if not index_current(ws.index_path)]
+            for workspace in stale:
+                app.rebuild(workspace)   # derived data from an older version: rebuilt in the background
+            if stale:
+                raise HttpError(409, f"{', '.join(ws.root.name for ws in stale)}: the list is being rebuilt for this "
+                                     "version; compare again when that job has finished")
             try:
                 result = compare(base, head)
             except UserError as error:

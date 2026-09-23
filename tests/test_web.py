@@ -301,3 +301,18 @@ def test_only_a_public_evaluation_can_switch_the_public_model_on(server: App, tm
     (workspace.root / "evaluation.json").write_text(json.dumps(data), encoding="utf-8")
     status, _, payload = client.request("POST", f"/api/e/{evaluation}/allow_public_model", {"allow": True})
     assert status == 400 and "local GPU" in json.loads(payload)["error"]
+
+
+def test_a_diff_against_an_old_index_rebuilds_it_first(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    first, base = _evaluation(server, client, tmp_path)
+    client.post(f"/api/e/{first}/run_tools", {}, expect=202)
+    _wait(client, first)
+    import sqlite3
+    with sqlite3.connect(base.index_path) as db:
+        db.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    status, _, payload = client.request("GET", f"/api/e/{first}/diff?against={first}")
+    assert status == 409 and "being rebuilt" in json.loads(payload)["error"]
+    _wait(client, first)
+    diff = client.get(f"/api/e/{first}/diff?against={first}")["diff"]
+    assert diff["counts"]["kept"] == 1 and diff["counts"]["new"] == diff["counts"]["gone"] == 0
