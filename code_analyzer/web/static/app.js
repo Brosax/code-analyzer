@@ -74,7 +74,7 @@ const S = {
   docs: [],
   extractJob: '',
   coverage: null,     // GET /coverage while 覆盖 is shown
-  reviewForm: { sfr: '', module: '', partition: '', depth: 'quick' },
+  reviewForm: { sfr: '', module: '', partition: '', depth: 'quick', channel: 'local' },
   reviewPlan: null,
   busy: false,        // a conversation turn is running
   live: null,         // {el, textEl, text, note}: the reply streaming in
@@ -302,16 +302,19 @@ function newEvalForm() {
     h('input', { type: 'radio', name: 'confidentiality', value, checked: value === 'client' }), text);
   const profiles = S.app.builtin_profiles || [];
   const profile = selectEl(profiles.map((p) => [p, p]), profiles[0] || '', () => {});
+  const carry = selectEl([['', '默认（新的构建上下文）'], ...(S.app.evaluations || []).map((e) => [e.id, `沿用 ${e.name}（路径改到新源码树）`])], '', () => {});
   const form = h('form', { class: 'stack', on: { submit: async (ev) => {
     ev.preventDefault();
     const confidentiality = form.querySelector('input[name="confidentiality"]:checked').value;
-    const res = await act(() => post('/api/evaluations', { source: source.value.trim(), confidentiality, profile: profile.value }));
+    const res = await act(() => post('/api/evaluations', { source: source.value.trim(), confidentiality, profile: profile.value,
+      buildctx_from: carry.value || undefined }));
     if (res) openEval(res.id);
   } } },
   h('label', { class: 'field' }, '源码路径（绝对路径）', source),
   h('div', { class: 'field', role: 'radiogroup', 'aria-label': '机密性' }, '机密性',
     h('div', { class: 'row center' }, radio('client', CONF.client), radio('public', CONF.public))),
   h('label', { class: 'field' }, '档案（内置，之后可在「档案」页更换或上传）', profile),
+  h('label', { class: 'field' }, '构建上下文（复评时沿用上一版本的，省去重新补丁）', carry),
   h('div', null, h('button', { class: 'btn primary', type: 'submit' }, '创建并打开')));
   return form;
 }
@@ -1065,9 +1068,20 @@ function renderProfile(panel) {
     pin ? h('span', { class: 'mono' }, `${pin.host}:${pin.port} · ${pin.model} · ${(pin.addresses || []).join(', ')}`)
       : h('span', { class: 'error-text' }, '未钉住：对话和 AI 审查都不会发出请求'),
     button(pin ? '重新钉住' : '钉住本地模型主机', pinModel, pin ? 'btn small ghost' : 'btn small primary'));
+  const pub = S.ev.public_model || {};
+  const pubRow = S.ev.evaluation.confidentiality === 'public' && pub.configured
+    ? h('div', { class: 'row center' }, h('span', { class: 'muted' }, '公开模型'),
+      h('span', null, `${pub.model} @ ${pub.host}：`, pub.switched_on ? h('b', null, '已允许') : '未允许',
+        h('span', { class: 'muted small' }, '（只用于本评估的批量 AI 审查，逐次在计划里选择；对话始终走本地 GPU；外发并按量计费）')),
+      button(pub.switched_on ? '关闭' : '允许使用', async () => {
+        const out = await act(() => post(ep('/allow_public_model'), { allow: !pub.switched_on }));
+        if (out) loadEval();
+      }, pub.switched_on ? 'btn small ghost' : 'btn small'))
+    : null;
   fill(panel,
     section('档案', [
       pinRow,
+      pubRow,
       h('p', null, h('b', null, p.name), ' ', h('span', { class: `badge ${p.status}` }, PROFILE_STATUS[p.status] || p.status),
         h('span', { class: 'muted small mono' }, `  sha256 ${short(p.sha256)}`)),
       h('div', { class: 'row' }, h('label', { class: 'field' }, '内置档案', builtin),
@@ -1210,8 +1224,40 @@ function renderCoverage(panel) {
         stat(t.retired, '退役编号')),
     ]),
     section('开始 AI 审查', reviewForm()),
-    aiBox);
+    aiBox,
+    section('版本对比（复评）', diffForm()));
   loadCoverage(aiBox);
+}
+
+/** Compare this evaluation's list with another evaluation of an earlier version of the code. */
+function diffForm() {
+  const others = (S.app.evaluations || []).filter((e) => e.id !== S.id);
+  if (!others.length) return h('p', { class: 'empty' }, '没有其他评估可以对比。');
+  const pick = selectEl(others.map((e) => [e.id, `${e.name} · ${e.source}`]), others[0].id, () => {}, { 'aria-label': '基准评估' });
+  const out = h('div');
+  const run = async (ev) => {
+    ev.preventDefault();
+    const res = await act(() => api(ep(`/diff?against=${encodeURIComponent(pick.value)}`)));
+    if (!res) return;
+    const d = res.diff;
+    const how = Object.entries(d.counts.how).map(([k, n]) => `${{ fingerprint: '同一发现', anchor: '同一锚点', moved: '移动' }[k] || k} ${n}`).join('，');
+    const table = (rows, cols, cells) => rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'grid' },
+      h('thead', null, h('tr', null, cols.map((c) => h('th', { scope: 'col' }, c)))),
+      h('tbody', null, rows.map((r) => h('tr', null, cells(r).map((c) => h('td', null, c))))))) : h('p', { class: 'empty' }, '无');
+    fill(out,
+      h('p', { class: 'equation' }, `基准 ${d.base.listed} 条 → 本评估 ${d.head.listed} 条：保留 `, h('b', null, d.counts.kept),
+        `（${how || '—'}），新增 `, h('b', null, d.counts.new), '，消失 ', h('b', null, d.counts.gone),
+        `；可沿用的处置 ${d.counts.dispositions_to_reuse} 条`),
+      h('h4', null, '新增（基准里没有）'), table(d.new, ['条目', '等级', '位置', '缺陷族'],
+        (r) => [r.pv_id, levelChip(r.level), `${r.path}:${r.line_start}`, r.family]),
+      h('h4', null, '消失（修复、删除或无法辨认的移动）'), table(d.gone, ['基准条目', '等级', '位置', '缺陷族', '基准处置'],
+        (r) => [r.pv_id, levelChip(r.level), `${r.path}:${r.line_start}`, r.family, STATUS[r.status] || r.status]),
+      h('h4', null, '保留且基准已处置'), table(d.kept.filter((r) => r.base_status && r.base_status !== 'open'),
+        ['条目', '基准条目', '匹配', '基准处置', '备注'], (r) => [r.pv_id, r.base_pv_id, r.how, STATUS[r.base_status] || r.base_status, r.base_note]),
+      d.kept.length + d.new.length + d.gone.length >= d.truncated_to ? h('p', { class: 'note' }, `每类最多显示 ${d.truncated_to} 条。`) : null);
+  };
+  return [h('form', { class: 'toolbar filters', on: { submit: run } }, h('label', { class: 'field' }, '基准评估（旧版本）', pick),
+    h('button', { class: 'btn', type: 'submit' }, '对比')), out];
 }
 
 async function loadCoverage(box) {
@@ -1256,18 +1302,21 @@ async function loadCoverage(box) {
 function reviewForm() {
   const f = S.reviewForm;
   const p = S.ev.profile;
+  const pub = S.ev.public_model;
   const box = h('div', { class: 'review-plan' });
   const pick = (key, label, options) => h('label', { class: 'field' }, label,
     selectEl([['', '全部'], ...options], f[key], (v) => { f[key] = v; }));
   const form = h('form', { class: 'toolbar filters', on: { submit: (ev) => {
     ev.preventDefault();
     const focus = Object.fromEntries(['sfr', 'module', 'partition'].filter((k) => f[k]).map((k) => [k, f[k]]));
-    planReview({ focus, depth: f.depth }, box);
+    planReview({ focus, depth: f.depth, channel: pub && pub.allowed && f.channel === 'public' ? 'public' : 'local' }, box);
   } } },
   pick('sfr', 'SFR', (p.sfr || []).map((s) => [s.id, `${s.id} ${s.title || ''}`])),
   pick('module', 'TOE 模块', (p.toe_modules || []).map((m) => [m.id, m.id])),
   pick('partition', '分区', [['main', PARTS.main], ['unmapped', PARTS.unmapped]]),
   h('label', { class: 'field' }, '深度', selectEl(Object.entries(DEPTH), f.depth, (v) => { f.depth = v; })),
+  pub && pub.allowed ? h('label', { class: 'field' }, '模型', selectEl([['local', `本地 GPU（${S.ev.agent.model || ''}）`],
+    ['public', `公开模型 ${pub.model}（外发到 ${pub.host}，按量计费）`]], f.channel || 'local', (v) => { f.channel = v; })) : null,
   h('button', { class: 'btn', type: 'submit', disabled: !(S.ev.agent && S.ev.agent.available) }, '生成计划'));
   return [form, box, h('p', { class: 'note' },
     S.ev.agent && S.ev.agent.available

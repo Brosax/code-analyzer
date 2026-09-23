@@ -36,6 +36,7 @@ from ..aireview import contracts, prompt
 from ..aireview import lenses as lens_mod
 from ..aireview.code import CodeIndex
 from ..analysis import CancellationToken
+from ..defaults import endpoint_class
 from ..errors import UserError
 from ..evidence.analyze import ensure_index, reindex
 from ..evidence.grounding import ground
@@ -51,9 +52,8 @@ from ..sesip.active import active_profile
 from ..sesip.profile import Profile
 from .engine import Attempt, Engine, Summary, Task
 
-WINDOW = 24576
 WINDOW_MARGIN = 512
-MAX_TOKENS = {"verdict": 700, "findings": 1400}
+LOCAL_MAX_TOKENS = {"verdict": 700, "findings": 1400}   # the local model does not think (reasoning none)
 REQUEST_TIMEOUT = 600
 PROMOTE = ("CONFIRMED", "LIKELY")
 # Measured on the GPU host (probe, 2026-09-22): ~200 prompt tok/s cold, ~20 generated tok/s.
@@ -124,6 +124,17 @@ class _Run:
     next_af: int = 0
     lines: SourceLines | None = None
     enums: tuple[set[str], set[str], set[str]] = field(default_factory=lambda: (set(), set(), set()))
+    window: int = 24576
+    max_tokens: dict[str, int] = field(default_factory=lambda: dict(LOCAL_MAX_TOKENS))
+
+
+def limits(client: ModelClient) -> tuple[int, dict[str, int]]:
+    """The window and per-contract output caps of the endpoint the job talks to."""
+    spec = endpoint_class(client.endpoint.kind)
+    if client.endpoint.kind == "local":
+        return int(spec["lens_window"]), dict(LOCAL_MAX_TOKENS)
+    cap = int(spec["lens_max_tokens"])   # a thinking model spends part of it before answering
+    return int(spec["lens_window"]), {"verdict": cap, "findings": cap}
 
 
 def run(workspace: Workspace, *, client: ModelClient, broker: Broker, token: CancellationToken, job_id: str,
@@ -140,12 +151,15 @@ def run(workspace: Workspace, *, client: ModelClient, broker: Broker, token: Can
         progress(f"plan: {counts['T1']} entries to verify, {counts['T2']} unit look(s); skipped {plan.skipped or 0}")
         workspace.ledger.append("review_started", job=job_id, focus=plan.focus, depth=depth, lens=lens,
                                 targets=list(targets or []), planned=len(plan.targets), counts=counts,
-                                skipped=plan.skipped, budget_seconds=budget_seconds)
+                                skipped=plan.skipped, budget_seconds=budget_seconds,
+                                channel=client.endpoint.kind, model=client.endpoint.model,
+                                host=client.endpoint.host)
         sfr_ids, levels, categories = prompt.profile_enums(context.profile)
+        window, caps = limits(client)
         state = _Run(context, client, broker, job_id, stop, progress, client.endpoint.model,
                      next_af=len({r["af"] for r in workspace.ledger.of("ai_finding")}) + 1,
                      lines=SourceLines(workspace.source),
-                     enums=(set(sfr_ids), set(levels), set(categories)))
+                     enums=(set(sfr_ids), set(levels), set(categories)), window=window, max_tokens=caps)
         # Grouped by lens so consecutive requests share the system prefix (the host's prompt cache).
         ordered = sorted(plan.targets, key=lambda t: (t.tier != "T1", t.lens, -t.score, t.path, t.line_start))
         tasks = [Task(f"t{i + 1:04d}", {"target": t}) for i, t in enumerate(ordered)]
@@ -194,7 +208,7 @@ def _work(state: _Run, task: Task) -> Attempt:
     candidate = task.payload.get("candidate") or (_candidate(state, target) if target.tier == "T1" else None)
     request = prompt.build(target, lens, state.context.code, state.context.profile, candidate=candidate)
     tokens = prompt.estimate_tokens(request)
-    if tokens + MAX_TOKENS[lens.contract] + WINDOW_MARGIN > WINDOW:
+    if tokens + state.max_tokens[lens.contract] + WINDOW_MARGIN > state.window:
         return Attempt("unscheduled", "the unit does not fit the model window (never cut to fit)",
                        data={"estimated_tokens": tokens})
     answer, seconds, cached, first = _ask(state, request)
@@ -204,7 +218,7 @@ def _work(state: _Run, task: Task) -> Attempt:
         extra = prompt.need_code(state.context.code, need)
         second = prompt.build(target, lens, state.context.code, state.context.profile, candidate=candidate,
                               allow_need=False, extra_code=extra)
-        if prompt.estimate_tokens(second) + MAX_TOKENS[lens.contract] + WINDOW_MARGIN <= WINDOW:
+        if prompt.estimate_tokens(second) + state.max_tokens[lens.contract] + WINDOW_MARGIN <= state.window:
             answer2, seconds2, cached2, _ = _ask(state, second)
             parsed2, problem2 = _parse(state, lens.contract, answer2.text)
             seconds += seconds2
@@ -252,7 +266,7 @@ def _work(state: _Run, task: Task) -> Attempt:
 def _ask(state: _Run, request: prompt.Request) -> tuple[Reply, float, bool, str]:
     """(reply, GPU seconds charged, from cache, prompt sha).  Preemption propagates to the engine."""
     fmt = contracts.response_format(request.contract, request.schema)
-    body = state.client.body(request.messages, max_tokens=MAX_TOKENS[request.contract], response_format=fmt)
+    body = state.client.body(request.messages, max_tokens=state.max_tokens[request.contract], response_format=fmt)
     key = hashlib.sha256(json_bytes({"lens": request.lens.id, "lens_sha": request.lens.sha256,
                                      "endpoint": state.client.endpoint.describe(), "body": body})).hexdigest()
     path = state.context.workspace.root / "aireview" / "cache" / f"{key}.json"
@@ -261,7 +275,7 @@ def _ask(state: _Run, request: prompt.Request) -> tuple[Reply, float, bool, str]
         return Reply(stored["text"], "", [], "stop", stored.get("usage", {}), 200, None, 0.0,
                      stored["prompt_sha256"]), 0.0, True, stored["prompt_sha256"]
     reply = state.broker.chat(state.client, BACKGROUND, stop=state.stop, messages=request.messages,
-                              max_tokens=MAX_TOKENS[request.contract], response_format=fmt, timeout=REQUEST_TIMEOUT,
+                              max_tokens=state.max_tokens[request.contract], response_format=fmt, timeout=REQUEST_TIMEOUT,
                               purpose=f"lens:{request.lens.id}")
     if reply.finish_reason != "length":
         path.parent.mkdir(parents=True, exist_ok=True)

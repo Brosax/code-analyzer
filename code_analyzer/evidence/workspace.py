@@ -140,6 +140,15 @@ class Workspace:
         self.ledger.append("model_pinned", host=pin.get("host"), port=pin.get("port"),
                            addresses=pin.get("addresses"), model=pin.get("model"), by=by)
 
+    def allow_public_model(self, allow: bool, *, by: str) -> None:
+        """Let batch jobs of a public evaluation use the third-party model (a human act, recorded)."""
+        evaluation = self.evaluation
+        if allow and evaluation["confidentiality"] != "public":
+            raise UserError("only a public evaluation may use the public model; client code stays on the local GPU")
+        evaluation["allow_public_model"] = bool(allow)
+        _atomic(self.root / EVALUATION_FILE, json_bytes(evaluation))
+        self.ledger.append("public_model_allowed", allow=bool(allow), by=by)
+
     # -- accessors ---------------------------------------------------------------------
     @property
     def evaluation(self) -> dict[str, Any]:

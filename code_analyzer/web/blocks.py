@@ -112,6 +112,9 @@ def block(record: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "model_pinned":
         return {**base, "kind": "event", "title": f"模型主机已钉住：{record.get('host')}:{record.get('port')}",
                 "detail": f"{record.get('model')} · {', '.join(record.get('addresses') or [])} · {record.get('by')}"}
+    if kind == "public_model_allowed":
+        return {**base, "kind": "event", "title": "允许批量任务使用公开模型" if record.get("allow") else "已关闭公开模型",
+                "detail": f"{record.get('by')}：只用于公开代码的 AI 审查；对话始终走本地 GPU"}
     if kind == "review_started":
         counts = record.get("counts") or {}
         return {**base, "kind": "job", "title": f"AI 审查 {record.get('job')} 开始",

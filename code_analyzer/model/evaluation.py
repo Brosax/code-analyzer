@@ -16,7 +16,7 @@ from ..errors import UserError
 from ..evidence.workspace import Workspace
 from ..settings import Settings
 from .client import Endpoint, ModelClient, ModelError
-from .egress import EgressPolicy, Pin, bound, pin_endpoint
+from .egress import EgressBlocked, EgressPolicy, Pin, bound, pin_endpoint
 from .record import Recorder
 
 
@@ -33,12 +33,42 @@ def pin_local(settings: Settings) -> dict[str, Any] | None:
         return None
 
 
-def client_for(workspace: Workspace, settings: Settings, *, review: bool = False,
-               tool_mode: str = "native") -> ModelClient:
+def public_endpoint(settings: Settings) -> Endpoint:
+    if not settings.has_public_model:
+        raise UserError("no public model is configured ([public_model] in settings.toml)")
+    return Endpoint(settings.public_endpoint, settings.public_model, kind="public",
+                    api_key_env=settings.public_api_key_env)
+
+
+def public_allowed(workspace: Workspace, settings: Settings) -> tuple[bool, str]:
+    """Whether this evaluation may use the third-party model, and if not, why."""
     evaluation = workspace.evaluation
-    if not evaluation.get("model_pin"):
-        raise UserError("this evaluation has no pinned model host yet; pin one on the profile page")
-    policy = EgressPolicy(evaluation["confidentiality"], Pin.from_json(evaluation["model_pin"]),
+    if evaluation["confidentiality"] != "public":
+        return False, "client code only ever goes to the local GPU"
+    if not settings.has_public_model:
+        return False, "no public model is configured ([public_model] in settings.toml)"
+    if not evaluation.get("allow_public_model"):
+        return False, "the evaluator has not allowed the public model for this evaluation"
+    return True, ""
+
+
+def client_for(workspace: Workspace, settings: Settings, *, review: bool = False,
+               tool_mode: str = "native", channel: str = "local") -> ModelClient:
+    """``channel`` "public" is for batch jobs a human chose it for, on a public evaluation that allows it.
+    The conversation never asks for it; nothing falls back to it."""
+    evaluation = workspace.evaluation
+    if channel == "public":
+        allowed, reason = public_allowed(workspace, settings)
+        if not allowed:
+            raise EgressBlocked(reason)
+        endpoint = public_endpoint(settings)
+    elif channel == "local":
+        if not evaluation.get("model_pin"):
+            raise UserError("this evaluation has no pinned model host yet; pin one on the profile page")
+        endpoint = local_endpoint(settings, review=review, tool_mode=tool_mode)
+    else:
+        raise UserError(f"unknown model channel {channel!r}")
+    pin = Pin.from_json(evaluation["model_pin"]) if evaluation.get("model_pin") else None
+    policy = EgressPolicy(evaluation["confidentiality"], pin,
                           allow_public_model=bool(evaluation.get("allow_public_model")))
-    return ModelClient(local_endpoint(settings, review=review, tool_mode=tool_mode), egress=bound(policy),
-                       recorder=Recorder(workspace.root / "model"))
+    return ModelClient(endpoint, egress=bound(policy), recorder=Recorder(workspace.root / "model"))

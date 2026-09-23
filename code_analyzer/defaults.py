@@ -23,6 +23,7 @@ ENDPOINT_CLASSES: dict[str, dict[str, Any]] = {
         "max_tokens_field": "max_tokens",
         "chat_max_tokens": 1500,
         "lens_max_tokens": 2000,
+        "lens_window": 24576,          # measured (/api/ps context_length)
         "max_concurrency": 8,
         "system_role": "system",
     },
@@ -31,6 +32,7 @@ ENDPOINT_CLASSES: dict[str, dict[str, Any]] = {
         "max_tokens_field": "max_completion_tokens",
         "chat_max_tokens": 4000,
         "lens_max_tokens": 4000,
+        "lens_window": 65536,          # conservative for a hosted model; its thinking shares lens_max_tokens
         "max_concurrency": 2,
         "system_role": "system",
     },

@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..errors import UserError
 from ..evidence import overlays
-from ..evidence.analyze import ensure_index, evaluate, reindex
+from ..evidence.analyze import carry_buildctx, ensure_index, evaluate, reindex
 from ..evidence.store import Store, index_current
 from ..evidence.workspace import EVALUATION_FILE, Workspace, _atomic
 from ..export.listing import LeakFound, export
@@ -47,12 +47,13 @@ from ..kernel.loop import Kernel
 from ..kernel.session import Conversation
 from ..kernel.tools import review_plan
 from ..model.broker import Broker
-from ..model.client import disabled_by_env
-from ..model.evaluation import client_for, local_endpoint, pin_local
+from ..model.client import ModelError, disabled_by_env
+from ..model.evaluation import client_for, local_endpoint, pin_local, public_allowed
 from ..model.probe import latest_probe
 from ..persist import json_bytes
 from ..sesip import active
 from ..sesip.coverage import coverage
+from ..sesip.diff import compare
 from ..sesip.profile import BUILTINS
 from ..settings import Settings, load_settings
 from .blocks import blocks
@@ -165,6 +166,8 @@ class App:
         if profile not in BUILTINS:
             raise HttpError(400, f"unknown built-in profile {profile}")
         active.select_builtin(workspace, profile)
+        if body.get("buildctx_from"):
+            carry_buildctx(self.workspace(str(body["buildctx_from"])), workspace)
         return {"id": workspace.root.name}
 
     # -- the conversation -------------------------------------------------------------------
@@ -214,8 +217,10 @@ class App:
             raise UserError(reason)
         budget = max(60.0, min(float(arguments.get("budget_minutes") or 10), MAX_REVIEW_MINUTES) * 60)
 
+        channel = "public" if arguments.get("channel") == "public" else "local"
+        client = client_for(workspace, self.settings, review=True, channel=channel)  # refuses before the job
+
         def work(job: Job) -> int:
-            client = client_for(workspace, self.settings, review=True)
             lens_job.run(workspace, client=client, broker=self.broker, token=job.token, job_id=job.id,
                          budget_seconds=budget, focus=arguments.get("focus") or {},
                          targets=list(arguments.get("targets") or []), depth=str(arguments.get("depth") or "normal"),
@@ -295,6 +300,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         (re.compile(rf"/api/e/({_ID})/stream"), "stream"),
         (re.compile(rf"/api/e/({_ID})/exports/(E\d+)/({_ID})"), "download"),
         (re.compile(rf"/api/e/({_ID})/coverage"), "coverage"),
+        (re.compile(rf"/api/e/({_ID})/diff"), "diff"),
     ]
     routes_post: list[tuple[re.Pattern[str], str]] = [
         (re.compile(r"/api/evaluations"), "create"),
@@ -314,6 +320,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         (re.compile(rf"/api/e/({_ID})/review/plan"), "review_plan"),
         (re.compile(rf"/api/e/({_ID})/review/start"), "review_start"),
         (re.compile(rf"/api/e/({_ID})/pin_model"), "pin_model"),
+        (re.compile(rf"/api/e/({_ID})/allow_public_model"), "allow_public"),
         (re.compile(rf"/api/e/({_ID})/compile_db/propose"), "compile_db_propose"),
         (re.compile(rf"/api/e/({_ID})/compile_db/run"), "compile_db_run"),
     ]
@@ -444,7 +451,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                              "approvals": [_card(a) for a in approvals.pending(workspace)],
                              "review": _review_summary(workspace),
                              "model_pin": {k: pin.get(k) for k in ("host", "port", "model", "addresses")}
-                             if pin else None})
+                             if pin else None,
+                             "public_model": _public_view(workspace, app.settings)})
 
         def _store(self, workspace: Workspace) -> Store:
             if app.jobs.running(workspace.root.name) is None and not ensure_index(workspace):
@@ -488,6 +496,17 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             finally:
                 if store is not None:
                     store.close()
+
+        def get_diff(self, evaluation: str, *, query: dict[str, str]) -> None:
+            head = app.workspace(evaluation)
+            base = app.workspace(query.get("against", ""))
+            try:
+                result = compare(base, head)
+            except UserError as error:
+                raise HttpError(409, str(error)) from None
+            limit = 200
+            self._json(200, {"diff": {**result, **{k: result[k][:limit] for k in ("kept", "new", "gone")},
+                                      "truncated_to": limit}})
 
         def get_findings(self, evaluation: str, *, query: dict[str, str]) -> None:
             store = self._store(app.workspace(evaluation))
@@ -689,7 +708,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             return {"focus": {k: str(focus[k]) for k in ("sfr", "module", "partition") if focus.get(k)},
                     "targets": [str(t) for t in body.get("targets") or [] if isinstance(t, str)][:200],
                     "depth": "quick" if body.get("depth") == "quick" else "normal",
-                    "lens": str(body.get("lens") or ""), "budget_minutes": body.get("budget_minutes")}
+                    "lens": str(body.get("lens") or ""), "budget_minutes": body.get("budget_minutes"),
+                    "channel": "public" if body.get("channel") == "public" else "local"}
 
         def post_review_plan(self, evaluation: str) -> None:
             arguments = self._review_arguments()
@@ -711,8 +731,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             arguments["budget_minutes"] = minutes
             try:
                 job = app.review(workspace, arguments)
-            except UserError as error:
-                raise HttpError(409, str(error)) from None
+            except (UserError, ModelError) as error:
+                raise HttpError(409, getattr(error, "message", None) or str(error)) from None
             # The click is the grant: recorded like an approved card, by the analyst.
             workspace.ledger.append("review_granted", budget_seconds=minutes * 60, by="analyst", job=job.id,
                                     arguments={k: v for k, v in arguments.items() if k != "budget_minutes"})
@@ -736,6 +756,15 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             except (UserError, ValueError) as error:
                 raise HttpError(409, str(error)) from None
             self._json(202, {"job": job.summary()})
+
+        def post_allow_public(self, evaluation: str) -> None:
+            body = self._json_body()
+            workspace = app.workspace(evaluation)
+            try:
+                workspace.allow_public_model(bool(body.get("allow")), by="analyst")
+            except UserError as error:
+                raise HttpError(400, str(error)) from None
+            self._json(200, {"public_model": _public_view(workspace, app.settings)})
 
         def post_pin_model(self, evaluation: str) -> None:
             self._json_body()
@@ -795,6 +824,14 @@ def serve(settings: Settings | None = None, *, port: int | None = None,
         server.serve_forever()
     finally:
         server.server_close()
+
+
+def _public_view(workspace: Workspace, settings: Settings) -> dict[str, Any]:
+    allowed, reason = public_allowed(workspace, settings)
+    endpoint = settings.public_endpoint
+    return {"configured": settings.has_public_model, "allowed": allowed, "reason": reason,
+            "switched_on": bool(workspace.evaluation.get("allow_public_model")),
+            "model": settings.public_model, "host": urlsplit(endpoint).hostname if endpoint else ""}
 
 
 def _review_summary(workspace: Workspace) -> dict[str, int]:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import tomllib
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -249,6 +250,18 @@ def _workspace(source: Path, eval_dir: Path | None, data_root: Path | None) -> W
     from ..settings import load_settings  # noqa: PLC0415
 
     return Workspace.create(data_root or load_settings().data_root, source, confidentiality="client")
+
+
+def carry_buildctx(source: Workspace, target: Workspace) -> tuple[int, str]:
+    """Start ``target`` from ``source``'s build context: include paths, overrides and the compile database
+    that point into the old source tree are moved to the new one; everything else is kept as is."""
+    text = buildctx_text(current_buildctx(source))
+    old, new = str(source.source.resolve()), str(target.source.resolve())
+    text = text.replace(f'"{old}/', f'"{new}/').replace(f'"{old}"', f'"{new}"')
+    context = tomllib.loads(text)
+    number_, sha = _record_buildctx(target, context)
+    target.ledger.append("buildctx_carried", version=number_, sha256=sha, source_evaluation=source.root.name)
+    return number_, sha
 
 
 def _record_buildctx(workspace: Workspace, context: dict[str, Any]) -> tuple[int, str]:

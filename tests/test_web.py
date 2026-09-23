@@ -286,3 +286,18 @@ def test_an_index_from_an_older_version_is_rebuilt_when_the_page_opens(server: A
     assert view["jobs"][-1]["kind"] == "reindex"
     _wait(client, evaluation)
     assert client.get(f"/api/e/{evaluation}")["triage"]["partition_main"] == 1
+
+
+def test_only_a_public_evaluation_can_switch_the_public_model_on(server: App, tmp_path: Path) -> None:
+    client = Client(server).login()
+    evaluation, workspace = _evaluation(server, client, tmp_path)          # created public
+    view = client.get(f"/api/e/{evaluation}")["public_model"]
+    assert view["configured"] is False and view["allowed"] is False
+    switched = client.post(f"/api/e/{evaluation}/allow_public_model", {"allow": True})["public_model"]
+    assert switched["switched_on"] is True and switched["allowed"] is False   # nothing configured to use
+    assert workspace.ledger.of("public_model_allowed")[-1]["by"] == "analyst"
+    data = workspace.evaluation
+    data["confidentiality"], data["allow_public_model"] = "client", False
+    (workspace.root / "evaluation.json").write_text(json.dumps(data), encoding="utf-8")
+    status, _, payload = client.request("POST", f"/api/e/{evaluation}/allow_public_model", {"allow": True})
+    assert status == 400 and "local GPU" in json.loads(payload)["error"]

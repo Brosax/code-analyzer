@@ -130,3 +130,16 @@ A non-2xx response carries `{"error": "<human sentence>"}`.
   AI 发现 AF-n 经复核进入未分级分区.
 - The chat's `review` tool plans the same way; it shows an approval card (GPU minutes) unless the plan has at
   most 3 units and the GPU time already granted covers the estimate.
+
+## M8: the public channel and re-evaluation
+
+- `GET /api/e/<id>` additionally returns `"public_model": {"configured", "allowed", "reason", "switched_on", "model",
+  "host"}`.
+- `POST /api/e/<id>/allow_public_model` `{"allow": bool}` → `{"public_model": {…}}`: only a public evaluation may
+  switch it on (400 otherwise); recorded as `public_model_allowed` with `by`. The conversation never uses the
+  public model; a review job uses it only when its plan/start body says `"channel": "public"` and the switch is on.
+- `POST /api/evaluations` accepts `"buildctx_from": "<evaluation id>"`: the new evaluation starts from that
+  evaluation's build context with paths into the old source tree moved to the new one (`buildctx_carried`).
+- `GET /api/e/<id>/diff?against=<base evaluation id>` → `{"diff": {"base", "head", "counts": {"kept", "new", "gone",
+  "how": {"fingerprint", "anchor", "moved"}, "dispositions_to_reuse"}, "kept": [...], "new": [...], "gone": [...],
+  "truncated_to": 200}}`. Kept rows carry the base's `base_pv_id`, `base_status`, `base_note`.
