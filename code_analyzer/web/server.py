@@ -633,7 +633,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                         if item["kind"] == "summary":
                             self._event("triage", app.triage(workspace) or {})
                     if records:
-                        after = max(after, int(records[-1]["seq"]))
+                        after = max(after, max(int(record["seq"]) for record in records))
                     deltas, delta_index = app.deltas_since(evaluation, delta_index)
                     for item in deltas:
                         self._event("delta", item)

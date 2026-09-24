@@ -45,6 +45,53 @@ def test_ledger_survives_a_torn_last_line(tmp_path: Path) -> None:
         handle.write(b'{"seq":3,"kind":"c","x":')  # killed mid-write
     records = Ledger(ledger.path).read()
     assert [r["kind"] for r in records] == ["a", "b"] and [r["seq"] for r in records] == [1, 2]
+    # the next writer starts on a new line, so the torn record costs only itself
+    Ledger(ledger.path).append("d", x=4)
+    assert [(r["seq"], r["kind"]) for r in Ledger(ledger.path).read()] == [(1, "a"), (2, "b"), (3, "d")]
+
+
+def test_every_writer_of_one_ledger_numbers_on_from_the_same_seq(tmp_path: Path) -> None:
+    """A job and the conversation each hold a Workspace; their seqs once collided (49-61 twice, 92 -> 62)."""
+    path = tmp_path / "ledger.jsonl"
+    job, conversation = Ledger(path), Ledger(path)
+    job.append("job", n=0)
+    for n in range(1, 6):
+        conversation.append("said", n=n)
+        job.append_many([("job", {"n": n}), ("job", {"n": -n})])
+    seqs = [r["seq"] for r in Ledger(path).read()]
+    assert seqs == list(range(1, 17))
+
+
+def test_threads_and_another_process_never_share_a_seq(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    Ledger(path).append("start")
+    child = subprocess.Popen([sys.executable, "-c", (
+        "import sys; sys.path.insert(0, sys.argv[2])\n"
+        "from pathlib import Path\n"
+        "from code_analyzer.evidence.workspace import Ledger\n"
+        "ledger = Ledger(Path(sys.argv[1]))\n"
+        "for n in range(60): ledger.append('child', n=n)\n"), str(path), str(ROOT)])
+    import threading
+
+    def write(tag: str) -> None:
+        ledger = Ledger(path)
+        for n in range(60):
+            ledger.append(tag, n=n)
+
+    threads = [threading.Thread(target=write, args=(f"thread{i}",)) for i in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert child.wait(timeout=60) == 0
+    seqs = [r["seq"] for r in Ledger(path).read()]
+    assert len(seqs) == 1 + 60 * 4 and seqs == sorted(set(seqs)) == list(range(1, 242))
+
+
+def test_a_ledger_out_of_order_continues_after_its_highest_seq(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    path.write_bytes(b'{"seq":1,"kind":"a"}\n{"seq":92,"kind":"b"}\n{"seq":62,"kind":"c"}\n')
+    assert Ledger(path).append("d")["seq"] == 93
 
 
 def test_workspace_refuses_to_live_inside_the_scanned_tree(tmp_path: Path) -> None:

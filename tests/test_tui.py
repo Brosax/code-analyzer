@@ -1422,9 +1422,15 @@ def test_a_ticked_configuration_change_survives_a_value_containing_a_space(
 
 
 def test_serving_a_run_announces_its_url_in_the_conversation_and_can_be_closed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """It used to start a scan, crash on a None port, and never stop."""
+    from code_analyzer import cli as cli_module
+    from code_analyzer import serve as serve_module
+
+    # any free port: 8765 is the v3 page's, which may be running on this machine
+    monkeypatch.setattr(serve_module, "DEFAULT_PORT", 0)
+    monkeypatch.setattr(cli_module, "DEFAULT_PORT", 0)
 
     async def exercise() -> None:
         import urllib.request
@@ -1450,7 +1456,7 @@ def test_serving_a_run_announces_its_url_in_the_conversation_and_can_be_closed(
                 if any("live view" in line for line in app.dialogue.lines()):
                     break
             announced = [line for line in app.dialogue.lines() if "live view" in line]
-            assert announced, "the URL never reached the transcript"
+            assert announced, "the URL never reached the transcript: " + " / ".join(app.dialogue.lines()[-8:])
             port = announced[0].strip().rstrip("/").rsplit(":", 1)[-1]
             assert urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read()
             assert app._busy

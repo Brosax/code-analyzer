@@ -18,6 +18,7 @@ consistent account.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -39,11 +40,34 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.Lock:
+    """One lock per ledger file for the whole process, however many Workspace objects point at it."""
+    key = os.path.realpath(path)
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(key, threading.Lock())
+
+
 class Ledger:
+    """Append-only, fsynced, one record per line; ``seq`` is unique and increasing across every writer.
+
+    Every request builds its own Workspace, and a job and the conversation each hold one for minutes, so
+    several Ledger objects append to the same file.  A seq counter cached per object let them number on
+    independently -- the chat-during-review run of 2026-09-23 wrote seq 49-61 twice and then went back
+    from 92 to 62, and the page, which resumes its event stream after the highest id it saw, never showed
+    the conversation's next answers.  Now each append holds the file's process-wide lock and an flock
+    (a headless run on the same evaluation is another process), and re-reads the highest seq whenever the
+    file has grown since this object last wrote.
+    """
+
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._lock = threading.Lock()
+        self._lock = _file_lock(path)
         self._seq: int | None = None
+        self._size = -1
 
     def append(self, kind: str, /, **data: Any) -> dict[str, Any]:
         if "kind" in data or "seq" in data or "at" in data:
@@ -52,22 +76,31 @@ class Ledger:
 
     def append_many(self, entries: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
         """Append several records with one fsync; they share a timestamp."""
-        with self._lock:
-            if self._seq is None:
-                records = self.read()
-                self._seq = records[-1]["seq"] if records else 0
-            now = utc_now()
-            written = []
-            payload = bytearray()
-            for kind, data in entries:
-                self._seq += 1
-                record = {"seq": self._seq, "at": now, "kind": kind, **data}
-                written.append(record)
-                payload += jsonl_bytes(record)
-            with open(self.path, "ab") as handle:
+        with self._lock, open(self.path, "a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                size = handle.seek(0, os.SEEK_END)
+                if self._seq is None or size != self._size:
+                    # someone else wrote since: the highest seq, not the last line's (an older file may not be in order)
+                    self._seq = max((int(record["seq"]) for record in self.read()), default=0)
+                payload = bytearray()
+                if size:
+                    handle.seek(size - 1)
+                    if handle.read(1) != b"\n":
+                        payload += b"\n"  # a writer killed mid-line must not take this record down with it
+                now = utc_now()
+                written = []
+                for kind, data in entries:
+                    self._seq += 1
+                    record = {"seq": self._seq, "at": now, "kind": kind, **data}
+                    written.append(record)
+                    payload += jsonl_bytes(record)
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+                self._size = handle.tell()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             return written
 
     def read(self) -> list[dict[str, Any]]:
