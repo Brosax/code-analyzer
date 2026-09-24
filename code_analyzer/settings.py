@@ -1,11 +1,13 @@
-"""The nine settings, and where the program keeps its own state.
+"""The ten settings, and where the program keeps its own state.
 
 ``~/.code-analyzer/settings.toml`` (or ``$CODE_ANALYZER_HOME/settings.toml``)
 is the whole operator-facing configuration.  An unknown key is an error rather
-than a silently ignored typo: with only nine keys, every one of them matters.
+than a silently ignored typo: with only ten keys, every one of them matters.
 
     port = 8765
     data_root = "~/.code-analyzer/evaluations"
+    web_url = ""                # optional: where a reverse proxy on this host publishes the page,
+                                # e.g. "http://192.168.5.34:8787/code-analyzer/"
 
     [local_model]
     endpoint = "http://192.168.5.10:11434/v1"
@@ -29,6 +31,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import UserError
 
@@ -57,6 +60,7 @@ class Settings:
     public_api_key_env: str = ""
     data_root: Path = field(default_factory=lambda: home() / "evaluations")
     port: int = DEFAULT_PORT
+    web_url: str = ""
     analyzers: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -71,6 +75,7 @@ class Settings:
 _SCHEMA: dict[str, Any] = {
     "port": int,
     "data_root": str,
+    "web_url": str,
     "local_model": {"endpoint": str, "name": str, "review_name": str},
     "public_model": {"endpoint": str, "name": str, "api_key_env": str},
     "analyzers": {name: str for name in ANALYZERS},
@@ -102,8 +107,32 @@ def load_settings(path: Path | None = None) -> Settings:
         public_api_key_env=public.get("api_key_env", "").strip(),
         data_root=Path(data_root).expanduser() if data_root else home() / "evaluations",
         port=port,
+        web_url=_web_url(raw.get("web_url", ""), str(target)),
         analyzers={name: value.strip() for name, value in raw.get("analyzers", {}).items() if value.strip()},
     )
+
+
+def _web_url(value: str, where: str) -> str:
+    """The page's address behind a reverse proxy: its host is the one Host header accepted besides loopback.
+
+    Normalised to what a browser sends -- no default port, a path ending in ``/`` -- so the Host
+    and Origin checks can compare strings.
+    """
+    value = value.strip()
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.query or parts.fragment:
+        raise UserError(f"{where}: web_url must be a plain http(s) URL such as "
+                        f"http://192.168.5.34:8787/code-analyzer/, got {value!r}")
+    try:
+        port = parts.port
+    except ValueError:
+        raise UserError(f"{where}: web_url has an invalid port: {value!r}") from None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    netloc = host if port in (None, {"http": 80, "https": 443}[parts.scheme]) else f"{host}:{port}"
+    path = parts.path if parts.path.endswith("/") else parts.path + "/"
+    return f"{parts.scheme}://{netloc}{path}"
 
 
 def _check(value: dict[str, Any], schema: dict[str, Any], where: str) -> None:

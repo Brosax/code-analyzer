@@ -2,12 +2,17 @@
 
 Security, in order of the checks every request meets:
 
-1. Bound to 127.0.0.1 only.
-2. ``Host`` must be ``127.0.0.1:<port>`` or ``localhost:<port>`` -- a page on
-   another origin that DNS-rebinds a name to 127.0.0.1 is refused.
-3. A session cookie is required for everything, the page included.  The only
-   way to get it is the one-time URL printed at startup; the token works once.
-   The cookie is HttpOnly and SameSite=Strict.
+1. Bound to 127.0.0.1 only.  Other machines reach it only through a reverse
+   proxy on this host, at the address named by the ``web_url`` setting.
+2. ``Host`` must be ``127.0.0.1:<port>``, ``localhost:<port>`` or the host of
+   ``web_url`` -- a page on another origin that DNS-rebinds a name to this
+   machine is refused.
+3. A session cookie is required for everything, the page included (only
+   ``/health`` answers without one).  The only way to get it is a one-time
+   link: printed at startup and kept in ``~/.code-analyzer/web-login.txt``
+   (mode 0600).  A link works once; using it puts a fresh one in the file.
+   The cookie is HttpOnly and SameSite=Strict, scoped to the page's own path;
+   sessions survive a restart (their sha256 is kept, 0600) for 30 days.
 4. A POST also needs a same-origin ``Origin`` and a JSON body (uploads: an
    octet-stream with ``X-Filename``), so another local page cannot drive it.
 5. Responses carry ``Content-Security-Policy: default-src 'self'``; the page
@@ -20,9 +25,11 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import html
 import http.cookies
 import io
 import json
+import os
 import re
 import secrets
 import threading
@@ -55,12 +62,15 @@ from ..sesip import active
 from ..sesip.coverage import coverage
 from ..sesip.diff import compare
 from ..sesip.profile import BUILTINS
-from ..settings import Settings, load_settings
+from ..settings import Settings, home, load_settings
 from .blocks import blocks
 
 BIND_HOST = "127.0.0.1"
 MAX_REVIEW_MINUTES = 240.0
 COOKIE = "ca_session"
+LINK_FILE = "web-login.txt"
+SESSIONS_FILE = "web-sessions.json"
+SESSION_SECONDS = 30 * 24 * 3600
 MAX_JSON = 1024 * 1024
 MAX_DOCUMENT = 64 * 1024 * 1024
 DOCX_LIMITS = {"unpacked": 200 * 1024 * 1024, "entries": 2000, "part": 50 * 1024 * 1024, "ratio": 100}
@@ -87,9 +97,9 @@ class App:
         self._conversations: dict[str, Conversation] = {}
         self._deltas: dict[str, list[dict[str, Any]]] = {}
         self.codec = _probed_codec(self.settings)
-        self._token: str | None = secrets.token_urlsafe(24)
-        self._sessions: set[str] = set()
+        self._token = secrets.token_urlsafe(24)
         self._lock = threading.Lock()
+        self._sessions = self._load_sessions()
         # Reconcile once, at startup: a call left open now was left by a process
         # that died.  Never again while serving -- a call open then is this
         # server's own running job.
@@ -104,17 +114,47 @@ class App:
     def login_url(self) -> str:
         return f"http://{BIND_HOST}:{self.port}/login?token={self._token}"
 
+    def login_urls(self) -> list[str]:
+        """The current one-time link: through the proxy first when there is one, then direct."""
+        urls = [self.login_url()]
+        if self.settings.web_url:
+            urls.insert(0, f"{self.settings.web_url}login?token={self._token}")
+        return urls
+
+    def publish_link(self) -> Path:
+        """Keep the current link where only this user can read it, for the next browser to sign in."""
+        path = home() / LINK_FILE
+        _private_write(path, "".join(f"{url}\n" for url in self.login_urls()).encode())
+        return path
+
     def redeem(self, token: str) -> str | None:
         with self._lock:
-            if not self._token or not secrets.compare_digest(token, self._token):
+            if not secrets.compare_digest(token.encode(), self._token.encode()):
                 return None
-            self._token = None  # one use
+            self._token = secrets.token_urlsafe(24)  # one use; the next browser takes the fresh link
+            self.publish_link()
             session = secrets.token_urlsafe(32)
-            self._sessions.add(session)
+            self._sessions[_digest(session)] = time.time()
+            self._save_sessions()
             return session
 
     def authorised(self, session: str | None) -> bool:
-        return bool(session) and session in self._sessions
+        if not session:
+            return False
+        created = self._sessions.get(_digest(session))
+        return created is not None and time.time() - created < SESSION_SECONDS
+
+    def _load_sessions(self) -> dict[str, float]:
+        try:
+            stored = json.loads((home() / SESSIONS_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        now = time.time()
+        return {key: float(value) for key, value in stored.items()
+                if isinstance(value, (int, float)) and now - value < SESSION_SECONDS} if isinstance(stored, dict) else {}
+
+    def _save_sessions(self) -> None:
+        _private_write(home() / SESSIONS_FILE, json_bytes(self._sessions))
 
     # -- evaluations ------------------------------------------------------------------
     def workspace(self, evaluation: str) -> Workspace:
@@ -344,7 +384,10 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         # -- plumbing -----------------------------------------------------------------
         def _host_ok(self) -> bool:
             host = self.headers.get("Host", "")
-            return host in {f"127.0.0.1:{app.port}", f"localhost:{app.port}"}
+            allowed = {f"127.0.0.1:{app.port}", f"localhost:{app.port}"}
+            if app.settings.web_url:
+                allowed.add(urlsplit(app.settings.web_url).netloc)
+            return host in allowed
 
         def _session(self) -> str | None:
             cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
@@ -376,12 +419,25 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 self._error(403, "wrong Host header")
                 return False
             path = urlsplit(self.path).path
-            if path == "/login":
+            if path in ("/login", "/health"):
                 return True
             if not app.authorised(self._session()):
-                self._error(403, "open the one-time URL printed by code-analyzer to sign in")
+                if self.command == "GET" and path in ("/", "/index.html"):
+                    self._sign_in_page()
+                else:
+                    self._error(403, "open the one-time URL printed by code-analyzer to sign in")
                 return False
             return True
+
+        def _sign_in_page(self) -> None:
+            """A browser that arrives without a session learns where the link is, in words."""
+            where = html.escape(str(home() / LINK_FILE))
+            page = ("<!doctype html><meta charset=\"utf-8\"><title>code-analyzer · 登录</title>"
+                    "<h1>code-analyzer：需要登录链接</h1>"
+                    "<p>这个页面只能通过一次性登录链接进入。在运行 code-analyzer 的机器上查看：</p>"
+                    f"<pre>cat {where}</pre>"
+                    "<p>每个链接只能用一次；用过之后，文件里会换上新的链接。已登录的浏览器 30 天内不用再登录。</p>")
+            self._send(403, page.encode(), "text/html; charset=utf-8")
 
         def _body(self, limit: int = MAX_JSON) -> bytes:
             length = int(self.headers.get("Content-Length") or 0)
@@ -409,6 +465,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             try:
                 if path == "/login":
                     return self._login(query.get("token", ""))
+                if path == "/health":
+                    return self._json(200, {"ok": True})
                 if path in ("/", "/index.html"):
                     return self._static("index.html", "text/html; charset=utf-8")
                 if path.startswith("/static/") and path[8:] in STATIC:
@@ -428,9 +486,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _login(self, token: str) -> None:
             session = app.redeem(token)
             if session is None:
-                return self._error(403, "this sign-in link has already been used or is wrong; restart code-analyzer")
+                return self._error(403, "this sign-in link has already been used or is wrong; the current one is "
+                                        f"in {home() / LINK_FILE} on the machine running code-analyzer")
+            # Relative, and no Path attribute: behind a proxy at /code-analyzer/ the browser lands on
+            # /code-analyzer/ and scopes the cookie there, not to every service sharing the gateway.
             self._send(303, b"", "text/plain", {
-                "Location": "/", "Set-Cookie": f"{COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/"})
+                "Location": "./", "Set-Cookie": f"{COOKIE}={session}; HttpOnly; SameSite=Strict"})
 
         def _static(self, name: str, content_type: str) -> None:
             data = resources.files("code_analyzer.web").joinpath("static", name).read_bytes()
@@ -834,11 +895,31 @@ def serve(settings: Settings | None = None, *, port: int | None = None,
         raise
     server.daemon_threads = True
     app.port = server.server_address[1]
-    announce(f"code-analyzer: open {app.login_url()}")
+    link_file = app.publish_link()
+    for url in app.login_urls():
+        announce(f"code-analyzer: open {url}")
+    announce(f"code-analyzer: each link works once; the current one is always in {link_file}")
     try:
         server.serve_forever()
     finally:
         server.server_close()
+
+
+def _digest(session: str) -> str:
+    return hashlib.sha256(session.encode()).hexdigest()
+
+
+def _private_write(path: Path, data: bytes) -> None:
+    """Atomic, and readable by this user only: a sign-in link or a session list is a key to the page."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
 
 
 def _public_view(workspace: Workspace, settings: Settings) -> dict[str, Any]:

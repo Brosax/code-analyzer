@@ -2,16 +2,38 @@
 
 Served by `code-analyzer` (web/server.py) on 127.0.0.1 only. All responses are JSON unless noted.
 The page is `/` (index.html) plus `/static/app.js` and `/static/app.css`. No inline script or style:
-the CSP is `default-src 'self'`.
+the CSP is `default-src 'self'`. Every URL the page uses is relative (`api/state`, `static/app.js`), so
+the same page works at `/` and behind a reverse proxy under a path prefix.
 
 ## Security
-- Startup prints `http://127.0.0.1:<port>/login?token=<one-time token>`. `GET /login?token=` sets the
-  `ca_session` cookie (HttpOnly, SameSite=Strict, Path=/) and redirects to `/`. The token works once.
-- Every request, `/` and static files included, needs the cookie. Without it: 403.
-- `Host` must be `127.0.0.1:<port>` or `localhost:<port>`; anything else: 403.
+- Startup prints `http://127.0.0.1:<port>/login?token=<one-time token>` (and the same link under `web_url`
+  when that setting is set), and keeps the current link in `~/.code-analyzer/web-login.txt` (mode 0600).
+  `GET /login?token=` sets the `ca_session` cookie (HttpOnly, SameSite=Strict, no Path: the browser scopes
+  it to the page's own directory) and redirects to `./`. A token works once; redeeming it writes a fresh
+  one to the file for the next browser. Sessions are kept as sha256 in `~/.code-analyzer/web-sessions.json`
+  (0600) and survive a restart for 30 days.
+- Every request, `/` and static files included, needs the cookie. Without it: 403 -- for `GET /` an HTML
+  page saying where the link file is, otherwise JSON. `GET /health` answers `{"ok": true}` without a
+  cookie (the gateway homepage's status dot).
+- `Host` must be `127.0.0.1:<port>`, `localhost:<port>`, or the host of the `web_url` setting; anything
+  else: 403.
+
 - Every POST needs a same-origin `Origin` header and `Content-Type: application/json`. The one exception is
   `POST /api/e/<id>/documents`, which takes `application/octet-stream` with an `X-Filename` header.
 - Untrusted text (paths, messages, source) must be inserted into the page with `textContent`, never `innerHTML`.
+
+## Behind the bench gateway
+The office network lets only 22 and 8787 through to the bench. The Caddy gateway on :8787
+(LowCostBaseStation `station/tools/gateway/Caddyfile`) publishes the page at `/code-analyzer/`:
+`redir /code-analyzer /code-analyzer/`, then `handle_path /code-analyzer/*` to `127.0.0.1:8765` with
+`flush_interval -1` (the SSE stream). Caddy passes the browser's `Host` through, so settings.toml says
+`web_url = "http://192.168.5.34:8787/code-analyzer/"`. The server runs as the systemd user service
+`code-analyzer-web` (`deploy/code-analyzer-web.service`).
+
+The page shares its origin (`192.168.5.34:8787`) with everything else on the gateway. Its cookie is
+scoped to `/code-analyzer`, but the same-origin policy does not separate paths: a script injected into
+another page on that gateway could read this one. Client source should be evaluated here only while that
+is acceptable.
 
 ## Errors
 A non-2xx response carries `{"error": "<human sentence>"}`.

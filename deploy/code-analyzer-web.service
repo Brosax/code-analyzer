@@ -1,0 +1,30 @@
+# code-analyzer's page as a systemd user service, so it outlives the terminal that started it.
+#
+# It still binds 127.0.0.1 only.  Other machines reach it through a reverse proxy on this host
+# (the bench gateway publishes it at http://192.168.5.34:8787/code-analyzer/); settings.toml
+# names that address:  web_url = "http://192.168.5.34:8787/code-analyzer/"
+#
+#   cp deploy/code-analyzer-web.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now code-analyzer-web
+#   cat ~/.code-analyzer/web-login.txt          # the current one-time sign-in link
+#   journalctl --user -u code-analyzer-web -f
+
+[Unit]
+Description=code-analyzer evaluation page on 127.0.0.1:8765
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/workspace/code-analyzer/.venv/bin/code-analyzer web
+# The analyzers this host uses live in ~/.local/bin (cppcheck 2.13, flawfinder 2.20, cmake);
+# a user unit's default PATH does not include it, and the system cppcheck 1.90 is refused.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# SIGTERM ends it like Ctrl+C (exit 130); a job it was running is reconciled at the next start.
+SuccessExitStatus=130
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

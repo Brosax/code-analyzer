@@ -111,7 +111,7 @@ function apiError(status, message) {
 }
 
 const post = (path, body = {}) => api(path, { body });
-const ep = (tail) => `/api/e/${encodeURIComponent(S.id)}${tail}`;
+const ep = (tail) => `api/e/${encodeURIComponent(S.id)}${tail}`;
 
 async function act(fn) {
   try {
@@ -258,7 +258,7 @@ async function showPicker(auto = false) {
   document.title = 'code-analyzer · 评估';
   const picker = $('picker');
   try {
-    S.app = await api('/api/state');
+    S.app = await api('api/state');
   } catch (e) {
     picker.hidden = false;
     fill(picker, h('div', { class: 'empty' }, h('p', null, '无法载入评估列表：'), h('p', { class: 'error-box' }, e.message)));
@@ -306,7 +306,7 @@ function newEvalForm() {
   const form = h('form', { class: 'stack', on: { submit: async (ev) => {
     ev.preventDefault();
     const confidentiality = form.querySelector('input[name="confidentiality"]:checked').value;
-    const res = await act(() => post('/api/evaluations', { source: source.value.trim(), confidentiality, profile: profile.value,
+    const res = await act(() => post('api/evaluations', { source: source.value.trim(), confidentiality, profile: profile.value,
       buildctx_from: carry.value || undefined }));
     if (res) openEval(res.id);
   } } },

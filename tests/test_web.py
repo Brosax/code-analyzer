@@ -22,13 +22,30 @@ from code_analyzer.web.blocks import blocks
 from code_analyzer.web.server import App, make_handler
 
 
-@pytest.fixture
-def server(tmp_path: Path):
-    app = App(Settings(data_root=tmp_path / "evaluations"))
+def _serve(app: App) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
     httpd.daemon_threads = True
     app.port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+@pytest.fixture
+def server(tmp_path: Path):
+    app = App(Settings(data_root=tmp_path / "evaluations"))
+    httpd = _serve(app)
+    yield app
+    httpd.shutdown()
+
+
+PROXIED = "192.168.5.34:8787"
+
+
+@pytest.fixture
+def proxied(tmp_path: Path):
+    """The page published by a reverse proxy on this host at /code-analyzer/ (settings web_url)."""
+    app = App(Settings(data_root=tmp_path / "evaluations", web_url=f"http://{PROXIED}/code-analyzer/"))
+    httpd = _serve(app)
     yield app
     httpd.shutdown()
 
@@ -85,10 +102,77 @@ def test_everything_needs_the_one_time_login(server: App) -> None:
     status, headers, _ = client.request("GET", "/api/state")
     assert status == 200 and "default-src 'self'" in headers["content-security-policy"]
     assert "HttpOnly" in Client(server).request("GET", "/login?token=x")[1].get("set-cookie", "HttpOnly")
-    # the token works once
-    again = Client(server)
-    token = server.login_url().split("token=")[1]
-    assert again.request("GET", f"/login?token={token}")[0] == 403
+    # a link works once; the next browser takes the fresh one
+    used = server.login_url().split("token=")[1]
+    Client(server).login()
+    assert Client(server).request("GET", f"/login?token={used}")[0] == 403
+    assert Client(server).request("GET", "/login?token=%E2%9C%93")[0] == 403
+
+
+def test_a_browser_without_a_session_is_told_where_the_link_is(server: App, private_home: Path) -> None:
+    status, headers, page = Client(server).request("GET", "/")
+    assert status == 403 and headers["content-type"].startswith("text/html")
+    assert str(private_home / "web-login.txt") in page.decode()
+    assert "<script" not in page.decode()
+    # the gateway homepage probes /health for its status dot; it says nothing else
+    status, _, payload = Client(server).request("GET", "/health")
+    assert status == 200 and json.loads(payload) == {"ok": True}
+    assert Client(server, host="evil.example:80").request("GET", "/health")[0] == 403
+
+
+def test_the_current_link_is_kept_private_and_rotates_on_use(server: App, private_home: Path) -> None:
+    link_file = server.publish_link()
+    assert link_file == private_home / "web-login.txt" and link_file.stat().st_mode & 0o777 == 0o600
+    first = link_file.read_text().split("token=")[1].strip()
+    status, headers, _ = Client(server).request("GET", f"/login?token={first}")
+    # relative redirect and no Path: behind /code-analyzer/ the cookie stays on that path
+    assert status == 303 and headers["location"] == "./"
+    assert "Path=" not in headers["set-cookie"] and "SameSite=Strict" in headers["set-cookie"]
+    second = link_file.read_text().split("token=")[1].strip()
+    assert second != first
+    assert Client(server).request("GET", f"/login?token={first}")[0] == 403
+    assert Client(server).request("GET", f"/login?token={second}")[0] == 303
+
+
+def test_sessions_survive_a_restart_and_expire(server: App, tmp_path: Path, private_home: Path) -> None:
+    client = Client(server).login()
+    stored = private_home / "web-sessions.json"
+    assert stored.stat().st_mode & 0o777 == 0o600
+    assert client.cookie.split("=", 1)[1] not in stored.read_text()  # only its sha256 is kept
+    restarted = App(Settings(data_root=tmp_path / "evaluations"))
+    httpd = _serve(restarted)
+    try:
+        again = Client(restarted)
+        again.cookie = client.cookie
+        assert again.request("GET", "/api/state")[0] == 200
+        stored.write_text(json.dumps({key: 1.0 for key in json.loads(stored.read_text())}))
+        assert App(Settings(data_root=tmp_path / "evaluations"))._sessions == {}
+    finally:
+        httpd.shutdown()
+
+
+def test_the_proxy_address_is_accepted_only_when_configured(server: App, proxied: App) -> None:
+    through = Client(proxied, host=PROXIED).login()
+    assert through.request("GET", "/api/state")[0] == 200
+    assert through.request("POST", "/api/evaluations", {"source": "/nonexistent"})[0] == 400  # past Host and Origin
+    assert through.request("POST", "/api/evaluations", {"source": "/tmp"},
+                           headers={"Origin": "http://evil.example"})[0] == 403
+    assert proxied.login_urls()[0].startswith(f"http://{PROXIED}/code-analyzer/login?token=")
+    direct = Client(proxied).login()
+    assert direct.request("GET", "/api/state")[0] == 200
+    elsewhere = Client(server, host=PROXIED)
+    elsewhere.cookie = Client(server).login().cookie
+    assert elsewhere.request("GET", "/api/state")[0] == 403
+
+
+def test_the_page_uses_relative_urls_so_it_works_under_a_path_prefix() -> None:
+    """Behind the gateway the page lives at /code-analyzer/; a root-absolute URL would reach another service."""
+    static = Path(__file__).parents[1] / "code_analyzer" / "web" / "static"
+    for name in ("index.html", "app.js", "app.css"):
+        text = (static / name).read_text(encoding="utf-8")
+        for quote in ("'", '"', "`", "("):
+            for root in ("/api", "/static", "/login", "/health"):
+                assert f"{quote}{root}" not in text, f"{name}: root-absolute {quote}{root}"
 
 
 def test_host_origin_and_content_type_are_enforced(server: App) -> None:
